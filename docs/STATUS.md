@@ -5,12 +5,14 @@
 ## 完了
 
 - README、作業ガイド、段階計画、軽量 CI の判定・ガードを用意した。
+- 初回コミット `e6cbcf7e32f8299dda1afaf90c7579c01487c6cc` を main に公開した。
 
 ## 検証
 
 - Node.js 24.19.0 で `node --test .github/scripts/ci-changes.test.mjs` が 12/12 成功。
 - `node .github/scripts/check-scaffold.mjs` と `sdk` / `modbus` / `slmp` 指定のガードが成功。
-- `git diff --check` が成功。CI 定義は YAML として解析できた。初回公開の GitHub Actions の結果は公開後に確認する。
+- `git diff --check` が成功。CI 定義は YAML として解析できた。
+- [初回公開の GitHub Actions](https://github.com/tyaro/banto-driver-wasm/actions/runs/40109757859) は全ジョブ成功。
 
 ## 未検証
 
@@ -24,9 +26,8 @@
 
 ## 次作業
 
-1. 初回公開の GitHub Actions 結果を確認し、失敗があれば初期構成の範囲で修正する。
-2. `docs/PLAN.md` の P1 に沿って Hub 側の API と WIT 案を照合する。
-3. 製品コードの最初の PR で、実行可能なビルド・適合テストと CI 配線を同時に入れる。
+1. `docs/PLAN.md` の P1 に沿って Hub 側の API と WIT 案を照合する。
+2. 製品コードの最初の PR で、実行可能なビルド・適合テストと CI 配線を同時に入れる。
 
 ## 判断
 
