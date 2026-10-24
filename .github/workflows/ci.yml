@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Keep main runs alive for future main-save / PR-restore caches.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sdk: ${{ steps.classify.outputs.sdk }}
+      modbus: ${{ steps.classify.outputs.modbus }}
+      slmp: ${{ steps.classify.outputs.slmp }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node --test .github/scripts/ci-changes.test.mjs
+      - name: List changed files
+        id: diff
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          if git rev-parse --verify -q 'HEAD^2' >/dev/null &&
+             git diff --name-only -z --no-renames 'HEAD^1' HEAD > "$RUNNER_TEMP/changed-files"; then
+            echo 'ok=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ok=false' >> "$GITHUB_OUTPUT"
+            echo '::warning::PR diff unavailable; checking all areas'
+          fi
+      - name: Classify
+        id: classify
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_DIFF_OK: ${{ steps.diff.outputs.ok }}
+          CI_CHANGED_FILES: ${{ runner.temp }}/changed-files
+        run: node .github/scripts/ci-changes.mjs
+
+  scaffold:
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node .github/scripts/check-scaffold.mjs
+
+  sdk-guard:
+    needs: changes
+    if: needs.changes.outputs.sdk == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node .github/scripts/check-scaffold.mjs sdk
+
+  modbus-guard:
+    needs: changes
+    if: needs.changes.outputs.modbus == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node .github/scripts/check-scaffold.mjs modbus
+
+  slmp-guard:
+    needs: changes
+    if: needs.changes.outputs.slmp == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: node .github/scripts/check-scaffold.mjs slmp
+
+  ci-gate:
+    if: always()
+    needs: [changes, scaffold, sdk-guard, modbus-guard, slmp-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check required jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+          jq -e '.changes.result == "success" and .scaffold.result == "success"' <<< "$NEEDS" >/dev/null
+          jq -e 'all(.[]; .result != "failure" and .result != "cancelled")' <<< "$NEEDS" >/dev/null
+          for area in sdk modbus slmp; do
+            job="${area}-guard"
+            wanted=$(jq -r --arg area "$area" '.changes.outputs[$area]' <<< "$NEEDS")
+            result=$(jq -r --arg job "$job" '.[$job].result' <<< "$NEEDS")
+            if [[ "$wanted" == true && "$result" != success ]]; then
+              echo "::error::$job required but $result"
+              exit 1
+            fi
+          done
