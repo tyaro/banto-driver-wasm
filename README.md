@@ -1,6 +1,6 @@
 # banto-driver-wasm
 
-Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開発場所です。現在は**初期構成のみ**で、SDK、WIT、WASM ドライバ、Hub の loader / runtime は実装していません。利用可能なドライバや配布物はまだありません。
+Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開発場所です。現在は Modbus TCP の**読み取りフレーム処理の小さなコア**だけがあります。SDK、WIT コンポーネント、Hub の loader / runtime は実装していません。Hub で利用可能な WASM ドライバや配布物はまだありません。
 
 ## 境界と初回目標
 
@@ -12,18 +12,23 @@ Hub にある公開 `banto-driver-api`（`FrameDriver`）、`banto-driver-engine
 
 - [docs/STATUS.md](docs/STATUS.md): 確認済みの進捗、残件、次作業。新しいセッションはここから開始します。
 - [docs/PLAN.md](docs/PLAN.md): 段階計画、完了条件、CI の拡張順。
+- [docs/CONTRACT.md](docs/CONTRACT.md): 現行 API と WIT 案の照合、未決の境界。
 - [AGENTS.md](AGENTS.md): 作業・引継ぎの規約。
 
 ## 現在の CI
 
-Linux 上で Node.js 24 の標準機能だけを使い、変更パスの判定テスト、文書の存在確認、ソース追加時のガードを実行します。ローカル確認:
+Linux で変更パスの判定テストと文書・ソース追加のガードを実行します。Modbus 領域は Rust 1.85.1 で整形、Clippy、単体テスト、WASM ターゲットへの型検査を実行します。ローカル確認:
 
 ```sh
 node --test .github/scripts/ci-changes.test.mjs
 node .github/scripts/check-scaffold.mjs
+cargo fmt --all --check
+cargo clippy -p banto-modbus-read-core --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo check -p banto-modbus-read-core --target wasm32-unknown-unknown --locked
 ```
 
-この CI は WASM のビルド、Modbus / SLMP の動作、Hub との適合をまだ検証しません。製品コードを足すときは、対応するビルド・テストジョブを同じ変更で追加してください。
+この CI は WIT コンポーネントのビルド、Hub での実行、Modbus / SLMP の通信、native との実行結果一致をまだ検証しません。現在の Rust コアは FC3・単一保持レジスタの要求と応答のみです。`wasm32` の型検査は実行可能な WASM ドライバの生成を意味しません。
 
 ## 参照元
 
