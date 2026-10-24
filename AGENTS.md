@@ -1,6 +1,6 @@
 # 作業ガイド
 
-最初に [docs/STATUS.md](docs/STATUS.md) と [docs/PLAN.md](docs/PLAN.md) を読み、`git status` と既存ファイルを確認する。既存の作業や未追跡ファイルを上書きしない。`.agents/skills` が追加された場合は該当する指示も読む。現時点ではこのリポジトリに専用 skill はない。
+最初に [docs/STATUS.md](docs/STATUS.md)、[docs/PLAN.md](docs/PLAN.md)、[docs/CONTRACT.md](docs/CONTRACT.md) を読み、`git status` と既存ファイルを確認する。既存の作業や未追跡ファイルを上書きしない。`.agents/skills` が追加された場合は該当する指示も読む。現時点ではこのリポジトリに専用 skill はない。
 
 ## 境界
 
@@ -8,11 +8,12 @@
 - native ドライバは内部依存を持つ。丸ごとコピーせず、初回は Modbus TCP 読み取りの WASM と native の結果一致を狙う。
 - ソケット I/O、再接続、品質、書き込みの安全判断と監査は Hub 側。WASM 側の能力は段階ごとに設計・検証する。
 - 未実装の製品機能を README、CI、STATUS で「テスト済み」と表現しない。
+- `drivers/modbus` は現在、単一 FC3 読み取りの `no_std` コアであり、Hub API の実装でも WIT コンポーネントでもない。
 
 ## CI と変更
 
 - `.github/scripts/ci-changes.mjs` の判定を変えたら表テストも変える。未知パスと共通設定は全領域に倒す。SDK / WIT の変更は全利用先へ波及させる。
-- 現在の area ジョブは構成ガードのみ。製品ソースを追加する PR では実ビルド・テストを同時に配線し、ガードを適切に置き換える。CI のゲートに必要ジョブを加える。
+- Modbus は整形・Clippy・単体テスト・WASM ターゲットの型検査を実行する。SDK / WIT と SLMP は構成ガードのみ。製品ソースを追加するときは対応する実ビルド・テストを同時に配線し、CI のゲートに必要ジョブを加える。
 - 規模が小さい間は nextest の 3 分割などを写さない。WASM 成果物ができたら一度ビルドして後続ジョブで再利用する。main のキャッシュ保存、PR の復元、PR の古い実行だけのキャンセルを維持する。
 
 ## 引継ぎ

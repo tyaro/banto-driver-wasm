@@ -1,0 +1,3 @@
+[workspace]
+members = ["drivers/modbus"]
+resolver = "2"

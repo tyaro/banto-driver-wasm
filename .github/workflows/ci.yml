@@ -72,17 +72,22 @@ jobs:
           node-version: 24
       - run: node .github/scripts/check-scaffold.mjs sdk
 
-  modbus-guard:
+  modbus-test:
     needs: changes
     if: needs.changes.outputs.modbus == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - name: Install Rust 1.85.1
+        run: rustup toolchain install 1.85.1 --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown --no-self-update
+      - uses: Swatinem/rust-cache@v2
         with:
-          node-version: 24
-      - run: node .github/scripts/check-scaffold.mjs modbus
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p banto-modbus-read-core --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo check -p banto-modbus-read-core --target wasm32-unknown-unknown --locked
 
   slmp-guard:
     needs: changes
@@ -98,7 +103,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [changes, scaffold, sdk-guard, modbus-guard, slmp-guard]
+    needs: [changes, scaffold, sdk-guard, modbus-test, slmp-guard]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -113,6 +118,7 @@ jobs:
           jq -e 'all(.[]; .result != "failure" and .result != "cancelled")' <<< "$NEEDS" >/dev/null
           for area in sdk modbus slmp; do
             job="${area}-guard"
+            if [[ "$area" == modbus ]]; then job=modbus-test; fi
             wanted=$(jq -r --arg area "$area" '.changes.outputs[$area]' <<< "$NEEDS")
             result=$(jq -r --arg job "$job" '.[$job].result' <<< "$NEEDS")
             if [[ "$wanted" == true && "$result" != success ]]; then

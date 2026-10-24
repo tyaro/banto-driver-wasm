@@ -6,6 +6,7 @@ const required = {
   'AGENTS.md': ['docs/STATUS.md'],
   'docs/STATUS.md': ['## 完了', '## 検証', '## 未検証', '## 残件', '## 次作業', '## 判断'],
   'docs/PLAN.md': ['# 段階計画'],
+  'docs/CONTRACT.md': ['# API と WIT の照合'],
 };
 
 for (const [path, markers] of Object.entries(required)) {
@@ -24,10 +25,16 @@ const allowed = new Set([
   '.github/scripts/ci-changes.test.mjs',
   '.github/scripts/check-scaffold.mjs',
   '.github/workflows/ci.yml',
+  '.gitignore',
+  'Cargo.toml',
+  'Cargo.lock',
+  'rust-toolchain.toml',
+  'drivers/modbus/Cargo.toml',
+  'drivers/modbus/src/lib.rs',
 ]);
 function checkTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === '.git') continue;
+    if (dir === '.' && (entry.name === '.git' || entry.name === 'target')) continue;
     const path = join(dir, entry.name).replaceAll('\\', '/');
     if (entry.isDirectory()) checkTree(path);
     else if (!allowed.has(path) && !/^(sdk|wit|drivers\/modbus|drivers\/slmp)\/README\.md$/.test(path)) {
@@ -39,7 +46,7 @@ checkTree('.');
 
 // Until a real build/test job replaces this guard, source files must not pass silently.
 const area = process.argv[2];
-const roots = { sdk: ['sdk', 'wit'], modbus: ['drivers/modbus'], slmp: ['drivers/slmp'] };
+const roots = { sdk: ['sdk', 'wit'], slmp: ['drivers/slmp'] };
 if (area && !roots[area]) throw new Error(`Unknown area: ${area}`);
 function visit(dir) {
   if (!existsSync(dir)) return;
