@@ -1,6 +1,6 @@
 # API と WIT の照合
 
-照合元: banto-industrial `a0d01aa2` の [API 実装](https://github.com/tyaro/banto-industrial/tree/a0d01aa2/crates/banto-driver-api)、[Modbus 実装](https://github.com/tyaro/banto-industrial/tree/a0d01aa2/crates/banto-driver-modbus)、[API 設計 §9.2](https://github.com/tyaro/banto-industrial/blob/a0d01aa2/docs/banto-driver-api-design.md)、[WIT 案 §6.2](https://github.com/tyaro/banto-industrial/blob/a0d01aa2/docs/banto-hub-driver-plugin-design.md)。本書は照合記録であり、WIT v1 の確定宣言ではない。
+照合元: banto-industrial `89de2953b59587839d93a182c0bc7c17179adb0e`（2026-10-24 main）の [API 実装](https://github.com/tyaro/banto-industrial/tree/89de2953/crates/banto-driver-api)、[Modbus 実装](https://github.com/tyaro/banto-industrial/tree/89de2953/crates/banto-driver-modbus)、[API 設計 §9.2](https://github.com/tyaro/banto-industrial/blob/89de2953/docs/banto-driver-api-design.md)、[WIT 案 §6.2](https://github.com/tyaro/banto-industrial/blob/89de2953/docs/banto-hub-driver-plugin-design.md)。前回の `a0d01aa2` から、照合対象の API、Modbus、engine、両設計文書には差分がない。本書は照合記録であり、WIT v1 の確定宣言ではない。
 
 | Hub の現行 API | WIT 案 | 今回の状態 |
 | --- | --- | --- |
@@ -19,6 +19,26 @@
 3. **生値**: API `RawValue::{Bool, Int, Uint, Float, Bytes}` は WIT `types.value` と型が対応する。FC3・`U16` の native は `RawValue::Uint(u64)` を返し、engine の `decode_value` は数値タグを `Value::F64` に写す。推奨: 将来のアダプターはコアの `u16` を `uint(u64)` に拡張し、Hub の既存 `decode_value` を再利用する。`float` に先回りして変換しない。型不一致は Hub の `ItemError::Unsupported` にする。文字列の NUL・符号化規則や多語数値は別の比較試験が必要。
 4. **trap と上限**: WIT `fatal-error` は `framing` / `protocol` / `invalid-config` だけで、trap・実行時間超過・メモリ上限超過はゲストからの返値ではない。Hub 設計 §6.1、§6.3、§6.4 は接続用のこれらを接続致命としてインスタンスを破棄し、検証用の trap は検証エラーとして接続へ波及させない。`step.max-len` 超と応答タイムアウトもホスト側の接続致命。推奨: Hub runtime にホスト起因の失敗を保持する内部分類を置き、broker へ致命として渡す。文言の解析や `item-error` への変換はしない。`FatalError::InvalidConfig` は接続設定の誤りだけに使う。
 
-照合元は Hub `a0d01aa2` の `crates/banto-driver-api/src/{driver,frame,error,types}.rs`、`crates/banto-driver-engine/src/{lib,decode}.rs`、`crates/banto-driver-modbus/src/{base,frame_conn}.rs`、`docs/banto-hub-driver-plugin-design.md` §4.2・§6.2–6.4。上記は推薦案であり、Hub 側の WIT / runtime を変更・確定していない。
+照合元は Hub `89de2953` の `crates/banto-driver-api/src/{driver,frame,error,types}.rs`、`crates/banto-driver-engine/src/{lib,decode}.rs`、`crates/banto-driver-modbus/src/{base,frame_conn}.rs`、`docs/banto-hub-driver-plugin-design.md` §4.2・§6.2–6.4。上記は推薦案であり、Hub 側の WIT / runtime を変更・確定していない。
+
+## 判断待ちの境界案と実装条件
+
+次の形は**提案**であり、確定 WIT や製品コードにまだ反映しない。Hub の設計・API と同時に採否を決める。
+
+| 境界 | 提案する最小形 | 採用時の互換性・検証 |
+| --- | --- | --- |
+| `probe` | `address` に `use types.{tag-spec}; probe: func() -> option<tag-spec>` を追加する。返すアドレスは人が入力する表記とし、Hub が `address.parse` で正規化した後、接続して一度だけ `read.plan` → 送受信 → `read.decode` を実行する。`none` は handshake のみ。 | 現行 §5 の「handshake 完了だけで接続テスト成功」を改める。Modbus は `40001` / `u16` の読み取りが成功することを比較する。`probe` の値は接続設定ではないため、接続用と検証用のどちらのインスタンスから取得するかを Hub 側で決める。 |
+| `settingsVersion` | manifest に `settingsVersion: u32` を追加し、native `DriverDescriptor::settings_version` と同じ意味で保存・版比較する。Modbus の初期値は 1。 | manifest の必須欄を増やす。既存 native の旧い descriptor は欠落時に 1 と読むが、未導入のプラグイン manifest の欠落時の扱いは別途決める。`version` / `hubApi` で代用しない。 |
+| `inter_frame_gap` | `transports = [tcp]` の v1 ではゼロと契約に明記し、WIT に呼び出しを増やさない。 | TCP 以外のプラグインはこの版では導入しない。将来シリアルを追加する際、単位と 500 ms 上限、Hub が送信前に待つ時点を明示する必要がある。 |
+| `RawValue` | `u16` の FC3 読み取り結果は `types.value.uint(u64)`、機器例外は `item-error.device`、破損フレームは `fatal-error.framing`、要求と異なる ID は `fatal-error.protocol`。 | Hub の `decode_value` を通すと U16 の数値は `Value::F64` になる。WIT に `f64` として先に渡すと生値の型が失われる。余剰 PDU の native との既知の差は維持し、比較結果に明記する。 |
+| trap・上限 | ゲストが返す `fatal-error` と、ホストが検出した失敗を分ける。接続用の trap、epoch 超過、メモリ上限、受信上限、応答タイムアウトは接続致命。検証用の trap と実行上限は検証エラー。 | WIT `fatal-error` にホスト起因の variant を足さない。内部では原因・実行文脈を型で保持し、文字列から逆算しない。Hub runtime がまだないため、最終的な内部型と broker への写像は Hub 側で決める。 |
+
+接続用で `step.max-len` を超える応答は、現行 engine では `FatalError::Framing` に写る。WASM ホストでも接続致命を保ち、原因を「受信上限」として内部で識別する提案である。`step` 自体の不正、`read.decode` が返した項目エラー、ホスト側の I/O 失敗・タイムアウトはそれぞれ発生源が異なる。`FatalError::InvalidConfig` を trap や資源枯渇の代用にしない。
+
+## 決定後の最小比較経路
+
+1. Hub と同じ版の WIT を確定し、`driver` world の最小実装をビルドする。`address` / `config` など必須 export は実際に用意し、今回の比較対象は Modbus TCP FC3・単一 `u16` に限定する。ソケットはゲストに渡さない。
+2. 既存の [native 比較試験](../comparison/src/lib.rs) の要求・応答フィクスチャを共通入力として使う。ゲストの `read.plan` / `read.decode` を**実コンポーネントとして実行**し、要求バイト、`value.uint`、機器例外、致命分類を native と比較する。既知の余剰 PDU 2 件は差として検査する。
+3. `wasm32-unknown-unknown` の `cargo check` はコアの型検査と記録し、コンポーネントのビルド・型の照合・実行結果とは別に報告する。Hub loader が完成するまではテスト用ホストでの実行と Hub runtime 経由の検証を区別する。
 
 これらを決めるまでは独自 ABI や確定 WIT ファイルを追加しない。FC3 単一レジスタの比較は完了した。次は Hub と WIT v1 の境界を決めてから最小アダプターを設計する。
