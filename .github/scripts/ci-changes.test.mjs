@@ -8,6 +8,7 @@ const cases = [
   ['empty diff', 'pull_request', [], [true, true, true]],
   ['docs only', 'pull_request', ['README.md', 'docs/STATUS.md'], [false, false, false]],
   ['Modbus only', 'pull_request', ['drivers/modbus/src/lib.rs'], [false, true, false]],
+  ['native comparison', 'pull_request', ['comparison/src/lib.rs'], [false, true, false]],
   ['SLMP only', 'pull_request', ['drivers/slmp/src/lib.rs'], [false, false, true]],
   ['SDK affects all', 'pull_request', ['sdk/src/lib.rs'], [true, true, true]],
   ['WIT affects all', 'pull_request', ['wit/driver.wit'], [true, true, true]],

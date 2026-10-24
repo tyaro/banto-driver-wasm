@@ -26,9 +26,10 @@ cargo fmt --all --check
 cargo clippy -p banto-modbus-read-core --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo check -p banto-modbus-read-core --target wasm32-unknown-unknown --locked
+cargo +1.98.1 test --manifest-path comparison/Cargo.toml --locked
 ```
 
-この CI は WIT コンポーネントのビルド、Hub での実行、Modbus / SLMP の通信、native との実行結果一致をまだ検証しません。現在の Rust コアは FC3・単一保持レジスタの要求と応答のみです。`wasm32` の型検査は実行可能な WASM ドライバの生成を意味しません。
+比較試験は Hub `a0d01aa2` の公開 `FrameDriver` を Git 依存として取得し、FC3・単一レジスタの同じ応答 12 件を native と新コアへ渡します。10 件は一致し、余剰 PDU の 2 件は native の受理と新コアの拒否を明示的に検査します。比較ジョブは Hub 側の固定ツールチェーン Rust 1.98.1 を使います。WIT コンポーネントのビルド、Hub runtime での WASM 実行、Modbus / SLMP 通信は未検証です。`wasm32` の型検査は実行可能な WASM ドライバの生成を意味しません。
 
 ## 参照元
 

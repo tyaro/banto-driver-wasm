@@ -89,6 +89,23 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo check -p banto-modbus-read-core --target wasm32-unknown-unknown --locked
 
+  native-compare:
+    needs: changes
+    if: needs.changes.outputs.modbus == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Hub's pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: comparison -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo +1.98.1 fmt --manifest-path comparison/Cargo.toml --check
+      - run: cargo +1.98.1 clippy --manifest-path comparison/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo +1.98.1 test --manifest-path comparison/Cargo.toml --locked
+
   slmp-guard:
     needs: changes
     if: needs.changes.outputs.slmp == 'true'
@@ -103,7 +120,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [changes, scaffold, sdk-guard, modbus-test, slmp-guard]
+    needs: [changes, scaffold, sdk-guard, modbus-test, native-compare, slmp-guard]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -126,3 +143,9 @@ jobs:
               exit 1
             fi
           done
+          wanted=$(jq -r '.changes.outputs.modbus' <<< "$NEEDS")
+          result=$(jq -r '."native-compare".result' <<< "$NEEDS")
+          if [[ "$wanted" == true && "$result" != success ]]; then
+            echo "::error::native-compare required but $result"
+            exit 1
+          fi
