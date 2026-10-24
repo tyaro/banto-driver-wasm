@@ -1,0 +1,13 @@
+[package]
+name = "banto-fc3-native-comparison"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A separate workspace keeps the Hub's dependency graph out of the no_std core.
+[workspace]
+
+[dependencies]
+banto-modbus-read-core = { path = "../drivers/modbus" }
+banto-driver-api = { git = "https://github.com/tyaro/banto-industrial.git", rev = "a0d01aa2beb007fc2636288c4e839410dece3fdc" }
+banto-driver-modbus = { git = "https://github.com/tyaro/banto-industrial.git", rev = "a0d01aa2beb007fc2636288c4e839410dece3fdc" }

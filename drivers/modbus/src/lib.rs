@@ -4,7 +4,8 @@
 //! component. The Hub still owns I/O and the production Modbus driver.
 //! The shape is checked against the native implementation at
 //! `banto-plc/src/modbus/frame.rs` and `banto-driver-modbus/src/frame_conn.rs`
-//! at banto-industrial a0d01aa2. Runtime parity remains unverified.
+//! at banto-industrial a0d01aa2. The separate `comparison` crate exercises
+//! the native FrameDriver on shared FC3 fixtures; it does not run WASM.
 
 #![no_std]
 

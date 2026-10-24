@@ -31,11 +31,15 @@ const allowed = new Set([
   'rust-toolchain.toml',
   'drivers/modbus/Cargo.toml',
   'drivers/modbus/src/lib.rs',
+  'comparison/Cargo.toml',
+  'comparison/Cargo.lock',
+  'comparison/src/lib.rs',
 ]);
 function checkTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (dir === '.' && (entry.name === '.git' || entry.name === 'target')) continue;
     const path = join(dir, entry.name).replaceAll('\\', '/');
+    if (path === 'comparison/target') continue;
     if (entry.isDirectory()) checkTree(path);
     else if (!allowed.has(path) && !/^(sdk|wit|drivers\/modbus|drivers\/slmp)\/README\.md$/.test(path)) {
       throw new Error(`${path}: add the needed CI check before introducing this file`);
