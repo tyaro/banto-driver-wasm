@@ -73,8 +73,8 @@ impl ReadHoldingU16 {
         }
         let pdu = &response[7..];
         match pdu.first() {
-            Some(0x83) if pdu.len() >= 2 => Err(ReadError::Device(pdu[1])),
-            Some(0x03) if pdu.len() >= 4 && pdu[1] == 2 => Ok(u16::from_be_bytes([pdu[2], pdu[3]])),
+            Some(0x83) if pdu.len() == 2 => Err(ReadError::Device(pdu[1])),
+            Some(0x03) if pdu.len() == 4 && pdu[1] == 2 => Ok(u16::from_be_bytes([pdu[2], pdu[3]])),
             _ => Err(ReadError::Framing),
         }
     }
@@ -108,6 +108,22 @@ mod tests {
         assert_eq!(
             READ.decode(&[0x12, 0x34, 0, 0, 0, 3, 1, 0x83, 2]),
             Err(ReadError::Device(2))
+        );
+    }
+
+    #[test]
+    fn normal_response_rejects_trailing_pdu_byte_with_matching_mbap_length() {
+        assert_eq!(
+            READ.decode(&[0x12, 0x34, 0, 0, 0, 6, 1, 3, 2, 0, 42, 0xff]),
+            Err(ReadError::Framing)
+        );
+    }
+
+    #[test]
+    fn exception_response_rejects_trailing_pdu_byte_with_matching_mbap_length() {
+        assert_eq!(
+            READ.decode(&[0x12, 0x34, 0, 0, 0, 4, 1, 0x83, 2, 0xff]),
+            Err(ReadError::Framing)
         );
     }
 
