@@ -1,5 +1,11 @@
 # STATUS
 
+## 今回の作業（SLMP 基本 SD 設定点数）
+
+- [PR #9](https://github.com/tyaro/banto-driver-wasm/pull/9) は head `9dd08da` の CI・統合レビュー・指摘解消・競合なしを再確認して squash merge した。main の統合 SHA は `3cc8119e7b0117cb6d5f56b6d35e3a22c57dc75e`。専用 worktree は未保存/固有ファイルと使用中プロセスがないことを確認して片付け、元 repo・他 worktree・branch は保持した。
+- `drivers/slmp` に標準 Q `SD290–304` と標準 iQ-R / ENCPU の基本 SD 点数の取得計画・復号を追加した。Q の D/W は内部点数のみと明示し、旧 M/B/内部 D/W の 32768 飽和は下限とする。R の pair と Z/LZ 単 word、S の firmware/SFC 条件を区別する。型式・経路・firmware または取得値が不明なら点数は `Unknown`。
+- Q 拡張 M/B、高速 D/W、D/W 合計、条件付き SD306–307、SD647 はこの小段階の数値判定に使わない。公式マップと独立 fixture 5件を照合した。Rust 1.98.1 の SLMP 既存12件を含む計17件、整形・Clippy・wasm32 型検査、scaffold をローカル検証。実機通信、WIT/Hub、write は未実施。
+
 ## 今回の作業（SLMP 0101 型式名読取り）
 
 - [PR #8](https://github.com/tyaro/banto-driver-wasm/pull/8) は head `8320935d` の CI・同版レビュー・競合なしを再確認して squash merge した。main の統合 SHA は `1f5932fd8e04820e6e9e6e585de7e625f4bad257`。専用 worktree は未保存・固有ファイルと使用中プロセスがないことを確認して片付けた。元 repo、他 worktree、branch は保持した。
