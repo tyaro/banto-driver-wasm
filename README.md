@@ -1,6 +1,6 @@
 # banto-driver-wasm
 
-SLMP の最初の実装は [`drivers/slmp`](drivers/slmp/README.md) にある binary 4E・0401 連続読取りのフレームコアです。Q/R の独立フィクスチャで確認し、機種判別・実設定範囲・Hub 接続・実機通信は後続とします。
+SLMP は [`drivers/slmp`](drivers/slmp/README.md) に binary 4E・0401 連続読取りと 0101/0000 型式名読取りの I/O 非依存コアがあります。実設定範囲の取得、Hub 接続、実機通信は後続です。
 
 Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開発場所です。現在は Modbus TCP の FC3・単一タグ U16/U32 読み取りコアと、同じ範囲を扱う WASM コンポーネントがあります。Hub は [PR #843](https://github.com/tyaro/banto-industrial/pull/843) で FC3・単一 U16 の WASM ゲストを固定 SHA で登録しました。このリポジトリの U32 版コンポーネントは Hub に登録されておらず、Hub 経由の U32 は未対応です。
 
@@ -8,7 +8,7 @@ Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開�
 
 Hub にある公開 `banto-driver-api`（`FrameDriver`）、`banto-driver-engine`、`banto-driver-conformance`、`DriverRegistry` を再利用する方針です。Hub はソケット、broker の 1 接続 1 セッション、品質判定、書き込みの関門、監査を持ち、WASM はフレームの生成・応答解析・アドレスと設定の検証を担当する想定です。既存 native ドライバは内部依存があるため、クレート一式をこのリポジトリへコピーしません。
 
-最初の製品目標は Modbus TCP の **WASM 読み取り**を Hub の既存 native 実装と同じ入力・応答で比較することです。FC3・単一 U16 はコア、native、実 WASM の共有フィクスチャ12件、単一タグ U32（2レジスタ）の両 `word_order` は15件で比較します。U32 は既存 WIT の `uint(u64)` と `word-count=2` で表現します。文字列、SLMP の機種判別・実設定範囲・WIT 接続、書き込み、プラグイン UI、配布管理は後続段階です。初版 WIT 境界は [CONTRACT.md](docs/CONTRACT.md) に記録しています。
+最初の製品目標は Modbus TCP の **WASM 読み取り**を Hub の既存 native 実装と同じ入力・応答で比較することです。FC3・単一 U16 はコア、native、実 WASM の共有フィクスチャ12件、単一タグ U32（2レジスタ）の両 `word_order` は15件で比較します。U32 は既存 WIT の `uint(u64)` と `word-count=2` で表現します。文字列、SLMP の実設定範囲・WIT 接続、書き込み、プラグイン UI、配布管理は後続段階です。初版 WIT 境界は [CONTRACT.md](docs/CONTRACT.md) に記録しています。
 
 ## 作業の入口
 

@@ -1,5 +1,11 @@
 # STATUS
 
+## 今回の作業（SLMP 0101 型式名読取り）
+
+- [PR #8](https://github.com/tyaro/banto-driver-wasm/pull/8) は head `8320935d` の CI・同版レビュー・競合なしを再確認して squash merge した。main の統合 SHA は `1f5932fd8e04820e6e9e6e585de7e625f4bad257`。専用 worktree は未保存・固有ファイルと使用中プロセスがないことを確認して片付けた。元 repo、他 worktree、branch は保持した。
+- `0101/0000` の binary 4E 要求と固定 16 バイト ASCII 型名・2 バイト型式コードの復号を I/O 非依存コアへ追加した。型名の生データと表示名を保持し、標準 Q / iQ-R・ENCPU の公式な名前・コード組のみ分類する。未知組、RCPU/0360H、特殊 CPU は未対応型式として保持し、設定済みタグ範囲を推定しない。
+- SLMP 公式マニュアル pp.138–141 を独立フィクスチャで確認。native には 0101 実装がないため、共通の 4E ヘッダー・応答検査のみ静的照合。GitHub Codex の同版レビューで見つかった Q10UDEHCPU / Q20UDEHCPU の別名漏れを公式表で確認して追加した。Rust 1.98.1 の SLMP テストは既存6件と新規6件が成功し、整形・Clippy・wasm32 型検査も成功。実 PLC 通信、WIT/Hub 結合、SD 範囲取得、書込みは未実施。
+
 ## 今回の作業（SLMP 0401 読取りフレーム）
 
 - [PR #7](https://github.com/tyaro/banto-driver-wasm/pull/7) は head `66020f3a` の CI・統合レビューを再確認して squash merge した。main の統合 SHA は `5233d55a4d1c278c473e9c44df608c1423c1a629`。元 repo・他 worktree・branch は保持した。

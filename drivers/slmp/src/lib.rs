@@ -1,9 +1,12 @@
 //! Binary 4E SLMP batch-read (0401) framing for standard Q and iQ-R.
-//! This core does no I/O, model detection, configured-range lookup, or writes.
+//! This core does no I/O, configured-range lookup, or writes.
 #![no_std]
 
 extern crate alloc;
 use alloc::vec::Vec;
+
+mod type_name;
+pub use type_name::{decode_type_name, encode_type_name, ModelFamily, TypeName};
 
 /// Wire layout only. The actual CPU model and its supported devices are checked later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +81,8 @@ pub enum RequestError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseError {
     Framing,
+    /// The 0101 name field is not a nonempty printable ASCII model name.
+    MalformedName,
     /// Nonzero SLMP end code; the PLC rejected the request.
     EndCode(u16),
 }
@@ -103,10 +108,8 @@ fn check_span(series: Series, span: ReadSpan) -> Result<(), RequestError> {
     Ok(())
 }
 
-/// Build one complete binary 4E batch-read request (command 0401).
-pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u8>, RequestError> {
-    check_span(series, span)?;
-    let mut out = Vec::with_capacity(if series == Series::Q { 25 } else { 27 });
+fn request_head(route: Route, data_length: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(27);
     out.extend_from_slice(&[0x54, 0x00]);
     out.extend_from_slice(&route.serial.to_le_bytes());
     out.extend_from_slice(&[0, 0]);
@@ -114,8 +117,15 @@ pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u
     out.push(route.pc);
     out.extend_from_slice(&route.io.to_le_bytes());
     out.push(route.station);
-    out.extend_from_slice(&(if series == Series::Q { 12u16 } else { 14u16 }).to_le_bytes());
+    out.extend_from_slice(&data_length.to_le_bytes());
     out.extend_from_slice(&route.timer.to_le_bytes());
+    out
+}
+
+/// Build one complete binary 4E batch-read request (command 0401).
+pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u8>, RequestError> {
+    check_span(series, span)?;
+    let mut out = request_head(route, if series == Series::Q { 12 } else { 14 });
     out.extend_from_slice(&0x0401u16.to_le_bytes());
     let subcommand = match (series, span.device.is_bit()) {
         (Series::Q, false) => 0,
@@ -136,7 +146,7 @@ pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u
 
 /// Parse a complete response to this request. The Hub owns stream framing and I/O.
 /// Even PLC refusals must echo the request's route and serial number.
-pub fn decode_read(route: Route, span: ReadSpan, frame: &[u8]) -> Result<Values, ResponseError> {
+fn response_data(route: Route, frame: &[u8]) -> Result<&[u8], ResponseError> {
     if frame.len() < 15
         || frame[0..2] != [0xd4, 0]
         || frame[2..4] != route.serial.to_le_bytes()
@@ -153,7 +163,11 @@ pub fn decode_read(route: Route, span: ReadSpan, frame: &[u8]) -> Result<Values,
     if end_code != 0 {
         return Err(ResponseError::EndCode(end_code));
     }
-    let data = &frame[15..];
+    Ok(&frame[15..])
+}
+
+pub fn decode_read(route: Route, span: ReadSpan, frame: &[u8]) -> Result<Values, ResponseError> {
+    let data = response_data(route, frame)?;
     if span.device.is_bit() {
         if data.len() != usize::from(span.count).div_ceil(2) {
             return Err(ResponseError::Framing);
