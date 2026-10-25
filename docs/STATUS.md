@@ -1,6 +1,12 @@
 # STATUS
 
-## Current stage: verified contiguous D/u16 batch reads
+## Current stage: Q25PRHCPU wire-only read
+
+- The exact `Q25PRHCPU / 004CH` 0101 pair now establishes Q word-read framing without classifying it as standard Q for SD planning. The guest sends no SD request, retains an unknown D count, and sends explicit D/u16 tags individually, including adjacent tags. Mismatched names/codes and 0101 refusals do not establish the wire format. [SLMP Reference Manual, printed p.139](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141).
+- The existing WIT and standard Q/R behavior remain unchanged. No live PLC communication, redundant-route selection, write, or Hub implementation is part of this stage.
+- Rust 1.98.1 local checks cover 26 SLMP core fixtures, the component unit/doc tests, 12 controlled real Wasmtime fixtures, formatting, Clippy, wasm32 target check, WIT target validation, scaffold guard, and 17 CI classification tests.
+
+## Previous stage: verified contiguous D/u16 batch reads
 
 - From merged PR #14 main, `read.plan` groups input-order adjacent D/u16 tags only when each address is within a verified configured range. Each step's ordered `covers` maps one response word to each original tag. The existing 0401 word-read limit of 960 points is enforced through the SLMP core; a longer run is split. Gaps, duplicates, unsupported specs and unknown-range tags break a run. Unknown-range explicit tags remain one request each and are not promoted by a successful read. [SLMP Reference Manual, printed p.46](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=48).
 - Unsupported syntax/type, verified R out-of-range addresses, and wire-number overflow remain uncovered for the Hub's item-level `Unsupported`. A whole-batch PLC end code becomes the same item-level `Device` error for each cover, without partial values; other planned steps can continue. Malformed or mismatched frames and plan/cover mismatches remain fatal under the host's close-and-reconnect contract.

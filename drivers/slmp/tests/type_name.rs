@@ -1,4 +1,7 @@
-use banto_slmp_read_core::{decode_type_name, encode_type_name, ModelFamily, ResponseError, Route};
+use banto_slmp_read_core::{
+    basic_sd_count, decode_type_name, encode_type_name, plan_basic_sd, BasicArea, BasicEvidence,
+    ModelFamily, PointCount, ResponseError, Route,
+};
 
 // Literal binary 4E bytes assembled from SLMP Reference Manual pp. 20-30,
 // 138-141. The Q02UCPU name/code pair is its printed binary example (p. 141).
@@ -26,6 +29,45 @@ fn request_and_known_q_r_responses_match_wire_fixtures() {
     assert_eq!(r.name, "R04ENCPU");
     assert_eq!(r.code, 0x4805);
     assert_eq!(r.family, ModelFamily::StandardR);
+}
+
+#[test]
+fn q25prh_exact_0101_pair_proves_q_wire_but_not_any_basic_sd_map() {
+    // SLMP Reference Manual, printed p.139, lists Q25PRHCPU / 004CH.
+    let mut frame = Q02UCPU;
+    frame[15..31].copy_from_slice(b"Q25PRHCPU       ");
+    frame[31..33].copy_from_slice(&[0x4c, 0x00]);
+    let model = decode_type_name(Route::default(), &frame).unwrap();
+    assert_eq!(model.name, "Q25PRHCPU");
+    assert_eq!(model.raw_name, *b"Q25PRHCPU       ");
+    assert_eq!(model.code, 0x004c);
+    assert_eq!(model.family, ModelFamily::Q25PrhWireOnly);
+    assert_eq!(plan_basic_sd(&model, BasicArea::DInternal), None);
+    assert_eq!(plan_basic_sd(&model, BasicArea::X), None);
+    assert_eq!(
+        basic_sd_count(
+            &model,
+            BasicArea::DInternal,
+            BasicEvidence {
+                route_confirmed: true,
+                r_firmware: None,
+            },
+            Some(&[1024]),
+        ),
+        PointCount::Unknown
+    );
+
+    frame[31..33].copy_from_slice(&[0x4b, 0x00]);
+    assert_eq!(
+        decode_type_name(Route::default(), &frame).unwrap().family,
+        ModelFamily::Unknown
+    );
+    frame[31..33].copy_from_slice(&[0x4c, 0x00]);
+    frame[15..31].copy_from_slice(b"Q12PRHCPU       ");
+    assert_eq!(
+        decode_type_name(Route::default(), &frame).unwrap().family,
+        ModelFamily::Unknown
+    );
 }
 
 #[test]
