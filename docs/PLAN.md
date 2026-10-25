@@ -1,6 +1,9 @@
 # 段階計画
 
-P3 では SLMP binary 4E・0401 の読取りフレーム、0101/0000 型式名読取り、基本 SD 点数の取得計画・復号を I/O 非依存コアで実装した。今回は条件を確認できた QnU ZR の SD306–307 のみ追加する。拡張 M/B、高速 D/W、Q D/W 合計、タグ読取りテスト、WIT 接続は後続段階とし、実機 I/O と書込みは別判断とする。
+
+P3 follow-up: SD286-289 QnU complete M/B and SD282-285 classified QnUDV internal-only D/W counts are a separate I/O-free stage. Version, serial, and route evidence must be independently confirmed. M/B pairs are complete configured counts, while fast D/W pairs are internal-only; Q SD308-311 totals and tag validation remain later work.
+
+P3 has I/O-free binary 4E 0401 read frames, 0101 model classification, basic SD count handling, and conditional QnU ZR SD306-307 handling. The current follow-up adds conditional SD282-289 field handling. Q D/W totals, tag validation, WIT integration, PLC I/O, and writes remain later decisions.
 
 状態: 計画。各段階の完了条件を満たすまでは製品機能を実装済みと扱わない。
 

@@ -1,5 +1,14 @@
 # SLMP: 機種別デバイス範囲とタグ判定の設計案
 
+
+## Conditional Q extension fields (current core stage)
+
+[QCPU Appendix 3 printed p.549](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=551) defines low/high SD286-287 for the QnU complete M count and SD288-289 for the complete B count. Its *6 footnote (printed p.553) requires CPU serial first five digits 10042 or later; it does not carry the separate Q00UJ exclusion used for ZR. [QnU Appendix 2 printed p.467](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=469) distinguishes bit-device extension version/serial support from extended D/W support. The core requires independently confirmed version, serial, and route evidence before planning these reads.
+
+The same QCPU table assigns SD282-283 to high-speed QnUDV/QnUDPV internal D points and SD284-285 to internal W points. The current classifier recognizes only five standard QnUDV name/code pairs, so this stage plans the pairs only for those five. QnUDPV remains unsupported. The SD282-285 entries have no additional serial footnote; model/version/route evidence is still required by this core. A complete two-word response yields the named count: M/B is the full configured count; fast D/W is internal-only. The QCPU table's 32K wording is not used as a blanket rejection threshold; QnU model-specific internal D capacities can exceed it. A nonzero high-word fixture verifies decoding and does not establish a possible physical capacity.
+
+SD286-289 are complete M/B counts and must not be added to old saturated M/B words SD292/294. SD282-285 are internal D/W counts, distinct from old SD302/303 and D/W total fields SD308-311. Q ZR SD306-307 is separate. The core does not synthesize D/W totals or claim an exact tag range. Missing applicability evidence, unsupported model, or partial SD response yields `Unknown`. Connection generation binding and cache invalidation remain future Hub/driver integration work. No PLC communication or write is implemented here.
+
 ## 現在の実装範囲（QnU ZR の条件付き点数）
 
 [`src/q_zr.rs`](src/q_zr.rs) は標準 Universal QnU（Q00UJCPU を除く）に対し、拡張 D **または**拡張 W を 1K 点以上設定したこと、対象 firmware と通信経路の適用を別途確認できた場合だけ `SD306–307` の low/high pair を ZR の点数として計画・復号する。条件未確認・条件外・読出し失敗・片 word だけの場合は `Unknown` であり、ゼロや厳密な上限を捏造しない。[Q CPU Appendix 3 p.550 の SD306–307 欄と *7](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=552)。この core は条件の証拠を収集せず、I/O と cache も持たない。証拠と SD 値は同じ接続先・取得世代に紐づけ、再接続時に失効させる必要がある。[独立フィクスチャ](tests/q_zr.rs) は Q00UJ 除外、条件分岐、2 word 順、0401 要求を検査する。

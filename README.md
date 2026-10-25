@@ -1,6 +1,9 @@
 # banto-driver-wasm
 
-SLMP は [`drivers/slmp`](drivers/slmp/README.md) に binary 4E・0401 連続読取り、0101/0000 型式名読取り、基本 SD 設定点数と条件付き QnU ZR 点数の取得計画・復号の I/O 非依存コアがあります。その他の拡張範囲、Hub 接続、実機通信は後続です。
+
+The SLMP I/O-free core also plans conditional QnU complete M/B counts (SD286-289) and recognized QnUDV internal-only D/W counts (SD282-285). These are field counts; D/W totals and complete tag ranges are not inferred; see [`drivers/slmp`](drivers/slmp/README.md) for evidence requirements.
+
+SLMP contains an I/O-free binary 4E 0401 read-frame core, 0101 model classification, basic SD point counts, conditional QnU ZR counts, and the conditional Q SD282-289 fields described below. Hub integration, PLC communication, and remaining device-range decisions are later stages.
 
 Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開発場所です。現在は Modbus TCP の FC3・単一タグ U16/U32 読み取りコアと、同じ範囲を扱う WASM コンポーネントがあります。Hub は [PR #843](https://github.com/tyaro/banto-industrial/pull/843) で FC3・単一 U16 の WASM ゲストを固定 SHA で登録しました。このリポジトリの U32 版コンポーネントは Hub に登録されておらず、Hub 経由の U32 は未対応です。
 
