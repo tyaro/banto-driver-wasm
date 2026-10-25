@@ -3,4 +3,6 @@
 /component/target/
 /runtime-comparison/target/
 /drivers/slmp/target/
+/slmp-component/target/
+/slmp-runtime/target/
 /dist/

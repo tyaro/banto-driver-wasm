@@ -12,6 +12,8 @@ const cases = [
   ['WASM component', 'pull_request', ['component/src/lib.rs'], [false, true, false]],
   ['runtime comparison', 'pull_request', ['runtime-comparison/src/lib.rs'], [false, true, false]],
   ['SLMP only', 'pull_request', ['drivers/slmp/src/lib.rs'], [false, false, true]],
+  ['SLMP component', 'pull_request', ['slmp-component/src/lib.rs'], [false, false, true]],
+  ['SLMP runtime fixtures', 'pull_request', ['slmp-runtime/src/lib.rs'], [false, false, true]],
   ['SDK affects all', 'pull_request', ['sdk/src/lib.rs'], [true, true, true]],
   ['WIT affects all', 'pull_request', ['wit/driver.wit'], [true, true, true]],
   ['unknown path', 'pull_request', ['other/file.rs'], [true, true, true]],

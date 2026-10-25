@@ -21,6 +21,7 @@ for (const [path, markers] of Object.entries(required)) {
 // tracked project file has an explicit place; future source/config must update CI.
 const allowed = new Set([
   ...Object.keys(required),
+  'docs/SLMP_DISCOVERY_CONTRACT.md',
   '.github/scripts/ci-changes.mjs',
   '.github/scripts/ci-changes.test.mjs',
   '.github/scripts/check-scaffold.mjs',
@@ -43,6 +44,12 @@ const allowed = new Set([
   'drivers/slmp/tests/read_frame.rs',
   'drivers/slmp/tests/sd_basic.rs',
   'drivers/slmp/tests/type_name.rs',
+  'slmp-component/Cargo.toml',
+  'slmp-component/Cargo.lock',
+  'slmp-component/src/lib.rs',
+  'slmp-runtime/Cargo.toml',
+  'slmp-runtime/Cargo.lock',
+  'slmp-runtime/src/lib.rs',
   'comparison/Cargo.toml',
   'comparison/Cargo.lock',
   'comparison/src/lib.rs',
@@ -59,7 +66,8 @@ function checkTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (dir === '.' && (entry.name === '.git' || entry.name === 'target' || entry.name === 'dist')) continue;
     const path = join(dir, entry.name).replaceAll('\\', '/');
-    if (path === 'comparison/target' || path === 'component/target' || path === 'runtime-comparison/target' || path === 'drivers/slmp/target') continue;
+    if (path === 'comparison/target' || path === 'component/target' || path === 'runtime-comparison/target' || path === 'drivers/slmp/target'
+      || path === 'slmp-component/target' || path === 'slmp-runtime/target') continue;
     if (entry.isDirectory()) checkTree(path);
     else if (!allowed.has(path) && !/^(sdk|wit|drivers\/modbus|drivers\/slmp)\/README\.md$/.test(path)) {
       throw new Error(`${path}: add the needed CI check before introducing this file`);

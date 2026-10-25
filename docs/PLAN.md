@@ -1,9 +1,10 @@
 # 段階計画
 
+P3 guest follow-up: the separate SLMP component uses the existing WIT world for controlled 0101 -> model-specific basic D SD -> one D/u16 0401 read at a time in Wasmtime. A recognized Q/R wire series permits an explicit unknown-range read at the operator's responsibility; a successful value never proves the range. Unknown model/name-code and 0101 refusal still lack a confirmed Q/R 0401 format in this guest. A structured Hub discovery snapshot is design only. Further WIT/Hub implementation, full device coverage, physical PLC I/O, and writes are later decisions.
 
 P3 follow-up: SD286-289 QnU complete M/B and SD282-285 classified QnUDV internal-only D/W counts are a separate I/O-free stage. Version, serial, and route evidence must be independently confirmed. M/B pairs are complete configured counts, while fast D/W pairs are internal-only; Q SD308-311 totals and tag validation remain later work.
 
-P3 has I/O-free binary 4E 0401 read frames, 0101 model classification, basic SD count handling, and conditional QnU ZR SD306-307 handling. The current follow-up adds conditional SD282-289 field handling. Q D/W totals, tag validation, WIT integration, PLC I/O, and writes remain later decisions.
+P3 has I/O-free binary 4E 0401 read frames, 0101 model classification, basic SD count handling, conditional QnU ZR SD306-307, and conditional SD282-289 field handling. The current guest uses the existing WIT for its narrow D/u16 read path. Q D/W totals, other tag kinds, structured discovery metadata, Hub integration, PLC I/O, and writes remain later decisions.
 
 状態: 計画。各段階の完了条件を満たすまでは製品機能を実装済みと扱わない。
 
