@@ -2,7 +2,7 @@
 
 更新日: 2026-10-25
 
-## 今回の作業（PR 準備中）
+## 今回の作業（[PR #5](https://github.com/tyaro/banto-driver-wasm/pull/5)）
 
 - main `be5753d003aa49d065405e30753a2a0903d3e24c` を確認し、FC3・単一タグ U32（2レジスタ）と word order を依存なしコアと固定版 native 比較に追加した。既存 U16 共有12件（10一致・余剰 PDU 2件の意図的拒否）は維持する。
 - 固定版 native `a0d01aa2` の `frame_conn.rs` と `decode.rs` を照合した。`low_high` は先頭ワードが下位、`high_low` は先頭が上位。`create_connection` の未指定時は `low_high`、フォームの `settings_schema` 既定値は `high_low` である。コアの既定は前者に合わせ、フォーム側は変更しない。
@@ -29,6 +29,7 @@
 ## 検証
 
 - 今回のローカル Rust 1.98.1 検証: コア単体10/10、native 比較4/4（U16 共有12件、U32 15件、末尾範囲・未指定既定値）、コアと比較クレートの整形・Clippy、コアの `wasm32-unknown-unknown` 型検査、既存コンポーネント単体4/4・doc1/1、既存 Wasmtime 比較クレートのテストコード型検査が成功。Node.js の変更判定15/15、構成ガード、`git diff --check` も成功した。U32 の実 WASM 比較を実施した結果ではない。
+- PR #5 初回 head `993b5d2d211e99af397d9e477266939c75fa7cf9` の [CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40157741035) は終端まで成功。`modbus-test` / `native-compare` / `component-build` / `component-compare` / `ci-gate` を含む7ジョブが成功し、対象外の SDK・SLMP ガード2ジョブは skipped。
 - Node.js 24.19.0 で `node --test .github/scripts/ci-changes.test.mjs` が 12/12 成功。
 - `node .github/scripts/check-scaffold.mjs` と `sdk` / `slmp` 指定のガードが成功。
 - `git diff --check` が成功。CI 定義は YAML として解析できた。
