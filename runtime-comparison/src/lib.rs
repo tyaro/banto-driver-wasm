@@ -2,13 +2,14 @@
 
 #[cfg(test)]
 mod tests {
-    use banto_fc3_native_comparison::fixtures::{native, Outcome, FIXTURES};
+    use banto_fc3_native_comparison::fixtures::{
+        native, native_u32, Outcome, FIXTURES, U32_FIXTURES,
+    };
     use serde_json::{json, Value as JsonValue};
 
     wasmtime::component::bindgen!({ path: "../wit", world: "driver" });
 
-    // Contract checks for the prototype artifact. Hub must enforce the same
-    // conditions when it gains a loader; these checks do not register a driver.
+    // Contract checks for the artifact. These do not register a driver in Hub.
     fn manifest_settings_version(manifest: &JsonValue) -> Result<u32, &'static str> {
         let version = manifest
             .get("settingsVersion")
@@ -35,11 +36,29 @@ mod tests {
         }
     }
 
+    fn checked_fc3_u32(
+        data_type: &str,
+        value: &banto::driver::types::Value,
+    ) -> Result<u32, &'static str> {
+        use banto::driver::types::Value;
+
+        if data_type != "u32" {
+            return Err("FC3 U32 requires u32");
+        }
+        match value {
+            Value::Uint(raw) => u32::try_from(*raw).map_err(|_| "uint exceeds u32"),
+            _ => Err("FC3 u32 requires uint"),
+        }
+    }
+
     #[test]
     fn prototype_manifest_requires_positive_settings_version() {
         let valid: JsonValue =
             serde_json::from_str(include_str!("../../component/manifest.json")).unwrap();
         assert_eq!(manifest_settings_version(&valid), Ok(1));
+        assert_eq!(valid["version"], "0.2.0");
+        assert_eq!(valid["hubApi"], "1");
+        assert_eq!(valid["displayName"], "Modbus TCP FC3 U16/U32 (WASM)");
         for invalid in [
             json!({}),
             json!({ "settingsVersion": null }),
@@ -64,6 +83,20 @@ mod tests {
         assert!(checked_fc3_u16("u16", &Value::Int(42)).is_err());
         assert!(checked_fc3_u16("u16", &Value::Float(42.0)).is_err());
         assert!(checked_fc3_u16("i16", &Value::Uint(42)).is_err());
+    }
+
+    #[test]
+    fn fc3_u32_boundary_refuses_other_variants_and_overflow() {
+        use banto::driver::types::Value;
+
+        assert_eq!(checked_fc3_u32("u32", &Value::Uint(0)), Ok(0));
+        assert_eq!(
+            checked_fc3_u32("u32", &Value::Uint(u32::MAX.into())),
+            Ok(u32::MAX)
+        );
+        assert!(checked_fc3_u32("u32", &Value::Uint(u64::from(u32::MAX) + 1)).is_err());
+        assert!(checked_fc3_u32("u32", &Value::Int(42)).is_err());
+        assert!(checked_fc3_u32("u16", &Value::Uint(42)).is_err());
     }
 
     #[test]
@@ -99,7 +132,7 @@ mod tests {
             driver
                 .banto_driver_address()
                 .call_supported_kinds(&mut store)?,
-            ["u16"]
+            ["u16", "u32"]
         );
 
         let settings = [
@@ -124,10 +157,13 @@ mod tests {
             .banto_driver_config()
             .call_secret_keys(&mut store)?
             .is_empty());
-        assert_eq!(
-            driver.banto_driver_config().call_schema(&mut store)?.len(),
-            3
-        );
+        let schema = driver.banto_driver_config().call_schema(&mut store)?;
+        assert_eq!(schema.len(), 4);
+        assert!(matches!(
+            schema.iter().find(|field| field.key == "word_order")
+                .and_then(|field| field.default.as_ref()),
+            Some(exports::banto::driver::config::SettingValue::Text(value)) if value == "low_high"
+        ));
         let conn = driver
             .banto_driver_session()
             .connection()
@@ -193,6 +229,209 @@ mod tests {
                 assert_eq!(wasm, expected_native, "WASM/native: {}", fixture.name);
             }
         }
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn real_component_matches_native_fc3_u32_fixtures() -> wasmtime::Result<()> {
+        use banto::driver::types::{FatalError, ItemError, Setting, TagSpec, Value};
+
+        let path = std::env::var("BANTO_COMPONENT_WASM")
+            .expect("set BANTO_COMPONENT_WASM to a built component");
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+        let mut store = wasmtime::Store::new(&engine, ());
+        let driver = Driver::instantiate(&mut store, &component, &linker)?;
+
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_supported_kinds(&mut store)?,
+            ["u16", "u32"]
+        );
+        let first = driver
+            .banto_driver_address()
+            .call_parse(&mut store, "40001", "u32", None)?
+            .expect("first U32 start");
+        assert_eq!(first.canonical, "400001");
+        assert_eq!(first.index, Some(0));
+        assert_eq!(first.word_count, 2);
+        let parsed = driver
+            .banto_driver_address()
+            .call_parse(&mut store, "465535", "u32", None)?
+            .expect("last U32 start");
+        assert_eq!(parsed.canonical, "465535");
+        assert_eq!(parsed.index, Some(65_534));
+        assert_eq!(parsed.word_count, 2);
+        assert!(driver
+            .banto_driver_address()
+            .call_parse(&mut store, "465536", "u32", None)?
+            .is_err());
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_parse(&mut store, "465536", "u16", None)?
+                .unwrap()
+                .word_count,
+            1
+        );
+        for (start, n, expected) in [
+            ("400001", 1, "400003"),
+            ("400003", -1, "400001"),
+            ("465533", 1, "465535"),
+        ] {
+            assert_eq!(
+                driver
+                    .banto_driver_address()
+                    .call_offset(&mut store, start, "u32", None, n)?
+                    .unwrap(),
+                expected
+            );
+        }
+        for (start, n) in [
+            ("400002", -1),
+            ("465534", 1),
+            ("465535", 1),
+            ("400001", i64::MAX),
+            ("400001", i64::MIN),
+        ] {
+            assert!(driver
+                .banto_driver_address()
+                .call_offset(&mut store, start, "u32", None, n)?
+                .is_err());
+        }
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_offset(&mut store, "400001", "u16", None, 1)?
+                .unwrap(),
+            "400002"
+        );
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_offset_words(&mut store, "465535", 1)?
+                .unwrap(),
+            "465536"
+        );
+
+        let base_settings = [
+            Setting {
+                key: "host".into(),
+                value: "example.test".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "502".into(),
+            },
+        ];
+        for fixture in U32_FIXTURES {
+            let mut settings = base_settings.to_vec();
+            if let Some(order) = fixture.word_order {
+                settings.push(Setting {
+                    key: "word_order".into(),
+                    value: order.into(),
+                });
+            }
+            assert!(driver
+                .banto_driver_config()
+                .call_validate(&mut store, &settings)?
+                .is_empty());
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings)?
+                .expect("valid settings");
+            let specs = [TagSpec {
+                address: "400001".into(),
+                data_type: "u32".into(),
+                string_words: None,
+            }];
+            let plans = driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs)?
+                .expect("U32 plan");
+            assert_eq!(plans.len(), 1, "{}", fixture.name);
+            assert_eq!(plans[0].covers, [0], "{}", fixture.name);
+            assert_eq!(
+                plans[0].step.send,
+                [0, 0, 0, 0, 0, 6, 1, 3, 0, 0, 0, 2],
+                "{}",
+                fixture.name
+            );
+            assert_eq!(plans[0].step.max_len, 260);
+
+            let expected_native = native_u32(fixture.response, fixture.word_order, "40001", 0);
+            assert_eq!(
+                expected_native, fixture.expected,
+                "native: {}",
+                fixture.name
+            );
+            let decoded = driver.banto_driver_read().call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                fixture.response,
+            )?;
+            let wasm = match decoded {
+                Ok(values) => match values.as_slice() {
+                    [Ok(value @ Value::Uint(_))] => Outcome::Value(
+                        checked_fc3_u32(&specs[0].data_type, value).expect("FC3 U32 boundary"),
+                    ),
+                    [Err(ItemError::Device(error))] => Outcome::Device(error.code),
+                    other => panic!("unexpected WASM U32 values for {}: {other:?}", fixture.name),
+                },
+                Err(FatalError::Framing(_)) => Outcome::Framing,
+                Err(FatalError::Protocol(_)) => Outcome::Protocol,
+                other => panic!("unexpected WASM U32 error for {}: {other:?}", fixture.name),
+            };
+            if fixture.native_accepts_extra {
+                assert_eq!(
+                    wasm,
+                    Outcome::Framing,
+                    "intentional strictness: {}",
+                    fixture.name
+                );
+                assert_ne!(wasm, expected_native);
+            } else {
+                assert_eq!(wasm, expected_native, "WASM/native: {}", fixture.name);
+            }
+            conn.resource_drop(&mut store)?;
+        }
+
+        let settings = base_settings.to_vec();
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("valid settings");
+        let last = [TagSpec {
+            address: "465535".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        }];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &last)?
+            .expect("last U32 plan");
+        assert_eq!(plans[0].step.send, [0, 0, 0, 0, 0, 6, 1, 3, 255, 254, 0, 2]);
+        let response = [0, 0, 0, 0, 0, 7, 1, 3, 4, 0x12, 0x34, 0xab, 0xcd];
+        assert!(
+            matches!(driver.banto_driver_read().call_decode(&mut store, conn, &plans[0], &last, &response)?, Ok(values) if matches!(values.as_slice(), [Ok(Value::Uint(0xabcd_1234))]))
+        );
+        let beyond = [TagSpec {
+            address: "465536".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        }];
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &beyond)?
+            .unwrap()
+            .is_empty());
         conn.resource_drop(&mut store)?;
         Ok(())
     }

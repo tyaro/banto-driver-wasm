@@ -2,7 +2,15 @@
 
 更新日: 2026-10-25
 
-## 今回の作業（[PR #5](https://github.com/tyaro/banto-driver-wasm/pull/5)）
+## 今回の作業（FC3 U32 実 WASM）
+
+- driver-wasm main `8498690b`（PR #6 の SLMP 文書を含む）から、未公開の SLMP 文書修整 `43b16d5` を引き継いだ。引用頁、R の見出しと SFC 条件、Q SD308–311 の根拠を明確化した。
+- FC3・単一タグ U32 を既存 WIT の `uint(u64)` / `word-count=2` でコンポーネントに追加し、U16/U32 のアドレス、計画、復号、`word_order` の整合を検査する。native とコアで比較済みの U32 15件を実 Wasmtime 比較へ拡張し、U16 12件を維持する。
+- [Hub PR #843](https://github.com/tyaro/banto-industrial/pull/843) は `4c6b126a` でマージ済み。Hub は固定ゲスト SHA で FC3・単一 U16 を扱う。この U32 版の Hub 登録・U32 境界検証は未実施である。
+- manifest は能力の表示に合わせてプラグイン `version` を `0.2.0` にする。既存の任意 `word_order` を利用し、設定移行と WIT 変更がないため `settingsVersion=1`、`hubApi=1` を維持する。
+- ローカル Rust 1.98.1 検証: コア10/10、固定 native 比較4/4、コンポーネント単体5/5・doc1/1、実 Wasmtime 比較8/8（U16 12件と U32 15件を含む）が成功。`wasm32-unknown-unknown` ビルドと wasm-tools 1.262.0 の component 生成・検証、3クレートの Clippy `-D warnings` が成功。Hub や実機を動かした結果ではない。
+
+## 前回の作業（[PR #5](https://github.com/tyaro/banto-driver-wasm/pull/5)）
 
 - main `be5753d003aa49d065405e30753a2a0903d3e24c` を確認し、FC3・単一タグ U32（2レジスタ）と word order を依存なしコアと固定版 native 比較に追加した。既存 U16 共有12件（10一致・余剰 PDU 2件の意図的拒否）は維持する。
 - 固定版 native `a0d01aa2` の `frame_conn.rs` と `decode.rs` を照合した。`low_high` は先頭ワードが下位、`high_low` は先頭が上位。`create_connection` の未指定時は `low_high`、フォームの `settings_schema` 既定値は `high_low` である。コアの既定は前者に合わせ、フォーム側は変更しない。
@@ -58,25 +66,21 @@
 
 - SLMP の機種・経路別 SD 取得、拡張 D/W の ZR 変換、タグ範囲判定、実機 read と write、Hub 表示・品質・監査は設計段階で未検証。判定不能時の運用方針、WIT 拡張、バッチ書込み単位は未決。
 
-- Hub loader / runtime、manifest の必須正整数検証、`FrameConnection` アダプター、既存接続テストへの登録・呼び出しは未実装。WASM 境界での U16 型・範囲検査、`covers` と結果件数の既存 `FrameSession` 検査への接続、内部原因の構造化診断と API 変換も Hub 側では未検証。
-- 実機への Modbus TCP 通信、SLMP、FC3 以外、複数タグ、文字列、書き込みは未実装または未検証。U32 と word order は依存なしコアと native 比較のみで、実 WASM コンポーネントや Hub 境界では未実装。ローカル TCP の制御通信は独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。アドレス解析と設定検証はゲスト内だけで実装した。
+- Hub の loader / runtime、manifest 検証、`FrameConnection` アダプター、U16 接続テストは PR #843 で実装された。この新しい U32 版ゲストの固定 SHA 更新、Hub 側 U32 型・範囲検査と読取り経路は未実施。
+- 実機への Modbus TCP 通信、SLMP、FC3 以外、複数タグ、文字列、書き込みは未実装または未検証。U32 は独立 Wasmtime 比較の対象で、Hub 境界では未対応。ローカル TCP の制御通信は U16 の独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。
 - ローカルでは Rust 1.85.1 を導入・実行していない。CI では既存の 1.85.1 コア検証と WASM artifact のジョブ間再利用が成功した。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
 
 ## 残件
 
 - SLMP 実装時に公式表の機種条件、経路、アドレス基数、bit/word 単位、複合タグの全範囲をフィクスチャで検証する。本番前の read-only 接続テストと Hub [Issue #845](https://github.com/tyaro/banto-industrial/issues/845) の境界を合わせ、実機 write は別途承認を受ける。
 
-- Hub 側の manifest 検証、loader / runtime、`FrameConnection` アダプター、既存接続テスト経路への登録を既存担当作業と調整する。接続テストの fingerprint による再利用・設定変更拒否と `probe` のエラー伝播は Hub 側で実装する。
-- Hub 境界で FC3・U16 の型と範囲を検査し、既存 `FrameSession` の `covers` / 件数チェックと値変換を再利用する。runtime の trap / epoch / memory limit を内部で分類して診断に残し、既存 API への写像を一か所に置く。
-- さらに実通信と既存 Hub 接続テスト経由の比較を行う。SDK / WIT と SLMP に製品ソースを足すときは area ガードを実ビルド・テストへ置き換える。
+- Hub 側 U32 登録と型・範囲検査は固定ゲスト SHA の更新を含む別作業で照合する。Hub の固定 U16 ゲストや adapter / CI は今回変更しない。
+- SLMP の 0101 型式判別、実設定範囲取得、指定タグ読取りテストの段階分割を準備する。現行 WIT で範囲取得手順を表現できるか確認し、互換性に影響する変更は別途判断する。
 
 ## 次作業
 
-1. Hub 側の既存担当作業と衝突しない変更範囲を確認する。最小範囲は新 WASM manifest の `settingsVersion` 必須正整数検証、loader / Wasmtime runtime、`FrameConnection` アダプター、既存 `FrameSession` と接続テストへの登録である。このリポジトリの `component/manifest.json` は試案であり、Hub の受理形式はまだ実装されていない。
-2. Hub 境界で U16 `uint(u64)` の型と `0..=65535` を検査し、既存 `FrameSession` の `covers` / 結果件数検査を再利用する。trap / epoch / memory limit の内部原因と既存 API への写像を実装・検証する。接続テストでは `probe` のエラー伝播、保存設定 fingerprint によるセッション再利用と設定変更拒否を確認する。
-3. 実 Modbus TCP 通信と Hub 経由の native / WASM 比較を実施する。FC3・単一 U16・TCP・読み取り専用を維持し、シリアル、複数レジスタ、文字列、書き込みへ広げる判断は別途行う。
-
-独立ホストの準備は PR #4 まで完了。次セッションの変更範囲案: (1) Hub の新規 `crates/banto-driver-wasm`（`banto-driver-api`、Wasmtime 50.0.0、serde / serde_json）で manifest の必須正整数検証・WIT loader/runtime・`FrameConnection` 変換、(2) `crates/banto-drivers/src/lib.rs` と `apps/banto-hub/host/Cargo.toml` の登録、(3) `apps/banto-hub/core/src/rest/plc_connections.rs` の既存接続テスト経路と局所試験へ接続する。既存 `FrameSession` の `covers` / 件数検査と `decode_value`、timeout / 受信上限の分類を再利用する。実装前に Hub [PR #842](https://github.com/tyaro/banto-industrial/pull/842)（R2b-7c、修正版 CI 待ち、未マージ）の最新状態と担当範囲を再照合する。同 PR が変更中の `apps/banto-hub/core/src/{runtime,hub,broker_glue}.rs` と `crates/banto-tags` は範囲調整なしに編集しない。
+1. この U32 版を独立 Wasmtime ホストで照合し、Hub U32 対応は別作業として境界を確認する。
+2. Q / iQ-R SLMP の読み取りコア、0101 型式判別、実設定範囲取得、タグ読取りテストの段階を設計する。native 参照、公式仕様、独立フィクスチャを照合し、native の既存不具合は模倣しない。
 
 次セッションの必要環境: Rust 1.98.1 のみ、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0、テスト依存 Wasmtime 50.0.0、Node.js 24。新しいクラウド環境には前セッションの導入が継承されると仮定せず確認する。実通信の自動確認は制御したローカル TCP で行い、実機 PLC は使わない。MSRV 宣言と native descriptor の欠落時 `settings_version=1` は変更しない。
 
@@ -88,4 +92,4 @@
 - 初回の製品目標は Modbus の WASM 読み取りと native 結果一致。既存ドライバの一括移植はしない。
 - CI は Linux 中心。Modbus 領域は既存の Rust 1.85.1 コア検証、Rust 1.98.1 の native 比較、WIT 検査・実コンポーネントのビルド・Wasmtime 比較を対象とする。nextest 分割は計測後に判断する。
 - native 比較を Modbus 領域の独立 CI ジョブとし、Hub `a0d01aa2` に固定する。余剰 PDU の受理差は新コアの厳格化を維持して明記する。WIT と Hub runtime の契約はこのリポジトリだけで確定しない。
-- 初版の WIT 境界と適用範囲は [CONTRACT.md](CONTRACT.md) の「初版境界の決定」に従う。新 WASM manifest の `settingsVersion` は必須正整数、TCP gap はゼロ、FC3・単一 U16 の生値は `uint(u64)`、host runtime 失敗は内部で型付き分類とする。
+- 初版の WIT 境界と適用範囲は [CONTRACT.md](CONTRACT.md) の「初版境界の決定」に従う。WASM manifest の `settingsVersion` は必須正整数、TCP gap はゼロ、FC3・単一 U16/U32 の生値は `uint(u64)`、host runtime 失敗は内部で型付き分類とする。Hub の固定ゲストは現時点で U16 のみ。
