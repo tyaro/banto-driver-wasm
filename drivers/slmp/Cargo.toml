@@ -1,0 +1,12 @@
+[package]
+name = "banto-slmp-read-core"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98.1"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+resolver = "2"

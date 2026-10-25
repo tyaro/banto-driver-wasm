@@ -31,6 +31,10 @@ const allowed = new Set([
   'rust-toolchain.toml',
   'drivers/modbus/Cargo.toml',
   'drivers/modbus/src/lib.rs',
+  'drivers/slmp/Cargo.toml',
+  'drivers/slmp/Cargo.lock',
+  'drivers/slmp/src/lib.rs',
+  'drivers/slmp/tests/read_frame.rs',
   'comparison/Cargo.toml',
   'comparison/Cargo.lock',
   'comparison/src/lib.rs',
@@ -47,7 +51,7 @@ function checkTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (dir === '.' && (entry.name === '.git' || entry.name === 'target' || entry.name === 'dist')) continue;
     const path = join(dir, entry.name).replaceAll('\\', '/');
-    if (path === 'comparison/target' || path === 'component/target' || path === 'runtime-comparison/target') continue;
+    if (path === 'comparison/target' || path === 'component/target' || path === 'runtime-comparison/target' || path === 'drivers/slmp/target') continue;
     if (entry.isDirectory()) checkTree(path);
     else if (!allowed.has(path) && !/^(sdk|wit|drivers\/modbus|drivers\/slmp)\/README\.md$/.test(path)) {
       throw new Error(`${path}: add the needed CI check before introducing this file`);
@@ -58,7 +62,7 @@ checkTree('.');
 
 // Until a real build/test job replaces this guard, source files must not pass silently.
 const area = process.argv[2];
-const roots = { sdk: ['sdk'], slmp: ['drivers/slmp'] };
+const roots = { sdk: ['sdk'] };
 if (area && !roots[area]) throw new Error(`Unknown area: ${area}`);
 function visit(dir) {
   if (!existsSync(dir)) return;

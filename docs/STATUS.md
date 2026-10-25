@@ -1,5 +1,12 @@
 # STATUS
 
+## 今回の作業（SLMP 0401 読取りフレーム）
+
+- [PR #7](https://github.com/tyaro/banto-driver-wasm/pull/7) は head `66020f3a` の CI・統合レビューを再確認して squash merge した。main の統合 SHA は `5233d55a4d1c278c473e9c44df608c1423c1a629`。元 repo・他 worktree・branch は保持した。
+- `drivers/slmp` に Q/R binary 4E・0401 の依存なし `no_std` コアを追加した。I/O はなく、M/X bit と D/W/SD word の読取りフレーム生成・応答解析のみ。SLMP Reference Manual の wire 形式と native `banto-driver-slmp/src/frame.rs` を別々に照合し、独立したバイト列フィクスチャで正常系・拒否・破損・点数と番号の境界を試験する。native が許す不正 bit nibble は仕様に従って拒否する。
+- `slmp-guard` を Rust 1.98.1 の整形・Clippy・単体テスト・wasm32 型検査を行う `slmp-test` に置き換える。機種判別、SD 実設定範囲、タグ読取りテスト、WIT/Hub、実機通信、書込みは未実装。
+- ローカルで Rust 1.98.1 の SLMP 整形・Clippy `-D warnings`・単体フィクスチャ 6/6・wasm32 型検査を通過。既存 Modbus コア 10/10、Node 変更判定 15/15、scaffold、CI YAML 構文、`git diff --check` も通過。実機・Hub 通信は行っていない。
+
 更新日: 2026-10-25
 
 ## 今回の作業（FC3 U32 実 WASM）

@@ -1,5 +1,13 @@
 # SLMP: 機種別デバイス範囲とタグ判定の設計案
 
+## 現在の実装範囲（0401 フレームコア）
+
+[`src/lib.rs`](src/lib.rs) は標準 Q / iQ-R の binary 4E フレームによる `0401` 連続読取り要求と応答を扱う、I/O のない `no_std` コア。M/X の bit と D/W/SD の word、Q の `0001/0000` と R の `0003/0002` サブコマンド、Q の3バイト・R の4バイトデバイス番号、little-endian の点数・word 値を実装した。デバイス番号の数値は呼出側がアドレス基数に従って解析済みとする。1要求の上限は bit 7168点、word 960点。これは SLMP の命令上限であり、機種固有の実設定範囲を保証しない。[SLMP Reference Manual pp.20–31, 37–47](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=21)。
+
+応答はシリアル・経路・長さ・データ点数を検査し、機器の非ゼロ終了コードをフレーム不正と区別する。bit の各 nibble は仕様上の 0/1 のみ許し、奇数点の最後の未使用 nibble は 0 を要求する。native の bit 復号は nibble の最下位 bit だけを見るため、この不正データの受理挙動は意図的に模倣しない。[SLMP Reference Manual pp.26–30, 41–43](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=27)。[独立フィクスチャ](tests/read_frame.rs) は native `banto-driver-slmp/src/frame.rs` の正常な wire layout と照合した。R は公式の4バイト番号全幅をフレーム化する一方、native の現在のアドレス上限 `0xFFFFFF` とは差がある。実機・対象 CPU の範囲は後続で判定する。
+
+このコアは `0101` 型式判別、SD 実設定点数、指定タグの読取りテスト、WIT コンポーネント、Hub I/O、実機通信、書込みをまだ扱わない。以下はその後続設計である。
+
 状態: 設計案（2026-10-25）。実装・実機適合・Hub/WIT 契約の確定を表さない。対象は標準の MELSEC-Q CPU と MELSEC iQ-R CPU / ENCPU。特殊 CPU、別系列、通信経路ごとの対応は機種別に検証する。
 
 ## 境界と用語
