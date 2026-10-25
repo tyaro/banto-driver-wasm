@@ -4,6 +4,8 @@
 
 ## 完了
 
+- SLMP の標準 Q / iQ-R・ENCPU を対象とする [機種別点数・タグ判定の設計案](../drivers/slmp/README.md)を公式マニュアルと照合して追加した。Hub の表示・品質・監査は [Issue #845](https://github.com/tyaro/banto-industrial/issues/845) で追跡する。この追加は文書のみで、コード・WIT・native/Hub・実機通信は変更していない。
+
 - README、作業ガイド、段階計画、軽量 CI の判定・ガードを用意した。
 - 初回コミット `e6cbcf7e32f8299dda1afaf90c7579c01487c6cc` を main に公開した。
 - Hub `a0d01aa2` の公開 API・WIT 案・native Modbus 実装を照合し、未決の境界を [CONTRACT.md](CONTRACT.md) に記録した。
@@ -20,6 +22,8 @@
 - [PR #4](https://github.com/tyaro/banto-driver-wasm/pull/4) の head `2db459fb437c143b3dee9b442fd5fffe516e0c2a` を、`ed845af9bc1f062b510d804e03d319eb4f3b8fd3` で main に squash merge した。Hub 本体とその並行ブランチには変更を加えていない。
 
 ## 検証
+
+- SLMP 文書変更で Node.js 24.22.1 の `node --test .github/scripts/ci-changes.test.mjs` が 15/15 成功。`node .github/scripts/check-scaffold.mjs` と `node .github/scripts/check-scaffold.mjs slmp` が成功。`git diff --check` が成功。Rust・実機通信は実行していない。
 
 - Node.js 24.19.0 で `node --test .github/scripts/ci-changes.test.mjs` が 12/12 成功。
 - `node .github/scripts/check-scaffold.mjs` と `sdk` / `slmp` 指定のガードが成功。
@@ -44,11 +48,15 @@
 
 ## 未検証
 
+- SLMP の機種・経路別 SD 取得、拡張 D/W の ZR 変換、タグ範囲判定、実機 read と write、Hub 表示・品質・監査は設計段階で未検証。判定不能時の運用方針、WIT 拡張、バッチ書込み単位は未決。
+
 - Hub loader / runtime、manifest の必須正整数検証、`FrameConnection` アダプター、既存接続テストへの登録・呼び出しは未実装。WASM 境界での U16 型・範囲検査、`covers` と結果件数の既存 `FrameSession` 検査への接続、内部原因の構造化診断と API 変換も Hub 側では未検証。
 - 実機への Modbus TCP 通信、SLMP、FC3 以外、複数レジスタ、ワード順、文字列、書き込みは未実装または未検証。ローカル TCP の制御通信は独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。アドレス解析と設定検証はゲスト内だけで実装した。
 - ローカルでは Rust 1.85.1 を導入・実行していない。CI では既存の 1.85.1 コア検証と WASM artifact のジョブ間再利用が成功した。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
 
 ## 残件
+
+- SLMP 実装時に公式表の機種条件、経路、アドレス基数、bit/word 単位、複合タグの全範囲をフィクスチャで検証する。本番前の read-only 接続テストと Hub [Issue #845](https://github.com/tyaro/banto-industrial/issues/845) の境界を合わせ、実機 write は別途承認を受ける。
 
 - Hub 側の manifest 検証、loader / runtime、`FrameConnection` アダプター、既存接続テスト経路への登録を既存担当作業と調整する。接続テストの fingerprint による再利用・設定変更拒否と `probe` のエラー伝播は Hub 側で実装する。
 - Hub 境界で FC3・U16 の型と範囲を検査し、既存 `FrameSession` の `covers` / 件数チェックと値変換を再利用する。runtime の trap / epoch / memory limit を内部で分類して診断に残し、既存 API への写像を一か所に置く。
@@ -65,6 +73,8 @@
 次セッションの必要環境: Rust 1.98.1 のみ、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0、テスト依存 Wasmtime 50.0.0、Node.js 24。新しいクラウド環境には前セッションの導入が継承されると仮定せず確認する。実通信の自動確認は制御したローカル TCP で行い、実機 PLC は使わない。MSRV 宣言と native descriptor の欠落時 `settings_version=1` は変更しない。
 
 ## 判断
+
+- SLMP の実設定点数と機種別範囲判定は WASM 側の設計対象とし、Hub は I/O・接続テストの表示・品質・監査を担う。PLC 設定待ちの保存を許し、形式/型不正と実機未確認、範囲外と unknown を区別する。
 
 - 開発場所を Hub と別の公開リポジトリ `tyaro/banto-driver-wasm` にする。
 - 初回の製品目標は Modbus の WASM 読み取りと native 結果一致。既存ドライバの一括移植はしない。
