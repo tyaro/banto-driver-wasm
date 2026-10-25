@@ -1,4 +1,4 @@
-//! Binary 4E SLMP guest for a deliberately narrow single-word D read path.
+//! Binary 4E SLMP guest for single-word D reads, one request per tag.
 //! The host owns transport. Each connection owns its discovery evidence.
 
 use std::cell::{Cell, RefCell};
@@ -37,7 +37,13 @@ struct SlmpConnection {
     base_route: Route,
     next_serial: Cell<u16>,
     phase: RefCell<Phase>,
-    pending: RefCell<BTreeMap<u16, ReadSpan>>,
+    pending: RefCell<BTreeMap<u16, PendingRead>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRead {
+    span: ReadSpan,
+    cover: u32,
 }
 
 impl SlmpConnection {
@@ -312,11 +318,6 @@ impl read::Guest for Component {
         specs: Vec<TagSpec>,
     ) -> Result<Vec<read::Planned>, FatalError> {
         let conn = conn.get::<SlmpConnection>();
-        if specs.len() != 1 {
-            return Err(FatalError::InvalidConfig(
-                "this SLMP stage reads exactly one D tag".into(),
-            ));
-        }
         let phase = conn.phase.borrow();
         let Phase::Ready { model, count } = &*phase else {
             return Err(FatalError::Protocol(
@@ -324,26 +325,46 @@ impl read::Guest for Component {
             ));
         };
         let series = known_series(model).expect("ready model has series");
+        // An unsupported tag is left uncovered: FrameSession returns its own
+        // per-item Unsupported result without dropping the connection.
         let spans = specs
             .iter()
-            .map(|spec| checked_d_span(spec, model, *count))
-            .collect::<Result<Vec<_>, _>>()?;
+            .enumerate()
+            .filter_map(|(index, spec)| {
+                let span = checked_d_span(spec, model, *count).ok()?;
+                encode_read(conn.base_route, series, span).ok()?;
+                Some((u32::try_from(index).ok()?, span))
+            })
+            .collect::<Vec<_>>();
+        if spans.len() > usize::from(u16::MAX) + 1 {
+            return Err(FatalError::Protocol("SLMP serial space exhausted".into()));
+        }
+        let mut serial = conn.next_serial.get();
+        let pending = conn.pending.borrow();
         let mut plans = Vec::with_capacity(spans.len());
-        for (index, span) in spans.into_iter().enumerate() {
-            let route = conn.route();
-            if conn.pending.borrow().contains_key(&route.serial) {
+        let mut new_pending = Vec::with_capacity(spans.len());
+        for (cover, span) in spans {
+            if pending.contains_key(&serial) {
                 return Err(FatalError::Protocol(
                     "SLMP serial reused while a read is pending".into(),
                 ));
             }
+            let route = Route {
+                serial,
+                ..conn.base_route
+            };
             let send = encode_read(route, series, span)
                 .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-            conn.pending.borrow_mut().insert(route.serial, span);
+            new_pending.push((serial, PendingRead { span, cover }));
             plans.push(read::Planned {
                 step: frame_step(send),
-                covers: vec![index as u32],
+                covers: vec![cover],
             });
+            serial = serial.wrapping_add(1);
         }
+        drop(pending);
+        conn.pending.borrow_mut().extend(new_pending);
+        conn.next_serial.set(serial);
         Ok(plans)
     }
 
@@ -384,11 +405,16 @@ impl read::Guest for Component {
         if p.step.send != expected {
             return Err(FatalError::Protocol("plan bytes do not match spec".into()));
         }
-        if conn.pending.borrow_mut().remove(&route.serial) != Some(span) {
+        let pending = PendingRead {
+            span,
+            cover: *cover,
+        };
+        if conn.pending.borrow().get(&route.serial) != Some(&pending) {
             return Err(FatalError::Protocol(
                 "plan is not pending on this connection".into(),
             ));
         }
+        conn.pending.borrow_mut().remove(&route.serial);
         match decode_read(route, span, &response) {
             Ok(Values::Words(words)) => {
                 let [word] = words.as_slice() else {
