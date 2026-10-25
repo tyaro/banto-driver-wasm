@@ -171,21 +171,27 @@ jobs:
         env:
           BANTO_COMPONENT_WASM: ${{ github.workspace }}/dist/banto-modbus-tcp-component.wasm
 
-  slmp-guard:
+  slmp-test:
     needs: changes
     if: needs.changes.outputs.slmp == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - name: Install Rust 1.98.1
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown --no-self-update
+      - uses: Swatinem/rust-cache@v2
         with:
-          node-version: 24
-      - run: node .github/scripts/check-scaffold.mjs slmp
+          workspaces: drivers/slmp -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo +1.98.1 fmt --manifest-path drivers/slmp/Cargo.toml --check
+      - run: cargo +1.98.1 clippy --manifest-path drivers/slmp/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo +1.98.1 test --manifest-path drivers/slmp/Cargo.toml --locked
+      - run: cargo +1.98.1 check --manifest-path drivers/slmp/Cargo.toml --target wasm32-unknown-unknown --locked
 
   ci-gate:
     if: always()
-    needs: [changes, scaffold, sdk-guard, modbus-test, native-compare, component-build, component-compare, slmp-guard]
+    needs: [changes, scaffold, sdk-guard, modbus-test, native-compare, component-build, component-compare, slmp-test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -201,6 +207,7 @@ jobs:
           for area in sdk modbus slmp; do
             job="${area}-guard"
             if [[ "$area" == modbus ]]; then job=modbus-test; fi
+            if [[ "$area" == slmp ]]; then job=slmp-test; fi
             wanted=$(jq -r --arg area "$area" '.changes.outputs[$area]' <<< "$NEEDS")
             result=$(jq -r --arg job "$job" '.[$job].result' <<< "$NEEDS")
             if [[ "$wanted" == true && "$result" != success ]]; then

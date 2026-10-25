@@ -1,5 +1,7 @@
 # 段階計画
 
+P3 の初回は SLMP binary 4E・0401 の読取りフレームコアと独立フィクスチャに限定する。機種判別、SD 実設定範囲、タグ読取りテスト、WIT 接続はそれぞれ後続段階とし、実機 I/O と書込みは別判断とする。
+
 状態: 計画。各段階の完了条件を満たすまでは製品機能を実装済みと扱わない。
 
 | 段階 | 作業 | 完了条件 |
@@ -16,8 +18,8 @@ P3 では、機種と設定によって異なるデバイスアクセス範囲�
 
 ## CI の拡張順
 
-現在の `changes` は文書、SDK / WIT、Modbus、SLMP、共通・未知パスを分類する。SDK / WIT は両ドライバに波及し、未知パスと共通設定は全領域に倒す。`scaffold` は必須文書と未知ファイルを確認し、`changes` は変更判定テストを実行する。`modbus-test` は Rust 1.85.1 の整形・Clippy・単体テスト・WASM ターゲットの型検査を実行する。`component-build` は WIT と実コンポーネントを検査し、`component-compare` は同じ成果物を Wasmtime で実行して native と照合する。SDK と SLMP の area ジョブは製品ソースの誤追加を検出する。`ci-gate` は必須ジョブの failure / cancelled / 想定外の skipped を検出する。
+現在の `changes` は文書、SDK / WIT、Modbus、SLMP、共通・未知パスを分類する。SDK / WIT は両ドライバに波及し、未知パスと共通設定は全領域に倒す。`scaffold` は必須文書と未知ファイルを確認し、`changes` は変更判定テストを実行する。`modbus-test` は Rust 1.85.1 の整形・Clippy・単体テスト・WASM ターゲットの型検査を実行する。`component-build` は WIT と実コンポーネントを検査し、`component-compare` は同じ成果物を Wasmtime で実行して native と照合する。SDK の area ジョブは製品ソースの誤追加を検出し、`slmp-test` は Rust 1.98.1 の整形・Clippy・単体テスト・WASM ターゲット型検査を行う。`ci-gate` は必須ジョブの failure / cancelled / 想定外の skipped を検出する。
 
-SDK と SLMP の製品コードを導入する際は、その領域の area ガードを実ビルド・テストに置き換える。現在の WASM バイナリは `component-build` で一度作り、比較ジョブに artifact として渡す。Rust キャッシュは main で保存し、PR で復元する。PR の古い実行のみキャンセルする。ジョブ・テストの所要時間を記録し、分割数とキャッシュ設定は実測で決める。nextest の分割はまだ行わない。
+SDK に製品コードを導入する際は、その領域の area ガードを実ビルド・テストに置き換える。SLMP の読取りフレームコアには実テストを追加した。現在の Modbus WASM バイナリは `component-build` で一度作り、比較ジョブに artifact として渡す。Rust キャッシュは main で保存し、PR で復元する。PR の古い実行のみキャンセルする。ジョブ・テストの所要時間を記録し、分割数とキャッシュ設定は実測で決める。nextest の分割はまだ行わない。
 
 ソースや依存を増やす変更で追加の承認が必要なら、その時点で止めて状況を報告する。
