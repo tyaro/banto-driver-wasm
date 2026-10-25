@@ -182,6 +182,7 @@ name = "banto-wasm-native-comparison"
 version = "0.0.0"
 dependencies = [
  "banto-fc3-native-comparison",
+ "serde_json",
  "wasmtime",
 ]
 
