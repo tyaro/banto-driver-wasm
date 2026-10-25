@@ -1,5 +1,12 @@
 # STATUS
 
+## Current stage: conditional Q extension fields (in progress)
+
+- After merged PR #11 (`506d89c97b37b81066eef8ad184c1e4fad1565fd`), this stage adds I/O-free SD282-289 plans and two-word decoders. QnU complete M/B count fields SD286-289 require independently confirmed route, compatible CPU version, and serial first five digits >= 10042. Fast internal-only D/W fields SD282-285 are limited to the five already-classified QnUDV names; QnUDPV is outside this classifier.
+- SD286-289 already report total configured M/B points: do not add the old SD292/294 words. SD282-285 report internal D/W only. No synthesized D/W total, complete tag range, or SD647-derived capacity is asserted. Missing model/version/route/serial evidence or an incomplete pair stays Unknown. No PLC I/O, WIT, Hub, native, or write implementation is included.
+- Rust 1.98.1 local SLMP fmt, Clippy (-D warnings), 25 fixture tests, and wasm32 type-check passed. Node CI-classification 15 tests, scaffold, and diff whitespace check passed. GitHub CI and PR review are pending.
+
+
 ## 今回の作業（QnU ZR の条件付き点数）
 
 - [PR #10](https://github.com/tyaro/banto-driver-wasm/pull/10) は head `0e05f43` の CI・統合レビュー・競合なしを再確認して squash merge した。main の統合 SHA は `d30ac2f305fa13edaf7fc91daeaaefc9773f802c`。専用 worktree は未保存/固有ファイルと使用中プロセスがないことを確認して片付け、元 repo・他 worktree・branch は保持した。

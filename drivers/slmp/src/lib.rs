@@ -14,6 +14,11 @@ pub use sd_basic::{basic_sd_count, plan_basic_sd, BasicArea, BasicEvidence, Poin
 mod q_zr;
 pub use q_zr::{decode_q_zr_count, plan_q_zr, QZrEvidence};
 
+mod q_extension;
+pub use q_extension::{
+    decode_q_extension_count, plan_q_extension, QExtensionArea, QExtensionEvidence,
+};
+
 /// Wire layout only. The actual CPU model and its supported devices are checked later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Series {
