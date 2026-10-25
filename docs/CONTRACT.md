@@ -4,13 +4,13 @@
 
 | Hub の現行 API | WIT 案 | 今回の状態 |
 | --- | --- | --- |
-| `FrameDriver::create_connection(Settings)`、`FrameConnection::handshake_next` | `connection.create`、`handshake-next` | 未実装。Modbus TCP には native と同様にハンドシェイクなしを予定 |
-| `FrameConnection::plan_read`、`Step`、`FrameRule::LengthPrefixed` | `read.plan`、`session.step`、`length-prefixed` | FC3・1 レジスタの MBAP 要求バイトだけを純粋関数で実装。transaction ID は呼び手が渡す |
-| `FrameConnection::decode_read`、`RawValue`、`ItemError` / `FatalError` | `read.decode`、`types.value`、`item-error` / `fatal-error` | FC3・1 レジスタの `u16` と例外コードを独立型で返す。Hub 型への変換は未実装 |
-| `DriverBase::parse_address` / `validate_config` / `settings_schema` | `address.parse` / `config.validate` / `config.schema` | 未実装。現状は 0 始まりのワイヤ offset を渡す |
+| `FrameDriver::create_connection(Settings)`、`FrameConnection::handshake_next` | `connection.create`、`handshake-next` | ゲスト export 実装済み。ハンドシェイクなし。Hub `FrameConnection` アダプターは未実装 |
+| `FrameConnection::plan_read`、`Step`、`FrameRule::LengthPrefixed` | `read.plan`、`session.step`、`length-prefixed` | FC3・1 レジスタの MBAP 要求を実コンポーネントから生成し、セッション内で transaction ID を進める。Hub 型への変換は未実装 |
+| `FrameConnection::decode_read`、`RawValue`、`ItemError` / `FatalError` | `read.decode`、`types.value`、`item-error` / `fatal-error` | 実コンポーネントが `uint(u64)`、機器例外、Framing / Protocol を返す。Hub 境界での U16 型・範囲検査と既存 API への変換は未実装 |
+| `DriverBase::parse_address` / `validate_config` / `settings_schema` | `address.parse` / `config.validate` / `config.schema` | ゲスト export 実装済み。FC3・U16 アドレス、TCP 設定、基本スキーマに限定。Hub 側の接続テスト連携は未実装 |
 | `banto-driver-engine`、`DriverRegistry`、適合テスト | Hub の WASM ホストが利用する構想 | 接続なし。Hub に loader / runtime はまだない |
 
-`drivers/modbus` の要求は Hub native の FC3 単一レジスタ要求と同じ MBAP 形である。[独立した比較試験](../comparison/src/lib.rs) は Hub `a0d01aa2` の公開 `FrameDriver` / `FrameConnection` を Git 依存で実行し、同一応答フィクスチャ 12 件をコアへも渡す。正常値、機器例外、ID 不一致、破損フレームの 10 件は値とエラー分類が一致する。残り 2 件は**意図的な差**: native の PDU 解析は宣言したデータの後ろの余剰バイトを受理するが、新コアは正常応答を 4 byte、例外応答を 2 byte に厳格化して `Framing` で拒否する。比較はこの差を明示的に検査する。Hub の engine / WASM 実行は通していない。ワード順、文字列、複数タグ、FC1/2/4 も対象外。
+`drivers/modbus` の要求は Hub native の FC3 単一レジスタ要求と同じ MBAP 形である。[独立した比較試験](../comparison/src/lib.rs) は Hub `a0d01aa2` の公開 `FrameDriver` / `FrameConnection` を Git 依存で実行する。そのフィクスチャ12件を [Wasmtime 比較試験](../runtime-comparison/src/lib.rs) でも再利用し、実コンポーネントの `read.plan` / `read.decode` を呼ぶ。正常値、機器例外、ID 不一致、破損フレームの10件は native・コア・WASM の値と分類が一致する。残り2件は**意図的な差**: native の PDU 解析は宣言したデータの後ろの余剰バイトを受理するが、新コアと WASM は正常応答を4 byte、例外応答を2 byte に厳格化して `Framing` で拒否する。Hub の engine / runtime 経由の実行は通していない。ワード順、文字列、複数タグ、FC1/2/4 も対象外。
 
 ## 初版境界の決定
 

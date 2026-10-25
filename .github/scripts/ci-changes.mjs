@@ -11,7 +11,8 @@ export function classify(event, files) {
   for (const file of files) {
     if (file.startsWith('sdk/') || file.startsWith('wit/')) {
       Object.assign(selected, all); // SDK/WIT can affect every consumer.
-    } else if (file.startsWith('drivers/modbus/') || file.startsWith('comparison/')) {
+    } else if (file.startsWith('drivers/modbus/') || file.startsWith('comparison/')
+      || file.startsWith('component/') || file.startsWith('runtime-comparison/')) {
       selected.modbus = true;
     } else if (file.startsWith('drivers/slmp/')) {
       selected.slmp = true;

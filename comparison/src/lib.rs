@@ -1,7 +1,6 @@
 //! Independent FC3 comparison against the pinned Hub `FrameDriver`.
 
-#[cfg(test)]
-mod tests {
+pub mod fixtures {
     use banto_driver_api::{
         DataType, DriverBase, FatalError, FrameDriver, ItemError, RawValue, Settings, TagKind,
         TagSpec,
@@ -10,22 +9,22 @@ mod tests {
     use banto_modbus_read_core::{ReadError, ReadHoldingU16, MAX_RESPONSE_LEN};
 
     #[derive(Debug, PartialEq, Eq)]
-    enum Outcome {
+    pub enum Outcome {
         Value(u16),
         Device(u32),
         Framing,
         Protocol,
     }
 
-    struct Fixture {
-        name: &'static str,
-        response: &'static [u8],
-        expected: Outcome,
+    pub struct Fixture {
+        pub name: &'static str,
+        pub response: &'static [u8],
+        pub expected: Outcome,
         /// The native PDU parser accepts extra bytes after the declared data.
-        native_accepts_extra: bool,
+        pub native_accepts_extra: bool,
     }
 
-    const FIXTURES: &[Fixture] = &[
+    pub const FIXTURES: &[Fixture] = &[
         Fixture {
             name: "value",
             response: &[0, 0, 0, 0, 0, 5, 1, 3, 2, 0, 42],
@@ -100,7 +99,7 @@ mod tests {
         },
     ];
 
-    fn native(response: &[u8]) -> Outcome {
+    pub fn native(response: &[u8]) -> Outcome {
         let driver = ModbusDriver;
         let kind = TagKind::numeric(DataType::U16);
         let address = driver.parse_address("40001", &kind).unwrap();
@@ -129,7 +128,7 @@ mod tests {
         }
     }
 
-    fn core(response: &[u8]) -> Outcome {
+    pub fn core(response: &[u8]) -> Outcome {
         let read = ReadHoldingU16 {
             transaction_id: 0,
             unit_id: 1,
