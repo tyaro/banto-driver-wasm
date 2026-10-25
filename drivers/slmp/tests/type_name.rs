@@ -42,6 +42,27 @@ fn universal_q_udeh_aliases_use_the_codes_in_the_official_table() {
         assert_eq!(parsed.raw_name, *raw_name);
         assert_eq!(parsed.code, u16::from_le_bytes(code));
         assert_eq!(parsed.family, ModelFamily::StandardQ);
+        response[31..33].copy_from_slice(&[0x68, 0x02]);
+        assert_eq!(
+            decode_type_name(Route::default(), &response)
+                .unwrap()
+                .family,
+            ModelFamily::Unknown
+        );
+    }
+    for (raw_name, code) in [
+        (b"Q10UDHCPU       ", [0x66, 0x02]),
+        (b"Q20UDHCPU       ", [0x67, 0x02]),
+    ] {
+        let mut response = Q02UCPU;
+        response[15..31].copy_from_slice(raw_name);
+        response[31..33].copy_from_slice(&code);
+        assert_eq!(
+            decode_type_name(Route::default(), &response)
+                .unwrap()
+                .family,
+            ModelFamily::StandardQ
+        );
     }
 }
 
