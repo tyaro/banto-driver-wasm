@@ -205,6 +205,7 @@ jobs:
           wasm-tools component new slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm -o dist/banto-slmp-read-component.wasm
           wasm-tools validate dist/banto-slmp-read-component.wasm
           wasm-tools component targets wit/driver.wit dist/banto-slmp-read-component.wasm --world driver
+          wasm-tools component targets wit dist/banto-slmp-read-component.wasm --world driver-with-write-v1
           wasm-tools component wit dist/banto-slmp-read-component.wasm | node -e 'let s=""; process.stdin.on("data", c=>s+=c); process.stdin.on("end",()=>{if(s.includes("wasi:")) process.exit(1)})'
       - name: Run controlled Q/R Wasmtime fixtures
         run: |

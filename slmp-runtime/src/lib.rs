@@ -7,6 +7,10 @@ mod tests {
 
     wasmtime::component::bindgen!({ path: "../wit", world: "driver" });
 
+    mod write_host {
+        wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-write-v1" });
+    }
+
     fn response(serial: u16, body: &[u8]) -> Vec<u8> {
         let mut frame = vec![0xd4, 0];
         frame.extend_from_slice(&serial.to_le_bytes());
@@ -33,6 +37,292 @@ mod tests {
         let mut store = Store::new(&engine, ());
         let driver = Driver::instantiate(&mut store, &component, &linker)?;
         Ok((store, driver))
+    }
+
+    #[test]
+    fn old_and_extended_worlds_negotiate_without_changing_old_exports() -> wasmtime::Result<()> {
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let new_component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let new_read = Driver::instantiate(&mut store, &new_component, &linker)?;
+        assert!(
+            new_read
+                .banto_driver_address()
+                .call_parse(&mut store, "D31", "u16", None)?
+                .expect("D/u16 syntax")
+                .writable_area
+        );
+        write_host::DriverWithWriteV1::instantiate(&mut store, &new_component, &linker)?;
+        if let Ok(old_path) = std::env::var("BANTO_SLMP_LEGACY_COMPONENT_WASM") {
+            let old_component = Component::from_file(&engine, old_path)?;
+            let old_read = Driver::instantiate(&mut store, &old_component, &linker)?;
+            assert!(
+                !old_read
+                    .banto_driver_address()
+                    .call_parse(&mut store, "D31", "u16", None)?
+                    .expect("old guest syntax")
+                    .writable_area
+            );
+            assert!(write_host::DriverWithWriteV1::instantiate(
+                &mut store,
+                &old_component,
+                &linker
+            )
+            .is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn write_extension_borrows_the_same_discovered_resource() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        assert!(
+            driver
+                .banto_driver_address()
+                .call_parse(&mut store, "D31", "u16", None)?
+                .expect("D/u16 syntax")
+                .writable_area
+        );
+        assert!(driver
+            .banto_driver_address()
+            .call_parse(&mut store, "D31", "u32", None)?
+            .is_err());
+        assert!(driver
+            .banto_driver_address()
+            .call_parse(&mut store, "D31", "u16", Some(1))?
+            .is_err());
+        let settings = vec![
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+        ];
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("settings");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101")
+            .expect("type send");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("SD280")
+            .expect("SD send");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(2, &[32, 0, 0, 0])))?
+            .expect("ready");
+        let item = WriteItem {
+            spec: TagSpec {
+                address: "D31".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Float(0x1234 as f64),
+        };
+        let progress = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, std::slice::from_ref(&item), None)?
+            .expect("preflight");
+        let WriteProgress::Send(plan) = progress else {
+            panic!("valid write must send")
+        };
+        assert_eq!(plan.covers, [0]);
+        assert_eq!(&plan.step.send[2..4], &[3, 0]);
+        assert_eq!(
+            &plan.step.send[15..],
+            &[1, 0x14, 2, 0, 31, 0, 0, 0, 0xa8, 0, 1, 0, 0x34, 0x12]
+        );
+        let done = driver
+            .banto_driver_write_v1()
+            .call_write_next(
+                &mut store,
+                conn,
+                std::slice::from_ref(&item),
+                Some(&response(3, &[])),
+            )?
+            .expect("ACK");
+        assert!(matches!(done, WriteProgress::Done(items) if matches!(items.as_slice(), [Ok(())])));
+        for invalid in [
+            WriteItem {
+                spec: TagSpec {
+                    address: "D32".into(),
+                    ..item.spec.clone()
+                },
+                ..item.clone()
+            },
+            WriteItem {
+                spec: TagSpec {
+                    data_type: "u32".into(),
+                    ..item.spec.clone()
+                },
+                ..item.clone()
+            },
+            WriteItem {
+                value: Value::Float(f64::NAN),
+                ..item.clone()
+            },
+            WriteItem {
+                value: Value::Float(-1.0),
+                ..item.clone()
+            },
+            WriteItem {
+                value: Value::Float(0.5),
+                ..item.clone()
+            },
+            WriteItem {
+                value: Value::Float(65536.0),
+                ..item.clone()
+            },
+            WriteItem {
+                value: Value::Uint(1),
+                ..item.clone()
+            },
+        ] {
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &[invalid], None)?
+                .expect("preflight rejection");
+            assert!(
+                matches!(outcome, WriteProgress::Done(items) if matches!(items.as_slice(), [Err(_)]))
+            );
+        }
+        assert!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &[item.clone(), item.clone()], None)?
+                .is_err(),
+            "multiple items reject before send"
+        );
+        let next = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, std::slice::from_ref(&item), None)?
+            .expect("serial unchanged by rejection");
+        let WriteProgress::Send(next) = next else {
+            panic!("valid write must send")
+        };
+        assert_eq!(&next.step.send[2..4], &[4, 0]);
+        let mut refused = response(4, &[]);
+        refused[13..15].copy_from_slice(&0xc051u16.to_le_bytes());
+        let rejected = driver
+            .banto_driver_write_v1()
+            .call_write_next(
+                &mut store,
+                conn,
+                std::slice::from_ref(&item),
+                Some(&refused),
+            )?
+            .expect("device refusal");
+        assert!(
+            matches!(rejected, WriteProgress::Done(items) if matches!(items.as_slice(), [Err(_)]))
+        );
+        let send = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, std::slice::from_ref(&item), None)?
+            .expect("next write after refusal");
+        assert!(matches!(send, WriteProgress::Send(_)));
+        assert!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, std::slice::from_ref(&item), None)?
+                .is_err(),
+            "pending write cannot be resent"
+        );
+        let bad_ack = response(99, &[]);
+        assert!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(
+                    &mut store,
+                    conn,
+                    std::slice::from_ref(&item),
+                    Some(&bad_ack)
+                )?
+                .is_err(),
+            "wrong serial is fatal"
+        );
+        assert!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &[item], None)?
+                .is_err(),
+            "fatal ACK poisons resource until reconnect"
+        );
+        conn.resource_drop(&mut store)?;
+
+        for (name, code, sd_count) in [
+            ("Q25PRHCPU", 0x004c, None),
+            ("Q02UCPU", 0x0263, Some(vec![32, 0])),
+            ("R04CPU", 0x4800, Some(vec![])),
+        ] {
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings)?
+                .expect("settings");
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101");
+            let sd = driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+                .expect("type");
+            if let Some(words) = sd_count {
+                assert!(sd.is_some());
+                let mut sd_response = response(2, &words);
+                if words.is_empty() {
+                    sd_response[13] = 1;
+                }
+                driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(&mut store, conn, Some(&sd_response))?
+                    .expect("SD");
+            } else {
+                assert!(sd.is_none());
+            }
+            let item = WriteItem {
+                spec: TagSpec {
+                    address: "D0".into(),
+                    data_type: "u16".into(),
+                    string_words: None,
+                },
+                value: Value::Float(1.0),
+            };
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &[item], None)?
+                .expect("no-send rejection");
+            assert!(
+                matches!(outcome, WriteProgress::Done(items) if matches!(items.as_slice(), [Err(_)])),
+                "{name}"
+            );
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
     }
 
     fn settings() -> Vec<banto::driver::types::Setting> {
