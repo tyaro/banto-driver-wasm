@@ -1,5 +1,5 @@
-//! Binary 4E SLMP batch-read (0401) framing for standard Q and iQ-R.
-//! This core does no I/O, configured-range lookup, or writes.
+//! Binary 4E SLMP read (0401) and restricted iQ-R D/u16 write (1401) framing.
+//! This core does no I/O or configured-range lookup; the guest gates writes.
 #![no_std]
 
 extern crate alloc;
@@ -153,6 +153,28 @@ pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u
     }
     out.extend_from_slice(&span.count.to_le_bytes());
     Ok(out)
+}
+
+/// Build one binary 4E iQ-R word write (1401/0002) for a single D point.
+/// The caller must establish the CPU model and configured D range first.
+pub fn encode_r_d_write(route: Route, number: u32, value: u16) -> Vec<u8> {
+    let mut out = request_head(route, 16);
+    out.extend_from_slice(&0x1401u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&number.to_le_bytes());
+    out.extend_from_slice(&[Device::D.code(), 0]);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&value.to_le_bytes());
+    out
+}
+
+/// A successful 1401 response has no data after its end code.
+pub fn decode_write_ack(route: Route, frame: &[u8]) -> Result<(), ResponseError> {
+    if response_data(route, frame)?.is_empty() {
+        Ok(())
+    } else {
+        Err(ResponseError::Framing)
+    }
 }
 
 /// Parse a complete response to this request. The Hub owns stream framing and I/O.

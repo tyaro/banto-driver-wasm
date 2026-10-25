@@ -1,4 +1,4 @@
-//! Binary 4E SLMP guest for D/u16 reads, batching only verified adjacent tags.
+//! Binary 4E SLMP guest for D/u16 reads and an optional restricted R write.
 //! The host owns transport. Each connection owns its discovery evidence.
 
 use std::cell::{Cell, RefCell};
@@ -6,13 +6,13 @@ use std::collections::BTreeMap;
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_slmp_read_core::{
-    basic_sd_count, decode_read, decode_type_name, encode_read, encode_type_name, plan_basic_sd,
-    BasicArea, BasicEvidence, Device, ModelFamily, PointCount, ReadSpan, ResponseError, Route,
-    Series, TypeName, Values,
+    basic_sd_count, decode_read, decode_type_name, decode_write_ack, encode_r_d_write, encode_read,
+    encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount,
+    ReadSpan, ResponseError, Route, Series, TypeName, Values,
 };
-use exports::banto::driver::{address, config, read, session};
+use exports::banto::driver::{address, config, read, session, write_v1};
 
-wit_bindgen::generate!({ path: "../wit", world: "driver" });
+wit_bindgen::generate!({ path: "../wit", world: "driver-with-write-v1" });
 
 struct Component;
 
@@ -38,6 +38,15 @@ struct SlmpConnection {
     next_serial: Cell<u16>,
     phase: RefCell<Phase>,
     pending: RefCell<BTreeMap<u16, PendingRead>>,
+    pending_write: RefCell<Option<PendingWrite>>,
+    write_poisoned: Cell<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingWrite {
+    route: Route,
+    number: u32,
+    value: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,6 +222,8 @@ impl session::GuestConnection for SlmpConnection {
             next_serial: Cell::new(1),
             phase: RefCell::new(Phase::Start),
             pending: RefCell::new(BTreeMap::new()),
+            pending_write: RefCell::new(None),
+            write_poisoned: Cell::new(false),
         }))
     }
 
@@ -337,6 +348,9 @@ impl read::Guest for Component {
         specs: Vec<TagSpec>,
     ) -> Result<Vec<read::Planned>, FatalError> {
         let conn = conn.get::<SlmpConnection>();
+        if conn.pending_write.borrow().is_some() || conn.write_poisoned.get() {
+            return Err(FatalError::Protocol("write response is pending".into()));
+        }
         let phase = conn.phase.borrow();
         let Phase::Ready { model, count } = &*phase else {
             return Err(FatalError::Protocol(
@@ -521,6 +535,121 @@ impl read::Guest for Component {
     }
 }
 
+impl write_v1::Guest for Component {
+    fn write_next(
+        conn: write_v1::ConnectionBorrow<'_>,
+        items: Vec<write_v1::WriteItem>,
+        prev_response: Option<Vec<u8>>,
+    ) -> Result<write_v1::WriteProgress, FatalError> {
+        let conn = conn.get::<SlmpConnection>();
+        if items.len() != 1 {
+            if conn.pending_write.borrow().is_some() {
+                conn.write_poisoned.set(true);
+            }
+            return Err(FatalError::InvalidConfig(
+                "exactly one D/u16 write item is required".into(),
+            ));
+        }
+        let item = &items[0];
+        if let Some(response) = prev_response {
+            // Consume before parsing so a malformed or refused ACK cannot be retried.
+            conn.write_poisoned.set(true);
+            let pending = conn.pending_write.borrow_mut().take().ok_or_else(|| {
+                FatalError::Protocol("write response without a pending request".into())
+            })?;
+            let number = parse_d(
+                &item.spec.address,
+                &item.spec.data_type,
+                item.spec.string_words,
+            )
+            .map_err(FatalError::Protocol)?;
+            let value = match item.value {
+                Value::Float(value) if valid_word(value) => value as u16,
+                _ => return Err(FatalError::Protocol("write item changed after send".into())),
+            };
+            if number != pending.number || value != pending.value {
+                return Err(FatalError::Protocol("write item changed after send".into()));
+            }
+            return match decode_write_ack(pending.route, &response) {
+                Ok(()) => {
+                    conn.write_poisoned.set(false);
+                    Ok(write_v1::WriteProgress::Done(vec![Ok(())]))
+                }
+                Err(ResponseError::EndCode(code)) => {
+                    conn.write_poisoned.set(false);
+                    Ok(write_v1::WriteProgress::Done(vec![Err(ItemError::Device(
+                        banto::driver::types::DeviceError {
+                            code: u32::from(code),
+                            message: format!("SLMP end code 0x{code:04X}"),
+                        },
+                    ))]))
+                }
+                Err(error) => Err(response_error(error)),
+            };
+        }
+        if conn.write_poisoned.get() {
+            return Err(FatalError::Protocol(
+                "write outcome is uncertain; reconnect".into(),
+            ));
+        }
+        if conn.pending_write.borrow().is_some() || !conn.pending.borrow().is_empty() {
+            return Err(FatalError::Protocol(
+                "a response is pending on this connection".into(),
+            ));
+        }
+        let (model, count) = match &*conn.phase.borrow() {
+            Phase::Ready { model, count } => (model.clone(), *count),
+            _ => return Ok(rejected_write("discovery is incomplete")),
+        };
+        if model.family != ModelFamily::StandardR {
+            return Ok(rejected_write(
+                "write requires a confirmed standard iQ-R CPU",
+            ));
+        }
+        let number = match parse_d(
+            &item.spec.address,
+            &item.spec.data_type,
+            item.spec.string_words,
+        ) {
+            Ok(number) => number,
+            Err(_) => return Ok(rejected_write("only single D/u16 is supported")),
+        };
+        if assess_d(&model, count, number) != RangeAssessment::VerifiedInside {
+            return Ok(rejected_write("D address is not within the verified range"));
+        }
+        let Value::Float(value) = item.value else {
+            return Ok(rejected_write(
+                "write value must be a finite integral float",
+            ));
+        };
+        if !valid_word(value) {
+            return Ok(rejected_write(
+                "write value must be a finite integer in 0..65535",
+            ));
+        }
+        let value = value as u16;
+        let route = conn.route();
+        let send = encode_r_d_write(route, number, value);
+        *conn.pending_write.borrow_mut() = Some(PendingWrite {
+            route,
+            number,
+            value,
+        });
+        Ok(write_v1::WriteProgress::Send(read::Planned {
+            step: frame_step(send),
+            covers: vec![0],
+        }))
+    }
+}
+
+fn valid_word(value: f64) -> bool {
+    value.is_finite() && value.fract() == 0.0 && (0.0..=65535.0).contains(&value)
+}
+
+fn rejected_write(message: &str) -> write_v1::WriteProgress {
+    write_v1::WriteProgress::Done(vec![Err(ItemError::Rejected(message.into()))])
+}
+
 impl address::Guest for Component {
     fn parse(
         text: String,
@@ -531,7 +660,9 @@ impl address::Guest for Component {
         Ok(address::Parsed {
             canonical: format!("D{number}"),
             area: "D".into(),
-            writable_area: false,
+            // Static D/u16 capability only. write-next separately requires
+            // StandardR and a confirmed configured D range on this session.
+            writable_area: true,
             bit: None,
             word_count: 1,
             index: Some(u64::from(number)),

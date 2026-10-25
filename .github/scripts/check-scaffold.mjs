@@ -44,6 +44,7 @@ const allowed = new Set([
   'drivers/slmp/tests/read_frame.rs',
   'drivers/slmp/tests/sd_basic.rs',
   'drivers/slmp/tests/type_name.rs',
+  'drivers/slmp/tests/write_frame.rs',
   'slmp-component/Cargo.toml',
   'slmp-component/Cargo.lock',
   'slmp-component/src/lib.rs',
@@ -61,6 +62,7 @@ const allowed = new Set([
   'runtime-comparison/Cargo.lock',
   'runtime-comparison/src/lib.rs',
   'wit/driver.wit',
+  'wit/write-v1.wit',
 ]);
 function checkTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

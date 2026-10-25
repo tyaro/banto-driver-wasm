@@ -144,3 +144,9 @@
 - CI は Linux 中心。Modbus 領域は既存の Rust 1.85.1 コア検証、Rust 1.98.1 の native 比較、WIT 検査・実コンポーネントのビルド・Wasmtime 比較を対象とする。nextest 分割は計測後に判断する。
 - native 比較を Modbus 領域の独立 CI ジョブとし、Hub `a0d01aa2` に固定する。余剰 PDU の受理差は新コアの厳格化を維持して明記する。WIT と Hub runtime の契約はこのリポジトリだけで確定しない。
 - 初版の WIT 境界と適用範囲は [CONTRACT.md](CONTRACT.md) の「初版境界の決定」に従う。WASM manifest の `settingsVersion` は必須正整数、TCP gap はゼロ、FC3・単一 U16/U32 の生値は `uint(u64)`、host runtime 失敗は内部で型付き分類とする。Hub の固定ゲストは現時点で U16 のみ。
+
+## 2026-10-25 SLMP optional write prototype (in progress)
+
+- Branch: feat/slmp-r-d-write, based on origin/main f9b87d829b46587a63e01696097d6c3e8084f2d4. Existing read-only WIT world remains unchanged; wit/write-v1.wit adds an optional versioned world sharing session.connection.
+- Local controlled fixtures cover old/new Wasmtime world negotiation, one StandardR D/u16 1401/0002 request on the same discovered session, preflight rejection, ACK/refusal/framing, and the existing read suite. No PLC communication, production host enablement, keys, or merge.
+- Controlled host contract checks share the same Store, instance, and connection resource. PR and CI results are tracked separately. After-send transport failure must remain an indeterminate write result without automatic retry.
