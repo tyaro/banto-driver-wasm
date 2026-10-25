@@ -32,23 +32,24 @@
 - このクラウド環境では公式 rustup から Rust 1.98.1 のみを導入し、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0 を使った。Wasmtime 50.0.0 は比較クレートのライブラリとして使用し、CLI は導入していない。Rust 1.85.1 は新規導入していない。
 - 新規 WIT は `wasm-tools component wit` と `validate` に成功。`cargo +1.98.1 build --manifest-path component/Cargo.toml --target wasm32-unknown-unknown --locked` でコアモジュールを作り、`wasm-tools component new`、`validate`、`component targets ... --world driver` に成功。これはコアの `wasm32` 型検査とは別の実コンポーネント生成である。
 - `BANTO_COMPONENT_WASM=... cargo +1.98.1 test --manifest-path runtime-comparison/Cargo.toml --locked` は3/3成功。実コンポーネントを Wasmtime 50.0.0 でインスタンス化し、共有12フィクスチャの10一致・2厳密拒否、probe / parse / config / handshake / plan を検査した。別テストで Wasmtime の `memory.grow` 上限失敗が `-1` を返し trap ではないこと、`unreachable` trap と epoch 割込を型付き原因として区別できることを確認した。
-- 最終ローカル確認: Rust 1.98.1 でコア単体7/7、コンポーネント単体4/4・doc1/1、native 比較2/2、実 WASM 比較3/3、各クレートの整形・Clippy、コア `wasm32` 型検査が成功。Node.js 24.19.0 の変更判定15/15、構成ガードの通常・`sdk`・`slmp`、CI YAML 解析、manifest の現値確認、`git diff --check` も成功した。新 CI の GitHub Actions はまだ実行していない。
+- 最終ローカル確認: Rust 1.98.1 でコア単体7/7、コンポーネント単体4/4・doc1/1、native 比較2/2、実 WASM 比較3/3、各クレートの整形・Clippy、コア `wasm32` 型検査が成功。Node.js 24.19.0 の変更判定15/15、構成ガードの通常・`sdk`・`slmp`、CI YAML 解析、manifest の現値確認、`git diff --check` も成功した。
+- [PR #3](https://github.com/tyaro/banto-driver-wasm/pull/3) を Ready で公開した。CI の成果物パスをリポジトリ基準の絶対パスに修正し、同じ配置で実 WASM 比較3/3を再実行した。[修正版 CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40150441856) は `component-build` / `component-compare` / `ci-gate` を含む全9ジョブ成功。Rust 1.85.1 のコア CI も成功した。修正前の実行は次の push によりキャンセルされた。
 
 ## 未検証
 
 - Hub loader / runtime、manifest の必須正整数検証、`FrameConnection` アダプター、既存接続テストへの登録・呼び出しは未実装。WASM 境界での U16 型・範囲検査、`covers` と結果件数の既存 `FrameSession` 検査への接続、内部原因の構造化診断と API 変換も Hub 側では未検証。
 - 実 Modbus TCP 通信、実機、SLMP、FC3 以外、複数レジスタ、ワード順、文字列、書き込みは未実装または未検証。アドレス解析と設定検証はゲスト内だけで実装した。
-- CI の artifact 保存・再利用と Rust 1.85.1 の MSRV 試験は、このセッションでは未実行。既存の 1.85.1 CI 宣言は変えていない。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
+- ローカルでは Rust 1.85.1 を導入・実行していない。CI では既存の 1.85.1 コア検証と WASM artifact のジョブ間再利用が成功した。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
 
 ## 残件
 
 - Hub 側の manifest 検証、loader / runtime、`FrameConnection` アダプター、既存接続テスト経路への登録を既存担当作業と調整する。接続テストの fingerprint による再利用・設定変更拒否と `probe` のエラー伝播は Hub 側で実装する。
 - Hub 境界で FC3・U16 の型と範囲を検査し、既存 `FrameSession` の `covers` / 件数チェックと値変換を再利用する。runtime の trap / epoch / memory limit を内部で分類して診断に残し、既存 API への写像を一か所に置く。
-- 新 CI を GitHub Actions で検証する。さらに実通信と既存 Hub 接続テスト経由の比較を行う。SDK / WIT と SLMP に製品ソースを足すときは area ガードを実ビルド・テストへ置き換える。
+- さらに実通信と既存 Hub 接続テスト経由の比較を行う。SDK / WIT と SLMP に製品ソースを足すときは area ガードを実ビルド・テストへ置き換える。
 
 ## 次作業
 
-1. 今回の WIT / ゲスト / Wasmtime 比較 / CI の PR を検証・公開し、レビュー指摘を解消する。
+1. PR #3 の最終レビューと CI を確認し、修正必須事項があれば同 PR で解消する。マージは別途判断する。
 2. Hub 側の最小変更範囲を調整し、manifest 検証、loader / runtime、既存 `FrameSession` と接続テストへのアダプターを作る。ワード順、文字列、複数レジスタ等はまだ範囲外。
 
 ## 判断
