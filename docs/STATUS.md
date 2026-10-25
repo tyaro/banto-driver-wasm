@@ -1,10 +1,16 @@
 # STATUS
 
-## Current stage: SLMP guest with controlled Wasmtime fixtures
+## Current stage: multiple D/u16 tags, one 0401 request each
+
+- Based on merged PR #13 main `384565abc397d47307be97aa8fe9d45a141d6de7`, `read.plan` now accepts a tag list and returns one independent single-word D request per supported tag in input order. Each step covers exactly its original tag index. Known-range and unknown-range tags never share a frame; no adjacent-address batching is implemented.
+- Unsupported syntax/type, verified R out-of-range addresses, and wire-number overflow are left uncovered, so the current Hub `FrameSession` reports item-level `Unsupported` without sending a frame for them. A PLC end code on one valid read remains an item-level `Device` error, allowing other planned tags to finish. Malformed or mismatched frames and plan/cover mismatches remain fatal under the host's close-and-reconnect contract.
+- Rust 1.98.1 checks passed locally: SLMP core 25 tests, component unit 1 and doc 1, real Wasmtime Q/R fixtures 8, component/runtime fmt and Clippy, WASM component validation against the existing WIT, scaffold guard, and CI change classification 17. The WIT, Hub, native driver, real PLC I/O, and write path are unchanged. Structured discovery quality and unknown-model wire selection remain later work.
+
+## Previous stage: SLMP guest with controlled Wasmtime fixtures (merged PR #13)
 
 - Based on merged PR #12 main b3c108a886bd5d46de2c0066c0559a2489ca10f2, a separate SLMP component exports the existing WIT world without changing Modbus. One connection resource sequences 0101, the applicable basic D count SD (Q internal SD302 or R complete SD280-281), then a single D/u16 0401 read. Static D address parsing does not use connection state.
 - Evidence and pending read plans are scoped to the connection resource. A newly created resource restarts 0101. With a recognized Q/R wire series, an explicit tag may be read one at a time when its range is unknown, at the operator's responsibility; success does not upgrade the range verdict. A Q address beyond internal D remains unknown, and an address within a saturated Q lower-bound prefix is verified. An R address beyond its exact complete D count is rejected. Unknown name/code pairs and 0101 refusals do not establish the Q/R 0401 wire format, so this guest plans neither SD nor tag reads for them.
-- Five controlled Q/R, unknown-model, 0101-refusal, SD-refusal, and reconnection Wasmtime fixtures pass locally, along with SLMP core 25 tests and the component unit test. Hub display is covered by the design-only discovery contract; versioned WIT compatibility must be tested before implementation. Q SD308-311 total semantics remain open. PR #13 tracks CI and review. No PLC, Hub, socket, native driver, or write operation was used; the existing WIT is unchanged.
+- Five controlled Q/R, unknown-model, 0101-refusal, SD-refusal, and reconnection Wasmtime fixtures passed, along with SLMP core 25 tests and the component unit test. Hub display is covered by the design-only discovery contract; versioned WIT compatibility must be tested before implementation. Q SD308-311 total semantics remain open. PR #13 merged as `384565abc397d47307be97aa8fe9d45a141d6de7`; its final CI passed. No PLC, Hub, socket, native driver, or write operation was used; the existing WIT was unchanged.
 
 ## Previous stage: conditional Q extension fields (merged PR #12)
 
