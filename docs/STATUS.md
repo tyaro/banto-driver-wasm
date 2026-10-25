@@ -1,10 +1,11 @@
 # STATUS
 
-## Current stage: multiple D/u16 tags, one 0401 request each
+## Current stage: verified contiguous D/u16 batch reads
 
-- Based on merged PR #13 main `384565abc397d47307be97aa8fe9d45a141d6de7`, `read.plan` now accepts a tag list and returns one independent single-word D request per supported tag in input order. Each step covers exactly its original tag index. Known-range and unknown-range tags never share a frame; no adjacent-address batching is implemented.
-- Unsupported syntax/type, verified R out-of-range addresses, and wire-number overflow are left uncovered, so the current Hub `FrameSession` reports item-level `Unsupported` without sending a frame for them. A PLC end code on one valid read remains an item-level `Device` error, allowing other planned tags to finish. Malformed or mismatched frames and plan/cover mismatches remain fatal under the host's close-and-reconnect contract.
-- Rust 1.98.1 checks passed locally: SLMP core 25 tests, component unit 1 and doc 1, real Wasmtime Q/R fixtures 8, component/runtime fmt and Clippy, WASM component validation against the existing WIT, scaffold guard, and CI change classification 17. The WIT, Hub, native driver, real PLC I/O, and write path are unchanged. Structured discovery quality and unknown-model wire selection remain later work.
+- From merged PR #14 main, `read.plan` groups input-order adjacent D/u16 tags only when each address is within a verified configured range. Each step's ordered `covers` maps one response word to each original tag. The existing 0401 word-read limit of 960 points is enforced through the SLMP core; a longer run is split. Gaps, duplicates, unsupported specs and unknown-range tags break a run. Unknown-range explicit tags remain one request each and are not promoted by a successful read. [SLMP Reference Manual, printed p.46](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=48).
+- Unsupported syntax/type, verified R out-of-range addresses, and wire-number overflow remain uncovered for the Hub's item-level `Unsupported`. A whole-batch PLC end code becomes the same item-level `Device` error for each cover, without partial values; other planned steps can continue. Malformed or mismatched frames and plan/cover mismatches remain fatal under the host's close-and-reconnect contract.
+- The WIT, Hub, native driver, real PLC I/O, and write path are unchanged. Structured discovery quality and unknown-model wire selection remain later work.
+- Local Rust 1.98.1 verification: SLMP core 25 tests, component unit/doc tests, 11 real Wasmtime fixtures, component/runtime Clippy and formatting, WASM validation and WIT target check, scaffold guard, and 17 CI classification tests.
 
 ## Previous stage: SLMP guest with controlled Wasmtime fixtures (merged PR #13)
 
