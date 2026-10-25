@@ -12,7 +12,7 @@ native 比較の固定元: banto-industrial `a0d01aa2` の [API 実装](https://
 
 `drivers/modbus` の要求は Hub native の FC3・単一 U16（1レジスタ）または U32（2レジスタ）要求と同じ MBAP 形である。[独立した比較試験](../comparison/src/lib.rs) は Hub `a0d01aa2` の公開 `FrameDriver` / `FrameConnection` を固定 Git 依存で実行する。U16 の共有フィクスチャ12件と U32 の15件を [Wasmtime 比較試験](../runtime-comparison/src/lib.rs) でも再利用する。U16 は10件、U32 は13件で native・コア・WASM の値と分類が一致する。各2件は**意図的な差**: native の PDU 解析は宣言データ後の余剰バイトを受理するが、コアと WASM は `Framing` で拒否する。この U32 版の Hub runtime 経由実行、文字列、複数タグ、FC1/2/4 は対象外。
 
-U32 の各レジスタ内のバイト順は big endian。固定版 native の `decode_register_value` では `high_low` が先頭を上位16 bit、`low_high` が先頭を下位16 bit として扱う。native の `create_connection` は `word_order` 未指定時に `low_high` を使う一方、native の `settings_schema` のフォーム既定値は `high_low` である。コアとゲストの未指定時は実際の native 接続に合わせて `LowHigh`、ゲストの設定フォーム既定表示も `low_high` とする。`address.parse` は U32 開始 offset 65534（参照番号 `465535`）まで受理し、65535（`465536`）を拒否する。コアは要求生成時にも同じ末尾範囲を検査する。Hub 固定ゲストと Hub 保存値の既定値は変更しない。
+U32 の各レジスタ内のバイト順は big endian。固定版 native の `decode_register_value` では `high_low` が先頭を上位16 bit、`low_high` が先頭を下位16 bit として扱う。native の `create_connection` は `word_order` 未指定時に `low_high` を使う一方、native の `settings_schema` のフォーム既定値は `high_low` である。コアとゲストの未指定時は実際の native 接続に合わせて `LowHigh`、ゲストの設定フォーム既定表示も `low_high` とする。`address.parse` は U32 開始 offset 65534（参照番号 `465535`）まで受理し、65535（`465536`）を拒否する。`address.offset` の U32 はタグ幅である2 wordずつ進み、`address.offset-words` は型と無関係に1 wordずつ進む。コアは要求生成時にも同じ末尾範囲を検査する。Hub 固定ゲストと Hub 保存値の既定値は変更しない。
 
 ## 初版境界の決定
 

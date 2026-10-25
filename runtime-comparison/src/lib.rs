@@ -277,17 +277,38 @@ mod tests {
                 .word_count,
             1
         );
+        for (start, n, expected) in [
+            ("400001", 1, "400003"),
+            ("400003", -1, "400001"),
+            ("465533", 1, "465535"),
+        ] {
+            assert_eq!(
+                driver
+                    .banto_driver_address()
+                    .call_offset(&mut store, start, "u32", None, n)?
+                    .unwrap(),
+                expected
+            );
+        }
+        for (start, n) in [
+            ("400002", -1),
+            ("465534", 1),
+            ("465535", 1),
+            ("400001", i64::MAX),
+            ("400001", i64::MIN),
+        ] {
+            assert!(driver
+                .banto_driver_address()
+                .call_offset(&mut store, start, "u32", None, n)?
+                .is_err());
+        }
         assert_eq!(
             driver
                 .banto_driver_address()
-                .call_offset(&mut store, "465534", "u32", None, 1)?
+                .call_offset(&mut store, "400001", "u16", None, 1)?
                 .unwrap(),
-            "465535"
+            "400002"
         );
-        assert!(driver
-            .banto_driver_address()
-            .call_offset(&mut store, "465535", "u32", None, 1)?
-            .is_err());
         assert_eq!(
             driver
                 .banto_driver_address()

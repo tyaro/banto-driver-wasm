@@ -345,8 +345,11 @@ impl address::Guest for Component {
         n: i64,
     ) -> Result<String, String> {
         let (offset, kind) = parse_holding(&canonical, &data_type, string_words)?;
+        let words = i64::from(kind.word_count())
+            .checked_mul(n)
+            .ok_or("オフセットが範囲外です")?;
         let next = i64::from(offset)
-            .checked_add(n)
+            .checked_add(words)
             .ok_or("オフセットが範囲外です")?;
         canonical_for(next, kind)
     }
@@ -558,6 +561,25 @@ mod tests {
             string_words: None,
         }];
         assert!(planned_read(&conn, &invalid).is_empty());
+    }
+
+    #[test]
+    fn offset_steps_by_kind_width_while_offset_words_stays_word_based() {
+        let offset = |address: &str, kind: &str, n| {
+            <Component as address::Guest>::offset(address.into(), kind.into(), None, n)
+        };
+        assert_eq!(offset("400001", "u32", 1).as_deref(), Ok("400003"));
+        assert_eq!(offset("400003", "u32", -1).as_deref(), Ok("400001"));
+        assert!(offset("400002", "u32", -1).is_err());
+        assert_eq!(offset("465533", "u32", 1).as_deref(), Ok("465535"));
+        assert!(offset("465534", "u32", 1).is_err());
+        assert!(offset("400001", "u32", i64::MAX).is_err());
+        assert!(offset("400001", "u32", i64::MIN).is_err());
+        assert_eq!(offset("400001", "u16", 1).as_deref(), Ok("400002"));
+        assert_eq!(
+            <Component as address::Guest>::offset_words("400001".into(), 1).as_deref(),
+            Ok("400002")
+        );
     }
 
     #[test]
