@@ -3,8 +3,68 @@
 #[cfg(test)]
 mod tests {
     use banto_fc3_native_comparison::fixtures::{native, Outcome, FIXTURES};
+    use serde_json::{json, Value as JsonValue};
 
     wasmtime::component::bindgen!({ path: "../wit", world: "driver" });
+
+    // Contract checks for the prototype artifact. Hub must enforce the same
+    // conditions when it gains a loader; these checks do not register a driver.
+    fn manifest_settings_version(manifest: &JsonValue) -> Result<u32, &'static str> {
+        let version = manifest
+            .get("settingsVersion")
+            .and_then(JsonValue::as_u64)
+            .ok_or("settingsVersion must be a positive integer")?;
+        u32::try_from(version)
+            .ok()
+            .filter(|version| *version > 0)
+            .ok_or("settingsVersion must be a positive integer")
+    }
+
+    fn checked_fc3_u16(
+        data_type: &str,
+        value: &banto::driver::types::Value,
+    ) -> Result<u16, &'static str> {
+        use banto::driver::types::Value;
+
+        if data_type != "u16" {
+            return Err("FC3 v1 requires u16");
+        }
+        match value {
+            Value::Uint(raw) => u16::try_from(*raw).map_err(|_| "uint exceeds u16"),
+            _ => Err("FC3 u16 requires uint"),
+        }
+    }
+
+    #[test]
+    fn prototype_manifest_requires_positive_settings_version() {
+        let valid: JsonValue =
+            serde_json::from_str(include_str!("../../component/manifest.json")).unwrap();
+        assert_eq!(manifest_settings_version(&valid), Ok(1));
+        for invalid in [
+            json!({}),
+            json!({ "settingsVersion": null }),
+            json!({ "settingsVersion": 0 }),
+            json!({ "settingsVersion": -1 }),
+            json!({ "settingsVersion": 1.0 }),
+            json!({ "settingsVersion": "1" }),
+            json!({ "settingsVersion": true }),
+            json!({ "settingsVersion": 4294967296u64 }),
+        ] {
+            assert!(manifest_settings_version(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn fc3_u16_boundary_refuses_other_variants_and_overflow() {
+        use banto::driver::types::Value;
+
+        assert_eq!(checked_fc3_u16("u16", &Value::Uint(0)), Ok(0));
+        assert_eq!(checked_fc3_u16("u16", &Value::Uint(65535)), Ok(65535));
+        assert!(checked_fc3_u16("u16", &Value::Uint(65536)).is_err());
+        assert!(checked_fc3_u16("u16", &Value::Int(42)).is_err());
+        assert!(checked_fc3_u16("u16", &Value::Float(42.0)).is_err());
+        assert!(checked_fc3_u16("i16", &Value::Uint(42)).is_err());
+    }
 
     #[test]
     fn real_component_matches_native_fc3_fixtures() -> wasmtime::Result<()> {
@@ -110,10 +170,10 @@ mod tests {
             )?;
             let wasm = match decoded {
                 Ok(values) => match values.as_slice() {
-                    [Ok(Value::Uint(value))] => {
-                        assert!(*value <= u16::MAX.into(), "U16 boundary: {}", fixture.name);
-                        Outcome::Value(*value as u16)
-                    }
+                    [Ok(Value::Uint(value))] => Outcome::Value(
+                        checked_fc3_u16(&specs[0].data_type, &Value::Uint(*value))
+                            .expect("FC3 U16 boundary"),
+                    ),
                     [Err(ItemError::Device(error))] => Outcome::Device(error.code),
                     other => panic!("unexpected WASM values for {}: {other:?}", fixture.name),
                 },
@@ -134,6 +194,137 @@ mod tests {
             }
         }
         conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_tcp_host_exchanges_probe_frames_with_component() -> wasmtime::Result<()> {
+        use banto::driver::types::{FatalError, ItemError, Setting, TagSpec, Value};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let path = std::env::var("BANTO_COMPONENT_WASM")
+            .expect("set BANTO_COMPONENT_WASM to a built component");
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+
+        for (case, expected) in [
+            ("value", Outcome::Value(42)),
+            ("exception", Outcome::Device(2)),
+            ("framing", Outcome::Framing),
+            ("wrong-id", Outcome::Protocol),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            let server = std::thread::spawn(move || -> std::io::Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = [0; 12];
+                stream.read_exact(&mut request)?;
+                assert_eq!(&request[2..], &[0, 0, 0, 6, 1, 3, 0, 0, 0, 1]);
+                let mut response = request[..2].to_vec();
+                match case {
+                    "value" => response.extend_from_slice(&[0, 0, 0, 5, 1, 3, 2, 0, 42]),
+                    "exception" => response.extend_from_slice(&[0, 0, 0, 3, 1, 0x83, 2]),
+                    "framing" => response.extend_from_slice(&[0, 0, 0, 5, 1, 3, 3, 0, 42]),
+                    "wrong-id" => {
+                        response[1] ^= 1;
+                        response.extend_from_slice(&[0, 0, 0, 5, 1, 3, 2, 0, 42]);
+                    }
+                    _ => unreachable!(),
+                }
+                stream.write_all(&response)
+            });
+
+            let settings = [
+                Setting {
+                    key: "host".into(),
+                    value: "127.0.0.1".into(),
+                },
+                Setting {
+                    key: "port".into(),
+                    value: port.to_string(),
+                },
+            ];
+            let mut store = wasmtime::Store::new(&engine, ());
+            let driver = Driver::instantiate(&mut store, &component, &linker)?;
+            assert!(driver
+                .banto_driver_config()
+                .call_validate(&mut store, &settings)?
+                .is_empty());
+            let probe = driver
+                .banto_driver_address()
+                .call_probe(&mut store)?
+                .expect("FC3 probe");
+            let parsed = driver
+                .banto_driver_address()
+                .call_parse(
+                    &mut store,
+                    &probe.address,
+                    &probe.data_type,
+                    probe.string_words,
+                )?
+                .expect("probe address parses");
+            let specs = [TagSpec {
+                address: parsed.canonical,
+                data_type: probe.data_type,
+                string_words: probe.string_words,
+            }];
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings)?
+                .expect("valid connection settings");
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("handshake")
+                .is_none());
+            let plans = driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs)?
+                .expect("FC3 plan");
+            let [plan] = plans.as_slice() else {
+                panic!("FC3 probe must have one plan");
+            };
+            assert_eq!(plan.covers, [0]);
+
+            // This is a controlled test host, not Hub's FrameSession. Keep
+            // transport I/O on this side of the component boundary.
+            let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.write_all(&plan.step.send)?;
+            let mut header = [0; 6];
+            stream.read_exact(&mut header)?;
+            let frame_len = 6 + usize::from(u16::from_be_bytes([header[4], header[5]]));
+            assert!(frame_len <= plan.step.max_len as usize);
+            let mut response = header.to_vec();
+            response.resize(frame_len, 0);
+            stream.read_exact(&mut response[6..])?;
+            server.join().expect("local server thread")?;
+            assert_eq!(native(&response), expected, "native {case}");
+
+            let decoded = driver
+                .banto_driver_read()
+                .call_decode(&mut store, conn, plan, &specs, &response)?;
+            let actual = match decoded {
+                Ok(values) => match values.as_slice() {
+                    [Ok(value @ Value::Uint(_))] => {
+                        Outcome::Value(checked_fc3_u16(&specs[0].data_type, value).unwrap())
+                    }
+                    [Err(ItemError::Device(error))] => Outcome::Device(error.code),
+                    other => panic!("unexpected probe values for {case}: {other:?}"),
+                },
+                Err(FatalError::Framing(_)) => Outcome::Framing,
+                Err(FatalError::Protocol(_)) => Outcome::Protocol,
+                other => panic!("unexpected probe error for {case}: {other:?}"),
+            };
+            assert_eq!(actual, expected, "{case}");
+            conn.resource_drop(&mut store)?;
+        }
         Ok(())
     }
 

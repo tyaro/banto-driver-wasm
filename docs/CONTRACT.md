@@ -24,6 +24,8 @@
 
 この決定は製品としての Hub loader / runtime が実装済みであることを意味しない。Hub 本体で必要な最小変更範囲は、manifest の検証、WASM loader / runtime、`FrameConnection` へのアダプター、既存の接続テストへの driver 登録・呼び出しである。Hub の既存担当作業と調整した上で行う。
 
+独立テストホストは `settingsVersion` の欠落・`0`・負数・小数・文字列・真偽値・`u32` 超過を拒否し、`uint(u64)` の U16 範囲と型を確認する。ローカル TCP の制御した応答で `probe` から `read.decode` まで通す。これらは Hub 側の manifest 受理・`FrameConnection` 変換・`FrameSession` の契約検査や接続テスト登録を代替しない。Hub の [PR #842](https://github.com/tyaro/banto-industrial/pull/842) は `PlcConnection` と settings 利用箇所を変更中のため、Hub 実装の書込みは調整後に行う。
+
 ## 最小比較経路と検証の区別
 
 1. 上記の `world driver` 全 export を持つ読み取り専用ゲストをビルドする。アドレス解析と設定検証は export として実装し、対応しないタグ型や設定は明示的に拒否する。ソケットはゲストに渡さない。

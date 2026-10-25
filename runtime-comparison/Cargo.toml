@@ -8,4 +8,5 @@ publish = false
 
 [dev-dependencies]
 banto-fc3-native-comparison = { path = "../comparison" }
+serde_json = "=1.0.154"
 wasmtime = { version = "=50.0.0", default-features = false, features = ["component-model", "runtime", "cranelift", "std", "wat"] }
