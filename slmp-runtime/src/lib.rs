@@ -48,6 +48,239 @@ mod tests {
         ]
     }
 
+    fn d_specs(addresses: &[u32]) -> Vec<banto::driver::types::TagSpec> {
+        addresses
+            .iter()
+            .map(|address| banto::driver::types::TagSpec {
+                address: format!("D{address}"),
+                data_type: "u16".into(),
+                string_words: None,
+            })
+            .collect()
+    }
+
+    fn ready_q(
+        store: &mut Store<()>,
+        driver: &Driver,
+        count: u16,
+    ) -> wasmtime::Result<exports::banto::driver::session::Connection> {
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut *store, &settings())?
+            .expect("settings");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, None)?
+            .expect("0101")
+            .is_some());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, Some(&model_response("Q02UCPU", 0x0263)))?
+            .expect("SD302")
+            .is_some());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, Some(&response(2, &count.to_le_bytes())))?
+            .expect("ready")
+            .is_none());
+        Ok(conn)
+    }
+
+    #[test]
+    fn verified_contiguous_d_batches_preserve_covers_values_and_unknown_split(
+    ) -> wasmtime::Result<()> {
+        use banto::driver::types::{ItemError, Value};
+        let (mut store, driver) = load()?;
+        let conn = ready_q(&mut store, &driver, 100)?;
+        let specs = d_specs(&[98, 99, 100, 101, 5, 6, 6, 7, 9]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plans");
+        assert_eq!(plans.len(), 6);
+        assert_eq!(
+            plans
+                .iter()
+                .map(|p| p.covers.as_slice())
+                .collect::<Vec<_>>(),
+            vec![
+                &[0, 1][..],
+                &[2][..],
+                &[3][..],
+                &[4, 5][..],
+                &[6, 7][..],
+                &[8][..]
+            ]
+        );
+        assert_eq!(&plans[0].step.send[19..25], &[98, 0, 0, 0xa8, 2, 0]);
+        assert_eq!(plans[0].step.max_len, 64);
+        let first = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(3, &[0x11, 0, 0x22, 0]),
+            )?
+            .expect("batch");
+        assert!(matches!(
+            first.as_slice(),
+            [Ok(Value::Uint(0x11)), Ok(Value::Uint(0x22))]
+        ));
+        let unknown = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[1],
+                &specs,
+                &response(4, &[0x33, 0]),
+            )?
+            .expect("unknown explicit read");
+        assert!(matches!(unknown.as_slice(), [Ok(Value::Uint(0x33))]));
+        let mut refusal = response(6, &[]);
+        refusal[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+        let refused = driver
+            .banto_driver_read()
+            .call_decode(&mut store, conn, &plans[3], &specs, &refusal)?
+            .expect("batch refusal is per-item");
+        assert!(
+            matches!(refused.as_slice(), [Err(ItemError::Device(a)), Err(ItemError::Device(b))] if a.code == 0xc05b && b.code == 0xc05b)
+        );
+        let duplicate = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[4],
+                &specs,
+                &response(7, &[0x44, 0, 0x55, 0]),
+            )?
+            .expect("new run after duplicate");
+        assert!(matches!(
+            duplicate.as_slice(),
+            [Ok(Value::Uint(0x44)), Ok(Value::Uint(0x55))]
+        ));
+        let next = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &d_specs(&[99, 100]))?
+            .expect("unknown was not promoted");
+        assert_eq!(
+            next.iter().map(|p| p.covers.as_slice()).collect::<Vec<_>>(),
+            vec![&[0][..], &[1][..]]
+        );
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_splits_at_official_960_word_limit_and_rejects_short_response() -> wasmtime::Result<()>
+    {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let conn = ready_q(&mut store, &driver, 1000)?;
+        let specs = d_specs(&(0..=960).collect::<Vec<_>>());
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plans");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers.len(), 960);
+        assert_eq!(plans[0].covers[0], 0);
+        assert_eq!(plans[0].covers[959], 959);
+        assert_eq!(plans[0].step.send[23..25], 960u16.to_le_bytes());
+        assert_eq!(plans[0].step.max_len, 1935);
+        assert_eq!(plans[1].covers, [960]);
+        assert_eq!(plans[1].step.send[23..25], [1, 0]);
+        let mut body = vec![0; 1920];
+        body[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+        body[1918..1920].copy_from_slice(&0x5678u16.to_le_bytes());
+        let values = driver
+            .banto_driver_read()
+            .call_decode(&mut store, conn, &plans[0], &specs, &response(3, &body))?
+            .expect("full 960-word response");
+        assert_eq!(values.len(), 960);
+        assert!(matches!(values[0], Ok(Value::Uint(0x1234))));
+        assert!(matches!(values[959], Ok(Value::Uint(0x5678))));
+        let retry = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &d_specs(&[0, 1]))?
+            .expect("new batch");
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    conn,
+                    &retry[0],
+                    &d_specs(&[0, 1]),
+                    &response(5, &[1, 0])
+                )?
+                .is_err(),
+            "short batch response is fatal; no partial tag values"
+        );
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn r_exact_count_batches_prefix_and_leaves_outside_uncovered() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("settings");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101")
+            .is_some());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("SD280 pair")
+            .is_some());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(2, &[32, 0, 0, 0])))?
+            .expect("ready")
+            .is_none());
+        let specs = d_specs(&[30, 31, 32]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plans");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].covers, [0, 1]);
+        assert_eq!(&plans[0].step.send[19..27], &[30, 0, 0, 0, 0xa8, 0, 2, 0]);
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(3, &[0x11, 0, 0x22, 0]),
+            )?
+            .expect("values");
+        assert!(matches!(
+            values.as_slice(),
+            [Ok(Value::Uint(0x11)), Ok(Value::Uint(0x22))]
+        ));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
     #[test]
     fn q_0101_sd302_then_verified_and_unknown_d_reads_run_in_real_component() -> wasmtime::Result<()>
     {

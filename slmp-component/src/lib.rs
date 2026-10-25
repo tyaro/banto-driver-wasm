@@ -1,4 +1,4 @@
-//! Binary 4E SLMP guest for single-word D reads, one request per tag.
+//! Binary 4E SLMP guest for D/u16 reads, batching only verified adjacent tags.
 //! The host owns transport. Each connection owns its discovery evidence.
 
 use std::cell::{Cell, RefCell};
@@ -40,10 +40,10 @@ struct SlmpConnection {
     pending: RefCell<BTreeMap<u16, PendingRead>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingRead {
     span: ReadSpan,
-    cover: u32,
+    covers: Vec<u32>,
 }
 
 impl SlmpConnection {
@@ -69,6 +69,14 @@ fn frame_step(send: Vec<u8>) -> session::Step {
         }),
         max_len: 64,
     }
+}
+
+fn read_step(send: Vec<u8>, words: u16) -> session::Step {
+    let mut step = frame_step(send);
+    // A successful binary 4E word response has 15 header bytes and 2 bytes
+    // per word. Keep the previous allowance for short PLC refusal frames.
+    step.max_len = (15 + u32::from(words) * 2).max(64);
+    step
 }
 
 fn response_error(error: ResponseError) -> FatalError {
@@ -327,23 +335,70 @@ impl read::Guest for Component {
         let series = known_series(model).expect("ready model has series");
         // An unsupported tag is left uncovered: FrameSession returns its own
         // per-item Unsupported result without dropping the connection.
-        let spans = specs
+        let eligible = specs
             .iter()
             .enumerate()
             .filter_map(|(index, spec)| {
                 let span = checked_d_span(spec, model, *count).ok()?;
                 encode_read(conn.base_route, series, span).ok()?;
-                Some((u32::try_from(index).ok()?, span))
+                Some((
+                    u32::try_from(index).ok()?,
+                    span,
+                    assess_d(model, *count, span.start) == RangeAssessment::VerifiedInside,
+                ))
             })
             .collect::<Vec<_>>();
-        if spans.len() > usize::from(u16::MAX) + 1 {
+        let mut groups: Vec<PendingRead> = Vec::new();
+        for (cover, span, verified) in eligible {
+            // Preserve input order. A duplicate, a gap in either specs or D
+            // addresses, or an unverified range starts a separate request.
+            let joined = if verified {
+                groups.last_mut().is_some_and(|last| {
+                    if assess_d(model, *count, last.span.start) != RangeAssessment::VerifiedInside {
+                        return false;
+                    }
+                    let Some(next_cover) = last.covers.last().and_then(|n| n.checked_add(1)) else {
+                        return false;
+                    };
+                    let Some(next_d) = last.span.start.checked_add(u32::from(last.span.count))
+                    else {
+                        return false;
+                    };
+                    let Some(next_count) = last.span.count.checked_add(1) else {
+                        return false;
+                    };
+                    let candidate = ReadSpan {
+                        count: next_count,
+                        ..last.span
+                    };
+                    if next_cover != cover
+                        || next_d != span.start
+                        || encode_read(conn.base_route, series, candidate).is_err()
+                    {
+                        return false;
+                    }
+                    last.span = candidate;
+                    last.covers.push(cover);
+                    true
+                })
+            } else {
+                false
+            };
+            if !joined {
+                groups.push(PendingRead {
+                    span,
+                    covers: vec![cover],
+                });
+            }
+        }
+        if groups.len() > usize::from(u16::MAX) + 1 {
             return Err(FatalError::Protocol("SLMP serial space exhausted".into()));
         }
         let mut serial = conn.next_serial.get();
         let pending = conn.pending.borrow();
-        let mut plans = Vec::with_capacity(spans.len());
-        let mut new_pending = Vec::with_capacity(spans.len());
-        for (cover, span) in spans {
+        let mut plans = Vec::with_capacity(groups.len());
+        let mut new_pending = Vec::with_capacity(groups.len());
+        for group in groups {
             if pending.contains_key(&serial) {
                 return Err(FatalError::Protocol(
                     "SLMP serial reused while a read is pending".into(),
@@ -353,13 +408,14 @@ impl read::Guest for Component {
                 serial,
                 ..conn.base_route
             };
-            let send = encode_read(route, series, span)
+            let send = encode_read(route, series, group.span)
                 .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-            new_pending.push((serial, PendingRead { span, cover }));
+            let step = read_step(send, group.span.count);
             plans.push(read::Planned {
-                step: frame_step(send),
-                covers: vec![cover],
+                step,
+                covers: group.covers.clone(),
             });
+            new_pending.push((serial, group));
             serial = serial.wrapping_add(1);
         }
         drop(pending);
@@ -381,13 +437,6 @@ impl read::Guest for Component {
                 "configured range is unresolved".into(),
             ));
         };
-        let [cover] = p.covers.as_slice() else {
-            return Err(FatalError::Protocol("one cover required".into()));
-        };
-        let spec = specs
-            .get(*cover as usize)
-            .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
-        let span = checked_d_span(spec, model, *count)?;
         let serial_bytes: [u8; 2] = p
             .step
             .send
@@ -399,36 +448,63 @@ impl read::Guest for Component {
             serial: u16::from_le_bytes(serial_bytes),
             ..conn.base_route
         };
-        let series = known_series(model).expect("ready model has series");
-        let expected = encode_read(route, series, span)
-            .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-        if p.step.send != expected {
-            return Err(FatalError::Protocol("plan bytes do not match spec".into()));
-        }
-        let pending = PendingRead {
-            span,
-            cover: *cover,
-        };
-        if conn.pending.borrow().get(&route.serial) != Some(&pending) {
+        let pending = conn
+            .pending
+            .borrow()
+            .get(&route.serial)
+            .cloned()
+            .ok_or_else(|| FatalError::Protocol("plan is not pending on this connection".into()))?;
+        if p.covers != pending.covers
+            || p.covers.is_empty()
+            || p.covers.len() != usize::from(pending.span.count)
+        {
             return Err(FatalError::Protocol(
-                "plan is not pending on this connection".into(),
+                "plan covers do not match pending read".into(),
             ));
         }
-        conn.pending.borrow_mut().remove(&route.serial);
-        match decode_read(route, span, &response) {
-            Ok(Values::Words(words)) => {
-                let [word] = words.as_slice() else {
-                    return Err(FatalError::Framing("expected one D word".into()));
-                };
-                Ok(vec![Ok(Value::Uint(u64::from(*word)))])
+        for (offset, cover) in p.covers.iter().enumerate() {
+            let spec = specs
+                .get(*cover as usize)
+                .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
+            let tag = checked_d_span(spec, model, *count)?;
+            let expected_d = pending
+                .span
+                .start
+                .checked_add(
+                    u32::try_from(offset)
+                        .map_err(|_| FatalError::Protocol("batch offset exceeds u32".into()))?,
+                )
+                .ok_or_else(|| FatalError::Protocol("batch address overflow".into()))?;
+            if tag.start != expected_d
+                || (p.covers.len() > 1
+                    && assess_d(model, *count, tag.start) != RangeAssessment::VerifiedInside)
+            {
+                return Err(FatalError::Protocol("plan does not match specs".into()));
             }
+        }
+        let series = known_series(model).expect("ready model has series");
+        let expected = encode_read(route, series, pending.span)
+            .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
+        if p.step.send != expected
+            || p.step.max_len != read_step(expected, pending.span.count).max_len
+        {
+            return Err(FatalError::Protocol("plan bytes do not match spec".into()));
+        }
+        conn.pending.borrow_mut().remove(&route.serial);
+        match decode_read(route, pending.span, &response) {
+            Ok(Values::Words(words)) => Ok(words
+                .into_iter()
+                .map(|word| Ok(Value::Uint(u64::from(word))))
+                .collect()),
             Ok(Values::Bits(_)) => Err(FatalError::Protocol("D read returned bits".into())),
-            Err(ResponseError::EndCode(code)) => Ok(vec![Err(ItemError::Device(
-                banto::driver::types::DeviceError {
-                    code: u32::from(code),
-                    message: format!("SLMP end code 0x{code:04X}"),
-                },
-            ))]),
+            Err(ResponseError::EndCode(code)) => Ok((0..pending.covers.len())
+                .map(|_| {
+                    Err(ItemError::Device(banto::driver::types::DeviceError {
+                        code: u32::from(code),
+                        message: format!("SLMP end code 0x{code:04X}"),
+                    }))
+                })
+                .collect()),
             Err(error) => Err(response_error(error)),
         }
     }
