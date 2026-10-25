@@ -6,9 +6,10 @@ pub mod fixtures {
         TagSpec,
     };
     use banto_driver_modbus::ModbusDriver;
-    use banto_modbus_read_core::{ReadError, ReadHoldingU16, MAX_RESPONSE_LEN};
     #[cfg(test)]
-    use banto_modbus_read_core::{ReadHoldingU32, RequestError, WordOrder};
+    use banto_modbus_read_core::RequestError;
+    use banto_modbus_read_core::{ReadError, ReadHoldingU16, MAX_RESPONSE_LEN};
+    use banto_modbus_read_core::{ReadHoldingU32, WordOrder};
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Outcome<T = u16> {
@@ -101,7 +102,6 @@ pub mod fixtures {
         },
     ];
 
-    #[cfg(test)]
     pub struct U32Fixture {
         pub name: &'static str,
         pub response: &'static [u8],
@@ -111,7 +111,6 @@ pub mod fixtures {
         pub native_accepts_extra: bool,
     }
 
-    #[cfg(test)]
     pub const U32_FIXTURES: &[U32Fixture] = &[
         U32Fixture {
             name: "zero_default",
@@ -263,7 +262,6 @@ pub mod fixtures {
         }
     }
 
-    #[cfg(test)]
     fn read_u32(offset: u16, word_order: WordOrder) -> ReadHoldingU32 {
         ReadHoldingU32 {
             transaction_id: 0,
@@ -273,8 +271,7 @@ pub mod fixtures {
         }
     }
 
-    #[cfg(test)]
-    fn native_u32(
+    pub fn native_u32(
         response: &[u8],
         order: Option<&str>,
         address: &str,

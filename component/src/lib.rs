@@ -4,7 +4,9 @@
 use std::cell::Cell;
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
-use banto_modbus_read_core::{ReadError, ReadHoldingU16, MAX_RESPONSE_LEN};
+use banto_modbus_read_core::{
+    ReadError, ReadHoldingU16, ReadHoldingU32, WordOrder, MAX_RESPONSE_LEN,
+};
 use exports::banto::driver::{address, config, read, session};
 
 wit_bindgen::generate!({ path: "../wit", world: "driver" });
@@ -13,7 +15,23 @@ struct Component;
 
 struct ModbusConnection {
     unit_id: u8,
+    word_order: WordOrder,
     next_transaction_id: Cell<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    U16,
+    U32,
+}
+
+impl Kind {
+    const fn word_count(self) -> u32 {
+        match self {
+            Self::U16 => 1,
+            Self::U32 => 2,
+        }
+    }
 }
 
 fn setting<'a>(settings: &'a [banto::driver::types::Setting], key: &str) -> Option<&'a str> {
@@ -97,12 +115,14 @@ fn check_number(
     }
 }
 
-/// Only FC3 holding-register U16 addresses are supported. Preserve the
-/// native parser's 5/6 digit reference and canonical six-digit form.
-fn parse_holding_u16(text: &str, data_type: &str, words: Option<u32>) -> Result<u16, String> {
-    if data_type != "u16" || words.is_some() {
-        return Err("初版は u16 の単一保持レジスタのみ対応します".into());
-    }
+/// Preserve the native parser's 5/6 digit reference and canonical form.
+/// A U32 occupies two complete registers; the final start is offset 65534.
+fn parse_holding(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16, Kind), String> {
+    let kind = match (data_type, words) {
+        ("u16", None) => Kind::U16,
+        ("u32", None) => Kind::U32,
+        _ => return Err("FC3 は u16 または u32 の保持レジスタのみ対応します".into()),
+    };
     let text = text.trim();
     let bytes = text.as_bytes();
     if !matches!(bytes.len(), 5 | 6) || bytes[0] != b'4' || !bytes.iter().all(u8::is_ascii_digit) {
@@ -111,17 +131,45 @@ fn parse_holding_u16(text: &str, data_type: &str, words: Option<u32>) -> Result<
     let number = text[1..]
         .parse::<u32>()
         .map_err(|_| format!("{text:?} は保持レジスタの参照番号ではありません"))?;
-    u16::try_from(number.checked_sub(1).ok_or("レジスタ番号は1からです")?)
-        .map_err(|_| "保持レジスタの範囲を超えています".into())
+    let offset = u16::try_from(number.checked_sub(1).ok_or("レジスタ番号は1からです")?)
+        .map_err(|_| "保持レジスタの範囲を超えています".to_string())?;
+    if kind == Kind::U32 && offset == u16::MAX {
+        return Err("u32 の2レジスタが保持レジスタの範囲を超えています".into());
+    }
+    Ok((offset, kind))
 }
 
 fn canonical(offset: u16) -> String {
     format!("4{:05}", u32::from(offset) + 1)
 }
 
-fn step(request: ReadHoldingU16) -> session::Step {
+fn request_bytes(
+    conn: &ModbusConnection,
+    transaction_id: u16,
+    offset: u16,
+    kind: Kind,
+) -> [u8; 12] {
+    match kind {
+        Kind::U16 => ReadHoldingU16 {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+        }
+        .request(),
+        Kind::U32 => ReadHoldingU32 {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            word_order: conn.word_order,
+        }
+        .request()
+        .expect("validated U32 start offset"),
+    }
+}
+
+fn step(send: [u8; 12]) -> session::Step {
     session::Step {
-        send: request.request().to_vec(),
+        send: send.to_vec(),
         expect: session::FrameRule::LengthPrefixed(session::PrefixSpec {
             offset: 4,
             width: 2,
@@ -138,17 +186,12 @@ fn planned_read(conn: &ModbusConnection, specs: &[TagSpec]) -> Vec<read::Planned
         .iter()
         .enumerate()
         .filter_map(|(index, spec)| {
-            let offset =
-                parse_holding_u16(&spec.address, &spec.data_type, spec.string_words).ok()?;
+            let (offset, kind) =
+                parse_holding(&spec.address, &spec.data_type, spec.string_words).ok()?;
             let transaction_id = conn.next_transaction_id.get();
             conn.next_transaction_id.set(transaction_id.wrapping_add(1));
-            let request = ReadHoldingU16 {
-                transaction_id,
-                unit_id: conn.unit_id,
-                offset,
-            };
             Some(read::Planned {
-                step: step(request),
+                step: step(request_bytes(conn, transaction_id, offset, kind)),
                 covers: vec![index as u32],
             })
         })
@@ -167,7 +210,7 @@ fn decode_planned(
     let spec = specs
         .get(*cover as usize)
         .ok_or_else(|| FatalError::Protocol("covers が specs の範囲外です".into()))?;
-    let offset = parse_holding_u16(&spec.address, &spec.data_type, spec.string_words)
+    let (offset, kind) = parse_holding(&spec.address, &spec.data_type, spec.string_words)
         .map_err(FatalError::Protocol)?;
     let send: [u8; 12] = p
         .step
@@ -175,18 +218,31 @@ fn decode_planned(
         .as_slice()
         .try_into()
         .map_err(|_| FatalError::Protocol("FC3 要求長が不正です".into()))?;
-    let request = ReadHoldingU16 {
-        transaction_id: u16::from_be_bytes([send[0], send[1]]),
-        unit_id: conn.unit_id,
-        offset,
-    };
-    if send != request.request() {
+    let transaction_id = u16::from_be_bytes([send[0], send[1]]);
+    if send != request_bytes(conn, transaction_id, offset, kind) {
         return Err(FatalError::Protocol(
             "計画と要求バイトが一致しません".into(),
         ));
     }
-    let value = match request.decode(response) {
-        Ok(value) => Ok(Value::Uint(u64::from(value))),
+    let decoded = match kind {
+        Kind::U16 => ReadHoldingU16 {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+        }
+        .decode(response)
+        .map(u64::from),
+        Kind::U32 => ReadHoldingU32 {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            word_order: conn.word_order,
+        }
+        .decode(response)
+        .map(u64::from),
+    };
+    let value = match decoded {
+        Ok(value) => Ok(Value::Uint(value)),
         Err(ReadError::Device(code)) => Err(ItemError::Device(banto::driver::types::DeviceError {
             code: u32::from(code),
             message: format!("FC=0x03 Modbus exception 0x{code:02X}"),
@@ -216,6 +272,9 @@ impl session::GuestConnection for ModbusConnection {
             .unwrap_or(1);
         Ok(session::Connection::new(ModbusConnection {
             unit_id,
+            word_order: setting(&settings, "word_order")
+                .and_then(WordOrder::parse)
+                .unwrap_or_default(),
             next_transaction_id: Cell::new(0),
         }))
     }
@@ -268,13 +327,13 @@ impl address::Guest for Component {
         data_type: String,
         string_words: Option<u32>,
     ) -> Result<address::Parsed, String> {
-        let offset = parse_holding_u16(&text, &data_type, string_words)?;
+        let (offset, kind) = parse_holding(&text, &data_type, string_words)?;
         Ok(address::Parsed {
             canonical: canonical(offset),
             area: "holding_register".into(),
             writable_area: true,
             bit: None,
-            word_count: 1,
+            word_count: kind.word_count(),
             index: Some(u64::from(offset)),
         })
     }
@@ -285,27 +344,27 @@ impl address::Guest for Component {
         string_words: Option<u32>,
         n: i64,
     ) -> Result<String, String> {
-        let offset = parse_holding_u16(&canonical, &data_type, string_words)?;
+        let (offset, kind) = parse_holding(&canonical, &data_type, string_words)?;
         let next = i64::from(offset)
             .checked_add(n)
             .ok_or("オフセットが範囲外です")?;
-        canonical_for(next)
+        canonical_for(next, kind)
     }
 
     fn supported_kinds() -> Vec<String> {
-        vec!["u16".into()]
+        vec!["u16".into(), "u32".into()]
     }
 
     fn offset_words(canonical: String, n: i64) -> Result<String, String> {
-        let offset = parse_holding_u16(&canonical, "u16", None)?;
+        let (offset, _) = parse_holding(&canonical, "u16", None)?;
         let next = i64::from(offset)
             .checked_add(n)
             .ok_or("オフセットが範囲外です")?;
-        canonical_for(next)
+        canonical_for(next, Kind::U16)
     }
 
     fn help() -> String {
-        "FC3 の単一保持レジスタ U16: 40001〜49999 または 400001〜465536".into()
+        "FC3 保持レジスタ u16（1 word）/ u32（2 words）: 40001〜49999 または 400001〜465536。u32 の最終開始は 465535".into()
     }
 
     fn probe() -> Option<TagSpec> {
@@ -317,8 +376,11 @@ impl address::Guest for Component {
     }
 }
 
-fn canonical_for(offset: i64) -> Result<String, String> {
+fn canonical_for(offset: i64, kind: Kind) -> Result<String, String> {
     let offset = u16::try_from(offset).map_err(|_| "保持レジスタの範囲を超えています")?;
+    if kind == Kind::U32 && offset == u16::MAX {
+        return Err("u32 の2レジスタが保持レジスタの範囲を超えています".into());
+    }
     Ok(canonical(offset))
 }
 
@@ -331,7 +393,9 @@ impl config::Guest for Component {
     }
 
     fn schema() -> Vec<config::SettingField> {
-        use config::{FieldGroup, FieldKind, IntegerSpec, SettingField, SettingValue};
+        use config::{
+            ChoiceOption, FieldGroup, FieldKind, IntegerSpec, SettingField, SettingValue,
+        };
         vec![
             SettingField {
                 key: "host".into(),
@@ -366,6 +430,24 @@ impl config::Guest for Component {
                 default: Some(SettingValue::Integer(1)),
                 group: FieldGroup::Advanced,
             },
+            SettingField {
+                key: "word_order".into(),
+                label: "ワード順".into(),
+                help: Some("u32 の先頭レジスタを下位/上位16 bit として扱います".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption {
+                        value: "low_high".into(),
+                        label: "low_high".into(),
+                    },
+                    ChoiceOption {
+                        value: "high_low".into(),
+                        label: "high_low".into(),
+                    },
+                ]),
+                required: false,
+                default: Some(SettingValue::Text("low_high".into())),
+                group: FieldGroup::Advanced,
+            },
         ]
     }
 }
@@ -380,6 +462,7 @@ mod tests {
     fn conn() -> ModbusConnection {
         ModbusConnection {
             unit_id: 1,
+            word_order: WordOrder::default(),
             next_transaction_id: Cell::new(0),
         }
     }
@@ -394,12 +477,21 @@ mod tests {
 
     #[test]
     fn address_and_probe_agree_with_fc3_scope() {
-        assert_eq!(parse_holding_u16("40001", "u16", None), Ok(0));
-        assert_eq!(parse_holding_u16("465536", "u16", None), Ok(u16::MAX));
+        assert_eq!(parse_holding("40001", "u16", None), Ok((0, Kind::U16)));
+        assert_eq!(
+            parse_holding("465536", "u16", None),
+            Ok((u16::MAX, Kind::U16))
+        );
+        assert_eq!(
+            parse_holding("465535", "u32", None),
+            Ok((65_534, Kind::U32))
+        );
+        assert!(parse_holding("465536", "u32", None).is_err());
         assert_eq!(canonical(0), "400001");
-        assert!(parse_holding_u16("30001", "u16", None).is_err());
-        assert!(parse_holding_u16("40001.3", "u16", None).is_err());
-        assert!(parse_holding_u16("40001", "i16", None).is_err());
+        assert!(parse_holding("30001", "u16", None).is_err());
+        assert!(parse_holding("40001.3", "u16", None).is_err());
+        assert!(parse_holding("40001", "i16", None).is_err());
+        assert!(parse_holding("40001", "u32", Some(2)).is_err());
         assert_eq!(
             <Component as address::Guest>::probe().unwrap().address,
             "40001"
@@ -438,6 +530,34 @@ mod tests {
             &[0, 0, 0, 0, 0, 6, 1, 3, 2, 0, 42, 255],
         );
         assert!(matches!(extra, Err(FatalError::Framing(_))));
+    }
+
+    #[test]
+    fn u32_plan_and_decode_respect_word_order_and_range() {
+        let mut conn = conn();
+        let specs = [TagSpec {
+            address: "465535".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        }];
+        let plans = planned_read(&conn, &specs);
+        assert_eq!(plans[0].step.send, [0, 0, 0, 0, 0, 6, 1, 3, 255, 254, 0, 2]);
+        let response = [0, 0, 0, 0, 0, 7, 1, 3, 4, 0x12, 0x34, 0xab, 0xcd];
+        assert!(matches!(
+            decode_planned(&conn, &plans[0], &specs, &response).as_deref(),
+            Ok([Ok(Value::Uint(0xabcd_1234))])
+        ));
+        conn.word_order = WordOrder::HighLow;
+        assert!(matches!(
+            decode_planned(&conn, &plans[0], &specs, &response).as_deref(),
+            Ok([Ok(Value::Uint(0x1234_abcd))])
+        ));
+        let invalid = [TagSpec {
+            address: "465536".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        }];
+        assert!(planned_read(&conn, &invalid).is_empty());
     }
 
     #[test]
