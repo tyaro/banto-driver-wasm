@@ -1,0 +1,11 @@
+[package]
+name = "banto-wasm-native-comparison"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+banto-fc3-native-comparison = { path = "../comparison" }
+wasmtime = { version = "=50.0.0", default-features = false, features = ["component-model", "runtime", "cranelift", "std", "wat"] }

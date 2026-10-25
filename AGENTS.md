@@ -8,12 +8,12 @@
 - native ドライバは内部依存を持つ。丸ごとコピーせず、初回は Modbus TCP 読み取りの WASM と native の結果一致を狙う。
 - ソケット I/O、再接続、品質、書き込みの安全判断と監査は Hub 側。WASM 側の能力は段階ごとに設計・検証する。
 - 未実装の製品機能を README、CI、STATUS で「テスト済み」と表現しない。
-- `drivers/modbus` は現在、単一 FC3 読み取りの `no_std` コアであり、Hub API の実装でも WIT コンポーネントでもない。
+- `drivers/modbus` は単一 FC3 読み取りの `no_std` コアである。`component` はこのコアを `world driver` に接続する実験的な WIT コンポーネントであり、Hub loader / runtime の実装ではない。
 
 ## CI と変更
 
 - `.github/scripts/ci-changes.mjs` の判定を変えたら表テストも変える。未知パスと共通設定は全領域に倒す。SDK / WIT の変更は全利用先へ波及させる。
-- Modbus は整形・Clippy・単体テスト・WASM ターゲットの型検査を実行する。SDK / WIT と SLMP は構成ガードのみ。製品ソースを追加するときは対応する実ビルド・テストを同時に配線し、CI のゲートに必要ジョブを加える。
+- Modbus コアは Rust 1.85.1 の整形・Clippy・単体テスト・WASM ターゲットの型検査を CI で維持する。コンポーネントは Rust 1.98.1 で WIT 検査・実ビルド・Wasmtime の比較試験を行う。SDK と SLMP は構成ガードのみ。製品ソースを追加するときは対応する実ビルド・テストを同時に配線し、CI のゲートに必要ジョブを加える。
 - 規模が小さい間は nextest の 3 分割などを写さない。WASM 成果物ができたら一度ビルドして後続ジョブで再利用する。main のキャッシュ保存、PR の復元、PR の古い実行だけのキャンセルを維持する。
 
 ## 引継ぎ

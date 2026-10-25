@@ -1,2 +1,5 @@
 /target/
 /comparison/target/
+/component/target/
+/runtime-comparison/target/
+/dist/

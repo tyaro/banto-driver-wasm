@@ -106,6 +106,71 @@ jobs:
       - run: cargo +1.98.1 clippy --manifest-path comparison/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo +1.98.1 test --manifest-path comparison/Cargo.toml --locked
 
+  component-build:
+    needs: changes
+    if: needs.changes.outputs.modbus == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install Rust 1.98.1 for the component
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: component -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install pinned WIT tooling
+        run: cargo +1.98.1 install wasm-tools --version 1.262.0 --locked
+      - name: Validate the full driver world
+        run: |
+          wasm-tools component wit wit/driver.wit --wasm -o "$RUNNER_TEMP/driver-wit.wasm"
+          wasm-tools validate "$RUNNER_TEMP/driver-wit.wasm"
+      - name: Check prototype manifest
+        run: |
+          node -e 'const m=require("./component/manifest.json"); if (!Number.isInteger(m.settingsVersion) || m.settingsVersion < 1 || m.hubApi !== "1" || m.transports.join() !== "tcp" || m.capabilities.join() !== "read") process.exit(1)'
+      - run: cargo +1.98.1 fmt --manifest-path component/Cargo.toml --check
+      - run: cargo +1.98.1 clippy --manifest-path component/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo +1.98.1 test --manifest-path component/Cargo.toml --locked
+      - name: Build one WASM component
+        run: |
+          cargo +1.98.1 build --manifest-path component/Cargo.toml --target wasm32-unknown-unknown --locked
+          mkdir -p dist
+          wasm-tools component new component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm -o dist/banto-modbus-tcp-component.wasm
+          wasm-tools validate dist/banto-modbus-tcp-component.wasm
+          wasm-tools component targets wit/driver.wit dist/banto-modbus-tcp-component.wasm --world driver
+          wasm-tools component wit dist/banto-modbus-tcp-component.wasm | node -e 'let s=""; process.stdin.on("data", c=>s+=c); process.stdin.on("end",()=>{if(s.includes("wasi:")) process.exit(1)})'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: banto-modbus-tcp-component
+          path: dist/banto-modbus-tcp-component.wasm
+          if-no-files-found: error
+
+  component-compare:
+    needs: [changes, component-build]
+    if: needs.changes.outputs.modbus == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: banto-modbus-tcp-component
+          path: dist
+      - name: Install Hub's pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime-comparison -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo +1.98.1 fmt --manifest-path runtime-comparison/Cargo.toml --check
+      - run: cargo +1.98.1 clippy --manifest-path runtime-comparison/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo +1.98.1 test --manifest-path runtime-comparison/Cargo.toml --locked
+        env:
+          BANTO_COMPONENT_WASM: ${{ github.workspace }}/dist/banto-modbus-tcp-component.wasm
+
   slmp-guard:
     needs: changes
     if: needs.changes.outputs.slmp == 'true'
@@ -120,7 +185,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [changes, scaffold, sdk-guard, modbus-test, native-compare, slmp-guard]
+    needs: [changes, scaffold, sdk-guard, modbus-test, native-compare, component-build, component-compare, slmp-guard]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -149,3 +214,10 @@ jobs:
             echo "::error::native-compare required but $result"
             exit 1
           fi
+          for job in component-build component-compare; do
+            result=$(jq -r --arg job "$job" '.[$job].result' <<< "$NEEDS")
+            if [[ "$wanted" == true && "$result" != success ]]; then
+              echo "::error::$job required but $result"
+              exit 1
+            fi
+          done

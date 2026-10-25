@@ -1,0 +1,14 @@
+[package]
+name = "banto-modbus-tcp-component"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+banto-modbus-read-core = { path = "../drivers/modbus" }
+wit-bindgen = "=0.63.0"

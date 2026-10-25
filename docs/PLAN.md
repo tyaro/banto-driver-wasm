@@ -12,8 +12,8 @@
 
 ## CI の拡張順
 
-現在の `changes` は文書、SDK / WIT、Modbus、SLMP、共通・未知パスを分類する。SDK / WIT は両ドライバに波及し、未知パスと共通設定は全領域に倒す。`scaffold` は必須文書と未知ファイルを確認し、`changes` は変更判定テストを実行する。`modbus-test` は Rust の整形・Clippy・単体テスト・WASM ターゲットの型検査を実行する。SDK / WIT と SLMP の area ジョブは製品ソースの誤追加を検出する。`ci-gate` は必須ジョブの failure / cancelled / 想定外の skipped を検出する。
+現在の `changes` は文書、SDK / WIT、Modbus、SLMP、共通・未知パスを分類する。SDK / WIT は両ドライバに波及し、未知パスと共通設定は全領域に倒す。`scaffold` は必須文書と未知ファイルを確認し、`changes` は変更判定テストを実行する。`modbus-test` は Rust 1.85.1 の整形・Clippy・単体テスト・WASM ターゲットの型検査を実行する。`component-build` は WIT と実コンポーネントを検査し、`component-compare` は同じ成果物を Wasmtime で実行して native と照合する。SDK と SLMP の area ジョブは製品ソースの誤追加を検出する。`ci-gate` は必須ジョブの failure / cancelled / 想定外の skipped を検出する。
 
-SDK / WIT と SLMP の製品コードを導入する際は、その領域の area ガードを実ビルド・テストに置き換え、依存先にも同じ成果物を渡す。WASM バイナリは 1 ジョブで一度作り、適合・native 比較ジョブに artifact として渡す。Rust キャッシュは main で保存し、PR で復元する。PR の古い実行のみキャンセルする。ジョブ・テストの所要時間を記録し、分割数とキャッシュ設定は実測で決める。現段階で nextest や WASM 成果物のジョブは置かない。
+SDK と SLMP の製品コードを導入する際は、その領域の area ガードを実ビルド・テストに置き換える。現在の WASM バイナリは `component-build` で一度作り、比較ジョブに artifact として渡す。Rust キャッシュは main で保存し、PR で復元する。PR の古い実行のみキャンセルする。ジョブ・テストの所要時間を記録し、分割数とキャッシュ設定は実測で決める。nextest の分割はまだ行わない。
 
 ソースや依存を増やす変更で追加の承認が必要なら、その時点で止めて状況を報告する。

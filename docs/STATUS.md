@@ -1,6 +1,6 @@
 # STATUS
 
-更新日: 2026-10-24
+更新日: 2026-10-25
 
 ## 完了
 
@@ -11,6 +11,10 @@
 - このセッションの開始時に main が `97f5f86c80ca8d5391bab793c98d13b965e67faa` であると確認し、新規ブランチ `fc3-native-compare` を作った。Hub の main は照合元 `a0d01aa2beb007fc2636288c4e839410dece3fdc` と一致した。
 - Hub の公開 `FrameDriver` を固定 Git 依存として実行する独立比較クレートを追加した。Hub の製品ソースはコピー・変更していない。WIT の未決事項と推薦案を [CONTRACT.md](CONTRACT.md) に更新した。
 - [PR #2](https://github.com/tyaro/banto-driver-wasm/pull/2) を `aed41e6eb8db098da260ee874ca5afebc84d32c8` で main にマージした。比較試験・CI ゲート・契約照合文書を含む。比較元の head は `b758ae90dc3c4152df73b0dcb142f78df913015a`。
+- 新規セッションで driver-wasm の main `77b9d8f7c0b8a62e190b3aa7f4f97462714686ae` を clean と確認した。Hub main `89de2953b59587839d93a182c0bc7c17179adb0e` を取得し、前回の `a0d01aa2` から API・Modbus・engine・WIT 設計に差分がないと確認した。未決境界の提案と決定後の比較経路を [CONTRACT.md](CONTRACT.md) に具体化した。製品コードと Hub 本体には変更を加えていない。
+- 2026-10-25 に WIT 境界の5案について最終方針の承認を受けた。ローカル準備コミット `02b8fe1c63c1876ee7ba34ba457e0808dde4e5d1` を保持したまま再開し、driver-wasm main `77b9d8f7` と Hub main `aab51f437a303fd3ca4ef77ec73c46e54d43bcbc` を確認した。Hub の対象 API・Modbus・engine・WIT 設計は前回の `89de2953` から差分がない。承認された範囲を [CONTRACT.md](CONTRACT.md) に記録した。
+- 承認済み境界に沿う [正本 WIT](../wit/driver.wit)、[FC3・単一 U16 ゲスト](../component/src/lib.rs)、[実 WASM 比較](../runtime-comparison/src/lib.rs) を追加した。`session` / `read` / `address` / `config` の全 export を持ち、ソケットと WASI は持たない。既存の native 比較フィクスチャを共用する。Hub 本体は変更していない。
+- CI に `component-build` と `component-compare` を加え、WIT 検査、コンポーネント生成・検証、成果物を使った Wasmtime 実行を配線した。既存の Rust 1.85.1 コア CI と native 比較は維持した。`component/manifest.json` は初版メタデータの試案であり、Hub 側の検証器や配布形式ではない。
 
 ## 検証
 
@@ -24,26 +28,34 @@
 - `cargo +1.98.1 test --manifest-path comparison/Cargo.toml --locked` で 2/2 成功。FC3 単一レジスタの共通応答フィクスチャ 12 件中 10 件で値・エラー分類が一致。余剰 PDU の正常・例外 2 件は native が受理し、新コアが `Framing` で拒否する意図的な差として検証。要求 MBAP、native の `probe`、`settings_version=1`、TCP の通信間隔ゼロも検証した。
 - 今回のローカル確認: Node.js 24.19.0 の変更判定テスト 13/13、構成ガード、Rust 1.85.1 の core テスト 7/7・Clippy・`wasm32-unknown-unknown` の型検査、Rust 1.98.1 の比較テスト 2/2・Clippy・整形、`git diff --check`、CI YAML 解析が成功。[PR #2 の CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40113142990) は `native-compare` / `modbus-test` / `ci-gate` を含む全 7 ジョブ成功。
 - [PR #2 マージ後の main CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40113609047) も全 7 ジョブ成功。
+- 今回の文書変更では Node.js 24.19.0 の `node --test .github/scripts/ci-changes.test.mjs` が 13/13 成功し、`node .github/scripts/check-scaffold.mjs` の通常・`sdk`・`slmp` 指定と `git diff --check` が成功した。
+- このクラウド環境では公式 rustup から Rust 1.98.1 のみを導入し、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0 を使った。Wasmtime 50.0.0 は比較クレートのライブラリとして使用し、CLI は導入していない。Rust 1.85.1 は新規導入していない。
+- 新規 WIT は `wasm-tools component wit` と `validate` に成功。`cargo +1.98.1 build --manifest-path component/Cargo.toml --target wasm32-unknown-unknown --locked` でコアモジュールを作り、`wasm-tools component new`、`validate`、`component targets ... --world driver` に成功。これはコアの `wasm32` 型検査とは別の実コンポーネント生成である。
+- `BANTO_COMPONENT_WASM=... cargo +1.98.1 test --manifest-path runtime-comparison/Cargo.toml --locked` は3/3成功。実コンポーネントを Wasmtime 50.0.0 でインスタンス化し、共有12フィクスチャの10一致・2厳密拒否、probe / parse / config / handshake / plan を検査した。別テストで Wasmtime の `memory.grow` 上限失敗が `-1` を返し trap ではないこと、`unreachable` trap と epoch 割込を型付き原因として区別できることを確認した。
+- 最終ローカル確認: Rust 1.98.1 でコア単体7/7、コンポーネント単体4/4・doc1/1、native 比較2/2、実 WASM 比較3/3、各クレートの整形・Clippy、コア `wasm32` 型検査が成功。Node.js 24.19.0 の変更判定15/15、構成ガードの通常・`sdk`・`slmp`、CI YAML 解析、manifest の現値確認、`git diff --check` も成功した。
+- [PR #3](https://github.com/tyaro/banto-driver-wasm/pull/3) を Ready で公開した。CI の成果物パスをリポジトリ基準の絶対パスに修正し、同じ配置で実 WASM 比較3/3を再実行した。[修正版 CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40150441856) は `component-build` / `component-compare` / `ci-gate` を含む全9ジョブ成功。Rust 1.85.1 のコア CI も成功した。修正前の実行は次の push によりキャンセルされた。
 
 ## 未検証
 
-- SDK、確定 WIT、WASM コンポーネント、Hub loader / runtime、Modbus / SLMP 通信、実機、成果物再利用は未実装・未検証。native 比較は純粋な FC3・単一レジスタに限定し、WASM と Hub runtime の比較ではない。
-- FC3 以外、複数レジスタ、ワード順、文字列、アドレス解析、設定検証も未実装。
+- Hub loader / runtime、manifest の必須正整数検証、`FrameConnection` アダプター、既存接続テストへの登録・呼び出しは未実装。WASM 境界での U16 型・範囲検査、`covers` と結果件数の既存 `FrameSession` 検査への接続、内部原因の構造化診断と API 変換も Hub 側では未検証。
+- 実 Modbus TCP 通信、実機、SLMP、FC3 以外、複数レジスタ、ワード順、文字列、書き込みは未実装または未検証。アドレス解析と設定検証はゲスト内だけで実装した。
+- ローカルでは Rust 1.85.1 を導入・実行していない。CI では既存の 1.85.1 コア検証と WASM artifact のジョブ間再利用が成功した。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
 
 ## 残件
 
-- `CONTRACT.md` の WIT 境界（通信間隔、probe、設定の版）とホスト起因の trap / 上限エラーの内部分類を Hub 側で決める。独自 ABI を先に作らない。
-- 現在の比較範囲を超える型・エラーのフィクスチャを増やし、WIT と Hub loader / runtime の実装後に実 WASM コンポーネントと native を照合する。
-- SDK / WIT と SLMP に製品ソースを足すときは、CI のガードを実ビルド・テストへ置き換える。WASM 成果物の一度ビルド・再利用と計測は、コンポーネント実装時に行う。
+- Hub 側の manifest 検証、loader / runtime、`FrameConnection` アダプター、既存接続テスト経路への登録を既存担当作業と調整する。接続テストの fingerprint による再利用・設定変更拒否と `probe` のエラー伝播は Hub 側で実装する。
+- Hub 境界で FC3・U16 の型と範囲を検査し、既存 `FrameSession` の `covers` / 件数チェックと値変換を再利用する。runtime の trap / epoch / memory limit を内部で分類して診断に残し、既存 API への写像を一か所に置く。
+- さらに実通信と既存 Hub 接続テスト経由の比較を行う。SDK / WIT と SLMP に製品ソースを足すときは area ガードを実ビルド・テストへ置き換える。
 
 ## 次作業
 
-1. Hub の最新 main の API / 設計を再照合し、`probe`、`settingsVersion`、TCP 限定のゼロ通信間隔、runtime エラー分類の推薦案を Hub 側で判断して WIT v1 の変更範囲を決める。
-2. 決定した WIT と Hub loader / runtime に合わせて最小アダプターを実装し、比較を実 WASM へ広げる。ワード順、文字列、複数レジスタ等はまだ範囲外。
+1. PR #3 の最終レビューと CI を確認し、修正必須事項があれば同 PR で解消する。マージは別途判断する。
+2. Hub 側の最小変更範囲を調整し、manifest 検証、loader / runtime、既存 `FrameSession` と接続テストへのアダプターを作る。ワード順、文字列、複数レジスタ等はまだ範囲外。
 
 ## 判断
 
 - 開発場所を Hub と別の公開リポジトリ `tyaro/banto-driver-wasm` にする。
 - 初回の製品目標は Modbus の WASM 読み取りと native 結果一致。既存ドライバの一括移植はしない。
-- CI は Linux 中心。現在の Modbus 領域は Rust の整形・Clippy・単体テスト・WASM ターゲットの型検査と独立した native 比較を対象とする。WIT コンポーネントのビルドや nextest 分割は後続の計測に基づく。
+- CI は Linux 中心。Modbus 領域は既存の Rust 1.85.1 コア検証、Rust 1.98.1 の native 比較、WIT 検査・実コンポーネントのビルド・Wasmtime 比較を対象とする。nextest 分割は計測後に判断する。
 - native 比較を Modbus 領域の独立 CI ジョブとし、Hub `a0d01aa2` に固定する。余剰 PDU の受理差は新コアの厳格化を維持して明記する。WIT と Hub runtime の契約はこのリポジトリだけで確定しない。
+- 初版の WIT 境界と適用範囲は [CONTRACT.md](CONTRACT.md) の「初版境界の決定」に従う。新 WASM manifest の `settingsVersion` は必須正整数、TCP gap はゼロ、FC3・単一 U16 の生値は `uint(u64)`、host runtime 失敗は内部で型付き分類とする。
