@@ -1,5 +1,6 @@
 # banto-driver-wasm
 
+A separate [SLMP WASM guest](slmp-component/src/lib.rs) now exercises the existing WIT connection handshake and a confirmed-range single D/u16 read using controlled [Wasmtime fixtures](slmp-runtime/src/lib.rs). [Discovery metadata and Hub display](docs/SLMP_DISCOVERY_CONTRACT.md) remain a design-only contract. No physical PLC I/O was used.
 
 The SLMP I/O-free core also plans conditional QnU complete M/B counts (SD286-289) and recognized QnUDV internal-only D/W counts (SD282-285). These are field counts; D/W totals and complete tag ranges are not inferred; see [`drivers/slmp`](drivers/slmp/README.md) for evidence requirements.
 

@@ -14,7 +14,8 @@ export function classify(event, files) {
     } else if (file.startsWith('drivers/modbus/') || file.startsWith('comparison/')
       || file.startsWith('component/') || file.startsWith('runtime-comparison/')) {
       selected.modbus = true;
-    } else if (file.startsWith('drivers/slmp/')) {
+    } else if (file.startsWith('drivers/slmp/') || file.startsWith('slmp-component/')
+      || file.startsWith('slmp-runtime/')) {
       selected.slmp = true;
     } else if (/^(docs\/.*\.md|[^/]+\.md)$/.test(file)) {
       // The scaffold check always validates the public documentation.

@@ -175,9 +175,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.slmp == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Install Rust 1.98.1
         run: rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown --no-self-update
       - uses: Swatinem/rust-cache@v2
@@ -188,6 +191,33 @@ jobs:
       - run: cargo +1.98.1 clippy --manifest-path drivers/slmp/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo +1.98.1 test --manifest-path drivers/slmp/Cargo.toml --locked
       - run: cargo +1.98.1 check --manifest-path drivers/slmp/Cargo.toml --target wasm32-unknown-unknown --locked
+      - name: Check the SLMP guest source
+        run: |
+          cargo +1.98.1 fmt --manifest-path slmp-component/Cargo.toml --check
+          cargo +1.98.1 clippy --manifest-path slmp-component/Cargo.toml --all-targets --locked -- -D warnings
+          cargo +1.98.1 test --manifest-path slmp-component/Cargo.toml --locked
+      - name: Install pinned WIT tooling
+        run: cargo +1.98.1 install wasm-tools --version 1.262.0 --locked
+      - name: Build and validate SLMP component against the existing world
+        run: |
+          cargo +1.98.1 build --manifest-path slmp-component/Cargo.toml --target wasm32-unknown-unknown --locked
+          mkdir -p dist
+          wasm-tools component new slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm -o dist/banto-slmp-read-component.wasm
+          wasm-tools validate dist/banto-slmp-read-component.wasm
+          wasm-tools component targets wit/driver.wit dist/banto-slmp-read-component.wasm --world driver
+          wasm-tools component wit dist/banto-slmp-read-component.wasm | node -e 'let s=""; process.stdin.on("data", c=>s+=c); process.stdin.on("end",()=>{if(s.includes("wasi:")) process.exit(1)})'
+      - name: Run controlled Q/R Wasmtime fixtures
+        run: |
+          cargo +1.98.1 fmt --manifest-path slmp-runtime/Cargo.toml --check
+          cargo +1.98.1 clippy --manifest-path slmp-runtime/Cargo.toml --all-targets --locked -- -D warnings
+          cargo +1.98.1 test --manifest-path slmp-runtime/Cargo.toml --locked
+        env:
+          BANTO_SLMP_COMPONENT_WASM: ${{ github.workspace }}/dist/banto-slmp-read-component.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: banto-slmp-read-component
+          path: dist/banto-slmp-read-component.wasm
+          if-no-files-found: error
 
   ci-gate:
     if: always()

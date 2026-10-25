@@ -1,5 +1,6 @@
 # 段階計画
 
+P3 guest follow-up: use a separate SLMP component with the existing WIT world to exercise 0101 -> model-specific basic D SD -> one confirmed-range D/u16 0401 read in Wasmtime. The unknown-range read policy is pending; a structured Hub discovery snapshot is design only. WIT/Hub implementation, full device coverage, physical PLC I/O, and writes are later decisions.
 
 P3 follow-up: SD286-289 QnU complete M/B and SD282-285 classified QnUDV internal-only D/W counts are a separate I/O-free stage. Version, serial, and route evidence must be independently confirmed. M/B pairs are complete configured counts, while fast D/W pairs are internal-only; Q SD308-311 totals and tag validation remain later work.
 

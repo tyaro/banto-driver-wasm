@@ -1,0 +1,10 @@
+[package]
+name = "banto-slmp-runtime-fixtures"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+wasmtime = { version = "=50.0.0", default-features = false, features = ["component-model", "runtime", "cranelift", "std", "wat"] }

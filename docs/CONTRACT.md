@@ -1,5 +1,7 @@
 # API と WIT の照合
 
+SLMP follow-up: the separate guest uses the current session.connection and read interfaces for a controlled 0101 -> SD -> D/u16 path. [The discovery snapshot proposal](SLMP_DISCOVERY_CONTRACT.md) defines CPU identity, count scope, unknown reasons, and generation invalidation without changing WIT or Hub in this stage. Unknown-range ordinary-read policy and WIT compatibility remain pending.
+
 native 比較の固定元: banto-industrial `a0d01aa2` の [API 実装](https://github.com/tyaro/banto-industrial/tree/a0d01aa2/crates/banto-driver-api) と [Modbus 実装](https://github.com/tyaro/banto-industrial/tree/a0d01aa2/crates/banto-driver-modbus)。Hub の実装状態は [PR #843](https://github.com/tyaro/banto-industrial/pull/843) の merge `4c6b126a` に照合する。Hub は既存 WIT の loader / Wasmtime runtime / `FrameConnection` アダプターを持ち、固定ゲスト SHA で FC3・単一 U16 を登録している。このリポジトリの U32 版は Hub に登録されていない。
 
 | Hub の現行 API | WIT 案 | 今回の状態 |

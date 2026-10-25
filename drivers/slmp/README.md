@@ -1,5 +1,6 @@
 # SLMP: 機種別デバイス範囲とタグ判定の設計案
 
+The separate SLMP guest in [slmp-component](../../slmp-component/src/lib.rs) connects this I/O-free core to the existing WIT connection handshake and one confirmed-range D/u16 read. [Wasmtime fixtures](../../slmp-runtime/src/lib.rs) use controlled Q/R responses. The [discovery contract proposal](../../docs/SLMP_DISCOVERY_CONTRACT.md) does not change WIT or Hub; unknown-range ordinary-read behavior is still a policy decision. No PLC communication was performed.
 
 ## Conditional Q extension fields (current core stage)
 
