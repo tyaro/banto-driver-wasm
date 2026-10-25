@@ -1,5 +1,6 @@
 //! 0101/0000 Read Type Name (binary 4E). The lookup is deliberately limited
-//! to ordinary Q and iQ-R/EN CPU pairs in the official model-code table.
+//! to ordinary Q and iQ-R/EN CPU pairs plus the wire-only Q25PRH pair in
+//! the official model-code table.
 use alloc::{string::String, vec::Vec};
 
 use crate::{request_head, response_data, ResponseError, Route};
@@ -8,6 +9,8 @@ use crate::{request_head, response_data, ResponseError, Route};
 pub enum ModelFamily {
     StandardQ,
     StandardR,
+    /// Exact Q25PRHCPU/004CH pair: Q 0401 wire only; SD applicability unverified.
+    Q25PrhWireOnly,
     /// Valid 0101 data whose name/code pair is not in the supported table.
     Unknown,
 }
@@ -57,8 +60,8 @@ pub fn decode_type_name(route: Route, frame: &[u8]) -> Result<TypeName, Response
 }
 
 // SLMP Reference Manual pp. 139-141 (printed), ordinary Q and iQ-R/EN
-// entries only. Shared codes are accepted only with an exact listed name.
-// Process, safety, remote, L, MX and the RCPU/0360H route fallback stay unknown.
+// entries plus Q25PRH wire-only. Codes require an exact listed name.
+// Other process, safety, remote, L, MX and the RCPU/0360H route fallback stay unknown.
 fn classify(name: &str, code: u16) -> ModelFamily {
     const Q: &[(&str, u16)] = &[
         ("Q00JCPU", 0x0250),
@@ -110,7 +113,11 @@ fn classify(name: &str, code: u16) -> ModelFamily {
         ("R120CPU", 0x4804),
         ("R120ENCPU", 0x4809),
     ];
-    if Q.contains(&(name, code)) {
+    if name == "Q25PRHCPU" && code == 0x004c {
+        // The 0101 table proves this pair's Q identity, but not SD302's
+        // applicability. Never classify it as StandardQ for SD planning.
+        ModelFamily::Q25PrhWireOnly
+    } else if Q.contains(&(name, code)) {
         ModelFamily::StandardQ
     } else if R.contains(&(name, code)) {
         ModelFamily::StandardR

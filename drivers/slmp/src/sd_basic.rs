@@ -58,7 +58,7 @@ pub fn plan_basic_sd(model: &TypeName, area: BasicArea) -> Option<ReadSpan> {
     let (start, count) = match model.family {
         ModelFamily::StandardQ => (q_sd(area)?, 1),
         ModelFamily::StandardR => r_sd(area)?,
-        ModelFamily::Unknown => return None,
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => return None,
     };
     Some(ReadSpan {
         device: Device::SD,

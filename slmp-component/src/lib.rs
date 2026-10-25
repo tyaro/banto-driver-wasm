@@ -155,7 +155,7 @@ fn canonical(number: i64) -> Result<String, String> {
 
 fn known_series(model: &TypeName) -> Option<Series> {
     match model.family {
-        ModelFamily::StandardQ => Some(Series::Q),
+        ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly => Some(Series::Q),
         ModelFamily::StandardR => Some(Series::R),
         ModelFamily::Unknown => None,
     }
@@ -169,6 +169,9 @@ enum RangeAssessment {
 }
 
 fn assess_d(model: &TypeName, count: PointCount, number: u32) -> RangeAssessment {
+    if model.family == ModelFamily::Q25PrhWireOnly {
+        return RangeAssessment::Unknown;
+    }
     match count {
         PointCount::Exact(limit) if number < limit => RangeAssessment::VerifiedInside,
         PointCount::AtLeast(prefix) if number < prefix => RangeAssessment::VerifiedInside,
@@ -235,13 +238,21 @@ impl session::GuestConnection for SlmpConnection {
                     }
                     Err(error) => return Err(response_error(error)),
                 };
-                let Some(area) = (match model.family {
-                    ModelFamily::StandardQ => Some(BasicArea::DInternal),
-                    ModelFamily::StandardR => Some(BasicArea::D),
-                    ModelFamily::Unknown => None,
-                }) else {
-                    *self.phase.borrow_mut() = Phase::NoRange(Some(model));
-                    return Ok(None);
+                let area = match model.family {
+                    ModelFamily::StandardQ => BasicArea::DInternal,
+                    ModelFamily::StandardR => BasicArea::D,
+                    ModelFamily::Q25PrhWireOnly => {
+                        // Q word wire is established, but the SD302 map is not.
+                        *self.phase.borrow_mut() = Phase::Ready {
+                            model,
+                            count: PointCount::Unknown,
+                        };
+                        return Ok(None);
+                    }
+                    ModelFamily::Unknown => {
+                        *self.phase.borrow_mut() = Phase::NoRange(Some(model));
+                        return Ok(None);
+                    }
                 };
                 let span = plan_basic_sd(&model, area).expect("known model has D count SD");
                 let sd_route = self.route();
@@ -635,6 +646,15 @@ mod tests {
         assert_eq!(
             assess_d(&r, PointCount::Unknown, 0),
             RangeAssessment::Unknown
+        );
+        assert_eq!(
+            assess_d(
+                &model(ModelFamily::Q25PrhWireOnly),
+                PointCount::Exact(100),
+                0
+            ),
+            RangeAssessment::Unknown,
+            "a Q25PRH SD count must not become a verified tag range"
         );
     }
 }

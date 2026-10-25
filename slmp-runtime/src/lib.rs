@@ -91,6 +91,96 @@ mod tests {
     }
 
     #[test]
+    fn q25prh_exact_pair_uses_q_wire_without_sd_or_verified_batch() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("settings");
+        let type_step = driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101")
+            .expect("type request");
+        assert_eq!(&type_step.send[2..4], &[1, 0]);
+        assert_eq!(&type_step.send[15..19], &[1, 1, 0, 0]);
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("Q25PRHCPU", 0x004c)))?
+            .expect("Q wire recognized without an applicable SD map")
+            .is_none());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("ready without SD")
+            .is_none());
+        let specs = d_specs(&[5, 6]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("explicit D reads with unknown range");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers, [0]);
+        assert_eq!(plans[1].covers, [1]);
+        assert_eq!(&plans[0].step.send[2..4], &[2, 0]);
+        assert_eq!(&plans[1].step.send[2..4], &[3, 0]);
+        assert_eq!(&plans[0].step.send[17..25], &[0, 0, 5, 0, 0, 0xa8, 1, 0]);
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(2, &[0x34, 0x12]),
+            )?
+            .expect("one explicit D word");
+        assert!(matches!(values.as_slice(), [Ok(Value::Uint(0x1234))]));
+        let later = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("successful read did not verify range");
+        assert_eq!(later.len(), 2);
+        assert_eq!(later[0].covers, [0]);
+        assert_eq!(later[1].covers, [1]);
+        conn.resource_drop(&mut store)?;
+
+        let fresh = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("fresh connection");
+        let fresh_type = driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, fresh, None)?
+            .expect("fresh 0101")
+            .expect("new resource repeats type request");
+        assert_eq!(&fresh_type.send[2..4], &[1, 0]);
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(
+                &mut store,
+                fresh,
+                Some(&model_response("Q25PRHCPU", 0x004b))
+            )?
+            .expect("mismatched model code remains unknown")
+            .is_none());
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, fresh, &specs)?
+            .is_err());
+        fresh.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
     fn verified_contiguous_d_batches_preserve_covers_values_and_unknown_split(
     ) -> wasmtime::Result<()> {
         use banto::driver::types::{ItemError, Value};
