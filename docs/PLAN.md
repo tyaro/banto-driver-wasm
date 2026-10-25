@@ -10,6 +10,10 @@
 | P3 SLMP 読み取り | P2 の境界を再利用して SLMP を実装 | native との結果・エラー一致とアドレス表の適合を自動検証 |
 | P4 拡張 | 書き込み、UI、配布・更新を Hub の各設計と調整して段階的に追加 | Hub の書き込み関門と監査を維持し、各能力の適合・運用テストを通す |
 
+P2 の段階的追加として FC3・単一タグ U32（2レジスタ）の両 word order を依存なしコアと固定版 native 比較で検証する。U16 の共有12件と実 WASM コンポーネントの対象は維持する。U32 の実 WASM 化と Hub 境界拡張は別工程とする。
+
+P3 では、機種と設定によって異なるデバイスアクセス範囲を確認するため、指定タグの読取りテスト命令を SLMP WASM ドライバに設ける要件を検討する。固定 probe の接続確認とは区別し、静的な形式・範囲検査、実読取りでの機器拒否、通信失敗を分けて扱う。[SLMP Reference Manual](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engm.pdf) の 0101/0000 は機種名の読出し、0401 は連続デバイス読出し、0403 はランダム読出しであり、0101 の成功だけで指定タグのアクセス範囲を保証しない。I/O は Hub エンジンが所有する。具体的な WIT 拡張と機種対応範囲は P3 着手時に提案・確認する。
+
 ## CI の拡張順
 
 現在の `changes` は文書、SDK / WIT、Modbus、SLMP、共通・未知パスを分類する。SDK / WIT は両ドライバに波及し、未知パスと共通設定は全領域に倒す。`scaffold` は必須文書と未知ファイルを確認し、`changes` は変更判定テストを実行する。`modbus-test` は Rust 1.85.1 の整形・Clippy・単体テスト・WASM ターゲットの型検査を実行する。`component-build` は WIT と実コンポーネントを検査し、`component-compare` は同じ成果物を Wasmtime で実行して native と照合する。SDK と SLMP の area ジョブは製品ソースの誤追加を検出する。`ci-gate` は必須ジョブの failure / cancelled / 想定外の skipped を検出する。

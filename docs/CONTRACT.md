@@ -10,7 +10,9 @@
 | `DriverBase::parse_address` / `validate_config` / `settings_schema` | `address.parse` / `config.validate` / `config.schema` | ゲスト export 実装済み。FC3・U16 アドレス、TCP 設定、基本スキーマに限定。Hub 側の接続テスト連携は未実装 |
 | `banto-driver-engine`、`DriverRegistry`、適合テスト | Hub の WASM ホストが利用する構想 | 接続なし。Hub に loader / runtime はまだない |
 
-`drivers/modbus` の要求は Hub native の FC3 単一レジスタ要求と同じ MBAP 形である。[独立した比較試験](../comparison/src/lib.rs) は Hub `a0d01aa2` の公開 `FrameDriver` / `FrameConnection` を Git 依存で実行する。そのフィクスチャ12件を [Wasmtime 比較試験](../runtime-comparison/src/lib.rs) でも再利用し、実コンポーネントの `read.plan` / `read.decode` を呼ぶ。正常値、機器例外、ID 不一致、破損フレームの10件は native・コア・WASM の値と分類が一致する。残り2件は**意図的な差**: native の PDU 解析は宣言したデータの後ろの余剰バイトを受理するが、新コアと WASM は正常応答を4 byte、例外応答を2 byte に厳格化して `Framing` で拒否する。Hub の engine / runtime 経由の実行は通していない。ワード順、文字列、複数タグ、FC1/2/4 も対象外。
+`drivers/modbus` の要求は Hub native の FC3・単一 U16（1レジスタ）または U32（2レジスタ）要求と同じ MBAP 形である。[独立した比較試験](../comparison/src/lib.rs) は Hub `a0d01aa2` の公開 `FrameDriver` / `FrameConnection` を固定 Git 依存で実行する。U16 の共有フィクスチャ12件は [Wasmtime 比較試験](../runtime-comparison/src/lib.rs) でも再利用する。正常値、機器例外、ID 不一致、破損フレームの10件は native・コア・WASM の値と分類が一致する。残り2件は**意図的な差**: native の PDU 解析は宣言したデータの後ろの余剰バイトを受理するが、コアと WASM は正常応答を4 byte、例外応答を2 byte に厳格化して `Framing` で拒否する。U32 の15件は native・コアのみで13件一致、余剰 PDU の2件はコアが厳密拒否する。U32 の実コンポーネント化、Hub の engine / runtime 経由の実行、文字列、複数タグ、FC1/2/4 は対象外。
+
+U32 の各レジスタ内のバイト順は big endian。固定版 native の `decode_register_value` では `high_low` が先頭を上位16 bit、`low_high` が先頭を下位16 bit として扱う。`create_connection` は `word_order` 未指定時に `low_high` を使う一方、`settings_schema` のフォーム既定値は `high_low` である。コアの `WordOrder::default()` は実際の native 接続の未指定時に合わせて `LowHigh` とする。`parse_address` は U32 開始 offset 65534（参照番号 `465535`）まで受理し、65535（`465536`）を拒否する。コアも要求生成時に同じ末尾範囲を検査する。この比較は設定フォームや Hub 保存値の既定値を変更しない。
 
 ## 初版境界の決定
 

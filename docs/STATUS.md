@@ -2,6 +2,13 @@
 
 更新日: 2026-10-25
 
+## 今回の作業（[PR #5](https://github.com/tyaro/banto-driver-wasm/pull/5)）
+
+- main `be5753d003aa49d065405e30753a2a0903d3e24c` を確認し、FC3・単一タグ U32（2レジスタ）と word order を依存なしコアと固定版 native 比較に追加した。既存 U16 共有12件（10一致・余剰 PDU 2件の意図的拒否）は維持する。
+- 固定版 native `a0d01aa2` の `frame_conn.rs` と `decode.rs` を照合した。`low_high` は先頭ワードが下位、`high_low` は先頭が上位。`create_connection` の未指定時は `low_high`、フォームの `settings_schema` 既定値は `high_low` である。コアの既定は前者に合わせ、フォーム側は変更しない。
+- U32 の末尾開始アドレスは offset 65534（`465535`）まで有効。offset 65535（`465536`）は native のアドレス解析とコアの要求生成で拒否する。U32 の正常値・例外・ID 不一致・破損・余剰 PDU を native 比較で検証する。
+- 後続 SLMP 工程には、機種・設定ごとのアクセス範囲を確かめる指定タグ読取りテスト命令の要件を引き継いだ。固定 probe と区別し、I/O は Hub エンジンに置く。今回の WIT・Hub・SLMP 実装は変更しない。
+
 ## 完了
 
 - SLMP の標準 Q / iQ-R・ENCPU を対象とする [機種別点数・タグ判定の設計案](../drivers/slmp/README.md)を公式マニュアルと照合して追加した。Hub の表示・品質・監査は [Issue #845](https://github.com/tyaro/banto-industrial/issues/845) で追跡する。この追加は文書のみで、コード・WIT・native/Hub・実機通信は変更していない。
@@ -24,7 +31,8 @@
 ## 検証
 
 - SLMP 文書変更で Node.js 24.22.1 の `node --test .github/scripts/ci-changes.test.mjs` が 15/15 成功。`node .github/scripts/check-scaffold.mjs` と `node .github/scripts/check-scaffold.mjs slmp` が成功。`git diff --check` が成功。Rust・実機通信は実行していない。
-
+- 今回のローカル Rust 1.98.1 検証: コア単体10/10、native 比較4/4（U16 共有12件、U32 15件、末尾範囲・未指定既定値）、コアと比較クレートの整形・Clippy、コアの `wasm32-unknown-unknown` 型検査、既存コンポーネント単体4/4・doc1/1、既存 Wasmtime 比較クレートのテストコード型検査が成功。Node.js の変更判定15/15、構成ガード、`git diff --check` も成功した。U32 の実 WASM 比較を実施した結果ではない。
+- PR #5 初回 head `993b5d2d211e99af397d9e477266939c75fa7cf9` の [CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40157741035) は終端まで成功。`modbus-test` / `native-compare` / `component-build` / `component-compare` / `ci-gate` を含む7ジョブが成功し、対象外の SDK・SLMP ガード2ジョブは skipped。
 - Node.js 24.19.0 で `node --test .github/scripts/ci-changes.test.mjs` が 12/12 成功。
 - `node .github/scripts/check-scaffold.mjs` と `sdk` / `slmp` 指定のガードが成功。
 - `git diff --check` が成功。CI 定義は YAML として解析できた。
@@ -51,7 +59,7 @@
 - SLMP の機種・経路別 SD 取得、拡張 D/W の ZR 変換、タグ範囲判定、実機 read と write、Hub 表示・品質・監査は設計段階で未検証。判定不能時の運用方針、WIT 拡張、バッチ書込み単位は未決。
 
 - Hub loader / runtime、manifest の必須正整数検証、`FrameConnection` アダプター、既存接続テストへの登録・呼び出しは未実装。WASM 境界での U16 型・範囲検査、`covers` と結果件数の既存 `FrameSession` 検査への接続、内部原因の構造化診断と API 変換も Hub 側では未検証。
-- 実機への Modbus TCP 通信、SLMP、FC3 以外、複数レジスタ、ワード順、文字列、書き込みは未実装または未検証。ローカル TCP の制御通信は独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。アドレス解析と設定検証はゲスト内だけで実装した。
+- 実機への Modbus TCP 通信、SLMP、FC3 以外、複数タグ、文字列、書き込みは未実装または未検証。U32 と word order は依存なしコアと native 比較のみで、実 WASM コンポーネントや Hub 境界では未実装。ローカル TCP の制御通信は独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。アドレス解析と設定検証はゲスト内だけで実装した。
 - ローカルでは Rust 1.85.1 を導入・実行していない。CI では既存の 1.85.1 コア検証と WASM artifact のジョブ間再利用が成功した。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
 
 ## 残件

@@ -1,12 +1,12 @@
 # banto-driver-wasm
 
-Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開発場所です。現在は Modbus TCP の FC3・単一 U16 読み取りコアと、承認済み `world driver` を実装する実験的な WASM コンポーネントがあります。Hub の loader / runtime は未実装で、Hub にインストールできる配布物はまだありません。
+Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開発場所です。現在は Modbus TCP の FC3・単一タグ U16/U32 読み取りコアと、FC3・単一 U16 のみを扱う実験的な WASM コンポーネントがあります。Hub の loader / runtime は未実装で、Hub にインストールできる配布物はまだありません。
 
 ## 境界と初回目標
 
 Hub にある公開 `banto-driver-api`（`FrameDriver`）、`banto-driver-engine`、`banto-driver-conformance`、`DriverRegistry` を再利用する方針です。Hub はソケット、broker の 1 接続 1 セッション、品質判定、書き込みの関門、監査を持ち、WASM はフレームの生成・応答解析・アドレスと設定の検証を担当する想定です。既存 native ドライバは内部依存があるため、クレート一式をこのリポジトリへコピーしません。
 
-最初の製品目標は Modbus TCP の **WASM 読み取り**を Hub の既存 native 実装と同じ入力・応答で比較することです。現在の比較範囲は FC3・単一 U16 とエラー分類で、共有フィクスチャ12件を使います。ワード順、文字列、SLMP、書き込み、プラグイン UI、配布管理は後続段階です。初版 WIT 境界は [CONTRACT.md](docs/CONTRACT.md) に記録しています。
+最初の製品目標は Modbus TCP の **WASM 読み取り**を Hub の既存 native 実装と同じ入力・応答で比較することです。既存の FC3・単一 U16 はコア、native、実 WASM の共有フィクスチャ12件で比較します。FC3・単一タグ U32（2レジスタ）の `low_high` / `high_low` はコアと native の比較に限定します。U32 の実 WASM 化、文字列、SLMP、書き込み、プラグイン UI、配布管理は後続段階です。初版 WIT 境界は [CONTRACT.md](docs/CONTRACT.md) に記録しています。
 
 ## 作業の入口
 
@@ -35,7 +35,7 @@ wasm-tools validate /tmp/banto-modbus-tcp-component.wasm
 BANTO_COMPONENT_WASM=/tmp/banto-modbus-tcp-component.wasm cargo +1.98.1 test --manifest-path runtime-comparison/Cargo.toml --locked
 ```
 
-比較試験は Hub `a0d01aa2` の公開 `FrameDriver` を Git 依存として取得し、FC3・単一レジスタの応答12件を native、コア、実 WASM コンポーネントで共有します。10件は値・分類が一致し、余剰 PDU の2件は native の受理と新コア・WASM の厳密拒否を明示的に検査します。実 WASM は独立した Wasmtime テストホストで実行します。Hub runtime 経由の実行と Modbus / SLMP 通信は未検証です。コアの `wasm32` 型検査と実コンポーネント実行は別の確認です。
+比較試験は Hub `a0d01aa2` の公開 `FrameDriver` を固定 Git 依存として取得します。FC3・単一 U16 の応答12件は native、コア、実 WASM コンポーネントで共有し、10件が一致、余剰 PDU の2件は native の受理とコア・WASM の厳密拒否を検査します。U32 の応答15件は native とコアだけを照合し、13件の一致と余剰 PDU 2件の意図的な厳密拒否を検査します。native 接続は `word_order` 未指定時に `low_high` を使用しますが、native の設定フォームの既定表示は `high_low` です。実 WASM は独立した Wasmtime テストホストで実行します。Hub runtime 経由の実行と Modbus / SLMP 通信は未検証です。コアの `wasm32` 型検査と実コンポーネント実行は別の確認です。
 
 ## 参照元
 
