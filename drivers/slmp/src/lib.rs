@@ -11,6 +11,9 @@ pub use type_name::{decode_type_name, encode_type_name, ModelFamily, TypeName};
 mod sd_basic;
 pub use sd_basic::{basic_sd_count, plan_basic_sd, BasicArea, BasicEvidence, PointCount};
 
+mod q_zr;
+pub use q_zr::{decode_q_zr_count, plan_q_zr, QZrEvidence};
+
 /// Wire layout only. The actual CPU model and its supported devices are checked later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Series {
