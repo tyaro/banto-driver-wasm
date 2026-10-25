@@ -49,7 +49,8 @@ mod tests {
     }
 
     #[test]
-    fn q_0101_sd302_then_d99_read_runs_in_real_component() -> wasmtime::Result<()> {
+    fn q_0101_sd302_then_verified_and_unknown_d_reads_run_in_real_component() -> wasmtime::Result<()>
+    {
         use banto::driver::types::{TagSpec, Value};
         let (mut store, driver) = load()?;
         let parsed = driver
@@ -131,10 +132,31 @@ mod tests {
             data_type: "u16".into(),
             string_words: None,
         }];
-        assert!(driver
+        let outside_plan = driver
             .banto_driver_read()
             .call_plan(&mut store, conn, &outside)?
-            .is_err());
+            .expect("Q SD302 is internal-only, so D100 remains unknown");
+        let outside_value = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &outside_plan[0],
+                &outside,
+                &response(4, &[0x78, 0x56]),
+            )?
+            .expect("explicit unknown-range read");
+        assert!(matches!(
+            outside_value.as_slice(),
+            [Ok(Value::Uint(0x5678))]
+        ));
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &outside)?
+                .is_ok(),
+            "read success must not promote internal-only count to a full D range"
+        );
         conn.resource_drop(&mut store)?;
         Ok(())
     }
@@ -196,6 +218,18 @@ mod tests {
             )?
             .expect("D read");
         assert!(matches!(decoded.as_slice(), [Ok(Value::Uint(0xabcd))]));
+        let beyond = [TagSpec {
+            address: "D32".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        }];
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &beyond)?
+                .is_err(),
+            "R SD280 pair is the complete D count"
+        );
         conn.resource_drop(&mut store)?;
 
         let fresh = driver
@@ -240,7 +274,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_0101_pair_does_not_plan_an_sd_read() -> wasmtime::Result<()> {
+    fn unknown_0101_pair_does_not_guess_wire_format_or_plan_sd() -> wasmtime::Result<()> {
+        use banto::driver::types::TagSpec;
         let (mut store, driver) = load()?;
         let conn = driver
             .banto_driver_session()
@@ -259,12 +294,58 @@ mod tests {
             .call_handshake_next(&mut store, conn, Some(&model_response("RCPU", 0x0360)))?
             .expect("valid but unknown model")
             .is_none());
+        let specs = [TagSpec {
+            address: "D0".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        }];
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .is_err());
         conn.resource_drop(&mut store)?;
         Ok(())
     }
 
     #[test]
-    fn rejected_sd_handshake_never_creates_verified_range() -> wasmtime::Result<()> {
+    fn refused_0101_has_no_model_or_read_plan() -> wasmtime::Result<()> {
+        use banto::driver::types::TagSpec;
+        let (mut store, driver) = load()?;
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("settings");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .is_some());
+        let mut refusal = response(1, &[]);
+        refusal[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&refusal))?
+            .expect("valid PLC refusal, no model")
+            .is_none());
+        let spec = [TagSpec {
+            address: "D0".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        }];
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &spec)?
+            .is_err());
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_sd_leaves_unknown_range_but_allows_one_explicit_read() -> wasmtime::Result<()> {
+        use banto::driver::types::{TagSpec, Value};
         let (mut store, driver) = load()?;
         let conn = driver
             .banto_driver_session()
@@ -289,6 +370,56 @@ mod tests {
             .banto_driver_session()
             .connection()
             .call_handshake_next(&mut store, conn, Some(&refusal))?
+            .expect("SD refusal leaves range unknown")
+            .is_none());
+        let spec = [TagSpec {
+            address: "D0".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        }];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &spec)?
+            .expect("explicit D0 read with unknown range");
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &spec,
+                &response(3, &[0x34, 0x12]),
+            )?
+            .expect("D0 value");
+        assert!(matches!(values.as_slice(), [Ok(Value::Uint(0x1234))]));
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &spec)?
+                .is_ok(),
+            "a successful read leaves range unknown"
+        );
+        let invalid = [TagSpec {
+            address: "Dfoo".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        }];
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &invalid)?
+            .is_err());
+        let unsupported = [TagSpec {
+            address: "D0".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        }];
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &unsupported)?
+            .is_err());
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &[spec[0].clone(), spec[0].clone()])?
             .is_err());
         conn.resource_drop(&mut store)?;
         Ok(())

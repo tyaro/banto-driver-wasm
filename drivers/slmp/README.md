@@ -1,6 +1,14 @@
 # SLMP: 機種別デバイス範囲とタグ判定の設計案
 
-The separate SLMP guest in [slmp-component](../../slmp-component/src/lib.rs) connects this I/O-free core to the existing WIT connection handshake and one confirmed-range D/u16 read. [Wasmtime fixtures](../../slmp-runtime/src/lib.rs) use controlled Q/R responses. The [discovery contract proposal](../../docs/SLMP_DISCOVERY_CONTRACT.md) does not change WIT or Hub; unknown-range ordinary-read behavior is still a policy decision. No PLC communication was performed.
+The separate SLMP guest in [slmp-component](../../slmp-component/src/lib.rs) connects this I/O-free core to the existing WIT connection handshake and one D/u16 tag read at a time. [Wasmtime fixtures](../../slmp-runtime/src/lib.rs) use controlled Q/R responses. The [discovery contract proposal](../../docs/SLMP_DISCOVERY_CONTRACT.md) does not change WIT or Hub. No PLC communication was performed.
+
+## Current read policy and operator responsibility
+
+The guest checks configured range only when 0101 identifies a supported standard Q/R name and code, the applicable SD response is usable, and the count's scope and unit match the tag. Q SD302 is **internal D only**: D addresses below its reported count are verified in-range; addresses at or above it are **unknown** because an extended D area may exist. If the old Q count is saturated at 32768, only the guaranteed prefix is verified. R SD280-281 gives a complete D count: addresses at or above an exact count are rejected. An SD refusal leaves the count unknown. The current guest supports only decimal D addresses with one u16 word and one tag per read; it does not combine known and unknown tags.
+
+When the model is recognized but the D range is unknown, an explicit valid tag can be read at the **user's responsibility**. Check the actual PLC device settings and route before relying on its value. Successful reading does **not** verify that the address is within the configured range, and it does not change the unknown status. An unrecognized model/name-code pair or a 0101 refusal does not establish whether Q or R 0401 framing applies (their subcommands and device-number widths differ), so this guest does not send an SD or tag read in those cases. That limitation is distinct from an unknown **range** with a known Q/R wire series. Invalid address or type and unsupported wire/route meaning remain errors. Hub quality and range display need the later structured discovery contract; this guest does not expose a verified-range label through the current WIT.
+
+0101 obtains a model name/code; it cannot validate every point. A later optional test could try each **registered tag** individually, but it would not prove the entire configured range. No full address scan or PLC connection is part of these fixtures.
 
 ## Conditional Q extension fields (current core stage)
 
@@ -98,7 +106,7 @@ Q の拡張 D/W は内部領域の次へ**論理デバイス番号が連続**す
 1. PLC 設定待ちの保存は許す。保存時は型・設定書式・アドレス表記・長さの不正を検出するが、未接続というだけで型式別の点数を推測しない。「形式/型が不正」と「実機未確認」を別状態にする。
 2. 本番利用前の**読出し専用**接続テストで 0101、機種別に適用可能な SD、対象タグの読出し可否を確認する。実機との通信は本設計文書では行っていない。実機への write 試験は別承認とする。Hub が I/O と結果表示、品質、監査を扱う。
 3. WASM はタグの開始点と全占有点数を、オーバーフローを避けて半開区間 `[start, end)` で計算する。設定点数 `N` の `[0, N)` に**完全に収まるタグだけ**を読出し候補とする。U32 の 2 word、文字列の全 word、bit と word の変換単位を含め、途中で切ったタグを読まない。成立する候補をフレーム制限・経路の境界に従って分割する。部分的な旧値を新しい正常値として扱わない。
-4. 判定は少なくとも `in_range` / `out_of_range` / `unknown` と取得世代を区別する。範囲外が確定したタグと、型式・SD・経路の情報不足による `unknown` を混ぜない。接続テストや通常読出しの失敗時に前回の正常値を「現在正常」として表示しない。unknown 時に運用上どの操作を許すかは未決。
+4. 判定は少なくとも `in_range` / `out_of_range` / `unknown` と取得世代を区別する。範囲外が確定したタグと、型式・SD・経路の情報不足による `unknown` を混ぜない。接続テストや通常読出しの失敗時に前回の正常値を「現在正常」として表示しない。型式と通信形式を識別できる場合の `unknown` は、利用者が実機設定を確認する責任で明示タグを 1 件ずつ通常読出し可能とする。読出し成功でも範囲保証に昇格しない。Hub への判定表示は構造化契約の後続課題とする。
 5. 点数キャッシュは接続先、0101 の生応答と判別結果、取得世代、経路、接続セッションに結び付ける。接続先変更・設定変更・再接続・再取得で失効し、古い点数を新しい接続へ持ち越さない。
 6. 将来の書込みは命令に含まれる**全範囲**を送信前に検査し、一部だけを送らない方針。実書込み、複数タグ/バッチの原子性と検査単位、WIT の拡張は後続設計と承認事項であり、現行実装の能力とはしない。
 

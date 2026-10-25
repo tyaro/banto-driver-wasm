@@ -147,17 +147,36 @@ fn known_series(model: &TypeName) -> Option<Series> {
     }
 }
 
-fn checked_d_span(spec: &TagSpec, count: PointCount) -> Result<ReadSpan, FatalError> {
+#[derive(Debug, PartialEq, Eq)]
+enum RangeAssessment {
+    VerifiedInside,
+    VerifiedOutside,
+    Unknown,
+}
+
+fn assess_d(model: &TypeName, count: PointCount, number: u32) -> RangeAssessment {
+    match count {
+        PointCount::Exact(limit) if number < limit => RangeAssessment::VerifiedInside,
+        PointCount::AtLeast(prefix) if number < prefix => RangeAssessment::VerifiedInside,
+        // R SD280-281 is the full D count. Q SD302 covers internal D only;
+        // an address beyond it may belong to extended D.
+        PointCount::Exact(limit) if model.family == ModelFamily::StandardR && number >= limit => {
+            RangeAssessment::VerifiedOutside
+        }
+        _ => RangeAssessment::Unknown,
+    }
+}
+
+fn checked_d_span(
+    spec: &TagSpec,
+    model: &TypeName,
+    count: PointCount,
+) -> Result<ReadSpan, FatalError> {
     let number = parse_d(&spec.address, &spec.data_type, spec.string_words)
         .map_err(FatalError::InvalidConfig)?;
-    let PointCount::Exact(limit) = count else {
-        return Err(FatalError::Protocol(
-            "configured D range is unresolved".into(),
-        ));
-    };
-    if number >= limit {
+    if assess_d(model, count, number) == RangeAssessment::VerifiedOutside {
         return Err(FatalError::InvalidConfig(
-            "D address exceeds verified internal count".into(),
+            "D address exceeds verified configured count".into(),
         ));
     }
     Ok(ReadSpan {
@@ -192,7 +211,16 @@ impl session::GuestConnection for SlmpConnection {
                 Ok(Some(frame_step(encode_type_name(route))))
             }
             (Phase::AwaitType { route }, Some(frame)) => {
-                let model = decode_type_name(route, &frame).map_err(response_error)?;
+                let model = match decode_type_name(route, &frame) {
+                    Ok(model) => model,
+                    Err(ResponseError::EndCode(_)) => {
+                        // The PLC answered 0101 but supplied no model. There is no
+                        // series evidence for selecting Q/R 0401 framing or SD.
+                        *self.phase.borrow_mut() = Phase::NoRange(None);
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(response_error(error)),
+                };
                 let Some(area) = (match model.family {
                     ModelFamily::StandardQ => Some(BasicArea::DInternal),
                     ModelFamily::StandardR => Some(BasicArea::D),
@@ -214,10 +242,21 @@ impl session::GuestConnection for SlmpConnection {
                 Ok(Some(frame_step(send)))
             }
             (Phase::AwaitSd { route, model, span }, Some(frame)) => {
-                let Values::Words(words) =
-                    decode_read(route, span, &frame).map_err(response_error)?
-                else {
-                    return Err(FatalError::Protocol("SD read returned bits".into()));
+                let words = match decode_read(route, span, &frame) {
+                    Ok(Values::Words(words)) => words,
+                    Err(ResponseError::EndCode(_)) => {
+                        // A PLC refusal leaves the count unknown, but the confirmed
+                        // model still gives us a supported wire format for explicit reads.
+                        *self.phase.borrow_mut() = Phase::Ready {
+                            model,
+                            count: PointCount::Unknown,
+                        };
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(response_error(error)),
+                    Ok(Values::Bits(_)) => {
+                        return Err(FatalError::Protocol("SD read returned bits".into()));
+                    }
                 };
                 let area = if model.family == ModelFamily::StandardQ {
                     BasicArea::DInternal
@@ -287,7 +326,7 @@ impl read::Guest for Component {
         let series = known_series(model).expect("ready model has series");
         let spans = specs
             .iter()
-            .map(|spec| checked_d_span(spec, *count))
+            .map(|spec| checked_d_span(spec, model, *count))
             .collect::<Result<Vec<_>, _>>()?;
         let mut plans = Vec::with_capacity(spans.len());
         for (index, span) in spans.into_iter().enumerate() {
@@ -327,7 +366,7 @@ impl read::Guest for Component {
         let spec = specs
             .get(*cover as usize)
             .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
-        let span = checked_d_span(spec, *count)?;
+        let span = checked_d_span(spec, model, *count)?;
         let serial_bytes: [u8; 2] = p
             .step
             .send
@@ -406,7 +445,8 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP D decimal address, single-word u16 only; configured range requires handshake".into()
+        "SLMP D decimal address, single-word u16 only; range may remain unknown after handshake"
+            .into()
     }
 
     fn probe() -> Option<TagSpec> {
@@ -450,6 +490,50 @@ impl config::Guest for Component {
                 group: FieldGroup::Basic,
             },
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(family: ModelFamily) -> TypeName {
+        TypeName {
+            raw_name: [b' '; 16],
+            name: String::new(),
+            code: 0,
+            family,
+        }
+    }
+
+    #[test]
+    fn range_assessment_respects_scope_and_verified_prefix() {
+        let q = model(ModelFamily::StandardQ);
+        let r = model(ModelFamily::StandardR);
+        assert_eq!(
+            assess_d(&q, PointCount::Exact(100), 99),
+            RangeAssessment::VerifiedInside
+        );
+        assert_eq!(
+            assess_d(&q, PointCount::Exact(100), 100),
+            RangeAssessment::Unknown
+        );
+        assert_eq!(
+            assess_d(&r, PointCount::Exact(100), 100),
+            RangeAssessment::VerifiedOutside
+        );
+        assert_eq!(
+            assess_d(&q, PointCount::AtLeast(32768), 32767),
+            RangeAssessment::VerifiedInside
+        );
+        assert_eq!(
+            assess_d(&q, PointCount::AtLeast(32768), 32768),
+            RangeAssessment::Unknown
+        );
+        assert_eq!(
+            assess_d(&r, PointCount::Unknown, 0),
+            RangeAssessment::Unknown
+        );
     }
 }
 
