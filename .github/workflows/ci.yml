@@ -169,7 +169,7 @@ jobs:
       - run: cargo +1.98.1 clippy --manifest-path runtime-comparison/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo +1.98.1 test --manifest-path runtime-comparison/Cargo.toml --locked
         env:
-          BANTO_COMPONENT_WASM: dist/banto-modbus-tcp-component.wasm
+          BANTO_COMPONENT_WASM: ${{ github.workspace }}/dist/banto-modbus-tcp-component.wasm
 
   slmp-guard:
     needs: changes
