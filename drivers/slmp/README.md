@@ -1,10 +1,16 @@
 # SLMP: 機種別デバイス範囲とタグ判定の設計案
 
+## 現在の実装範囲（QnU ZR の条件付き点数）
+
+[`src/q_zr.rs`](src/q_zr.rs) は標準 Universal QnU（Q00UJCPU を除く）に対し、拡張 D **または**拡張 W を 1K 点以上設定したこと、対象 firmware と通信経路の適用を別途確認できた場合だけ `SD306–307` の low/high pair を ZR の点数として計画・復号する。条件未確認・条件外・読出し失敗・片 word だけの場合は `Unknown` であり、ゼロや厳密な上限を捏造しない。[Q CPU Appendix 3 p.550 の SD306–307 欄と *7](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=552)。この core は条件の証拠を収集せず、I/O と cache も持たない。証拠と SD 値は同じ接続先・取得世代に紐づけ、再接続時に失効させる必要がある。[独立フィクスチャ](tests/q_zr.rs) は Q00UJ 除外、条件分岐、2 word 順、0401 要求を検査する。
+
+`SD647` は選択中ファイルの容量を 1K word 単位で端数切捨てし、拡張 D/W の使用時は ZR との共有容量を表す。このため `SD647 × 1024` を ZR 単独の厳密な点数上限にしない。[QnU p.400](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=402)、[pp.403–404](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=405)。拡張 M/B、高速 D/W、Q の全 D/W 点数と SD308–311 の機種別解釈は本工程では扱わず `Unknown` に留める。
+
 ## 現在の実装範囲（基本 SD 点数）
 
 [`src/sd_basic.rs`](src/sd_basic.rs) は I/O 非依存の取得計画と復号を追加した。標準 Q の `SD290–304` は単 word、標準 iQ-R / ENCPU の下表は原則 low/high の 2 word、Z/LZ だけ単 word として計画する。返す数値は**設定点数**であり、アドレス末尾や SLMP 0401 の読出し点数上限ではない。Q の `DInternal` / `WInternal` は SD302/303 の内部点数だけを表し、Q の全 D/W を要求した場合は `Unknown` に留める。Q の旧 M/B/内部 D/内部 W 欄が 32768 を返した場合は `AtLeast(32768)` とし、厳密な末尾を確定しない。型式が不明、読出しが未取得、取得 word 数が違う、経路の対応が未確認の場合も `Unknown` を返す。[Q CPU Appendix 3 pp.549–553](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=551)、[iQ-R Appendix 5 pp.616–617](https://www.mitsubishielectric.com/dl/fa/document/manual/plc/sh082488eng/sh082488engf.pdf#page=618)。
 
-R の S 点数は R00/R01/R02CPU または Rn(EN)CPU の確認済み firmware 12 以降でのみ数値を確定する。これ以外は `Unknown`。経路確認・firmware 版の取得自体はこの core にない。取得した SD 値・型式・経路の証拠は接続先と取得世代に紐づけ、再接続時には失効させる必要がある。この段階は cache を持たない。Q の拡張 M/B、高速 D/W、D/W 総点数、ZR 条件付き `SD306–307`、端数切捨てと合計容量の `SD647` は次段階で扱い、現段階の Q ZR / 全 D/W は `Unknown` とする。native にこれら SD 点数の取得実装はなく、独立フィクスチャは公式表と既存の 0401/0101 フレームコアを照合する。[独立フィクスチャ](tests/sd_basic.rs)。
+R の S 点数は R00/R01/R02CPU または Rn(EN)CPU の確認済み firmware 12 以降でのみ数値を確定する。これ以外は `Unknown`。経路確認・firmware 版の取得自体はこの core にない。取得した SD 値・型式・経路の証拠は接続先と取得世代に紐づけ、再接続時には失効させる必要がある。この段階は cache を持たない。基本 SD API では Q の ZR / 全 D/W を `Unknown` に保ち、ZR のみ上記の条件付き API で扱う。native にこれら SD 点数の取得実装はなく、独立フィクスチャは公式表と既存の 0401/0101 フレームコアを照合する。[独立フィクスチャ](tests/sd_basic.rs)。
 
 ## 現在の実装範囲（0101 型式名読取り）
 

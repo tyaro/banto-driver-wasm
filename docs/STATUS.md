@@ -1,5 +1,11 @@
 # STATUS
 
+## 今回の作業（QnU ZR の条件付き点数）
+
+- [PR #10](https://github.com/tyaro/banto-driver-wasm/pull/10) は head `0e05f43` の CI・統合レビュー・競合なしを再確認して squash merge した。main の統合 SHA は `d30ac2f305fa13edaf7fc91daeaaefc9773f802c`。専用 worktree は未保存/固有ファイルと使用中プロセスがないことを確認して片付け、元 repo・他 worktree・branch は保持した。
+- QCPU Appendix 3 p.550 の `SD306–307` 欄を原典の表画像で照合した。標準 QnU（Q00UJ 除外）で拡張 D または W を 1K 点以上設定した証拠、firmware と経路の適用確認がある場合のみ、ZR の low/high 点数を復号する。いずれか不明なら `Unknown`。SD647 の 1K 端数切捨て・共有容量から ZR 厳密上限を推定しない。
+- ローカル Rust 1.98.1 の SLMP テストは既存17件と新規4件の計21件、整形・Clippy・wasm32 型検査、scaffold が成功。native にこの SD 判定はなく、実機 I/O・WIT/Hub・書込みは未実施。拡張 M/B、高速 D/W、D/W 総点数の適用条件は後続で個別に扱う。
+
 ## 今回の作業（SLMP 基本 SD 設定点数）
 
 - [PR #9](https://github.com/tyaro/banto-driver-wasm/pull/9) は head `9dd08da` の CI・統合レビュー・指摘解消・競合なしを再確認して squash merge した。main の統合 SHA は `3cc8119e7b0117cb6d5f56b6d35e3a22c57dc75e`。専用 worktree は未保存/固有ファイルと使用中プロセスがないことを確認して片付け、元 repo・他 worktree・branch は保持した。
