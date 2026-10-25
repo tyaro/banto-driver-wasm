@@ -1,5 +1,11 @@
 # SLMP: 機種別デバイス範囲とタグ判定の設計案
 
+## 現在の実装範囲（基本 SD 点数）
+
+[`src/sd_basic.rs`](src/sd_basic.rs) は I/O 非依存の取得計画と復号を追加した。標準 Q の `SD290–304` は単 word、標準 iQ-R / ENCPU の下表は原則 low/high の 2 word、Z/LZ だけ単 word として計画する。返す数値は**設定点数**であり、アドレス末尾や SLMP 0401 の読出し点数上限ではない。Q の `DInternal` / `WInternal` は SD302/303 の内部点数だけを表し、Q の全 D/W を要求した場合は `Unknown` に留める。Q の旧 M/B/内部 D/内部 W 欄が 32768 を返した場合は `AtLeast(32768)` とし、厳密な末尾を確定しない。型式が不明、読出しが未取得、取得 word 数が違う、経路の対応が未確認の場合も `Unknown` を返す。[Q CPU Appendix 3 pp.549–553](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=551)、[iQ-R Appendix 5 pp.616–617](https://www.mitsubishielectric.com/dl/fa/document/manual/plc/sh082488eng/sh082488engf.pdf#page=618)。
+
+R の S 点数は R00/R01/R02CPU または Rn(EN)CPU の確認済み firmware 12 以降でのみ数値を確定する。これ以外は `Unknown`。経路確認・firmware 版の取得自体はこの core にない。取得した SD 値・型式・経路の証拠は接続先と取得世代に紐づけ、再接続時には失効させる必要がある。この段階は cache を持たない。Q の拡張 M/B、高速 D/W、D/W 総点数、ZR 条件付き `SD306–307`、端数切捨てと合計容量の `SD647` は次段階で扱い、現段階の Q ZR / 全 D/W は `Unknown` とする。native にこれら SD 点数の取得実装はなく、独立フィクスチャは公式表と既存の 0401/0101 フレームコアを照合する。[独立フィクスチャ](tests/sd_basic.rs)。
+
 ## 現在の実装範囲（0101 型式名読取り）
 
 [`src/type_name.rs`](src/type_name.rs) は I/O のない binary 4E `0101/0000` 要求を生成し、正常応答の 16 バイト ASCII 型名と little-endian 2 バイト型式コードを解析する。原 16 バイト（空白埋めを含む）と末尾空白を除いた表示名を両方保持する。正式な表にある標準 Q と iQ-R CPU / ENCPU の**型名と型式コードの組**だけを分類し、未知または不一致の組と `RCPU / 0360H` は `Unknown` を返す。不正な文字列、応答長、経路・シリアル、非ゼロ終了コードは区別する。[SLMP Reference Manual pp.138–141](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=139)。[独立フィクスチャ](tests/type_name.rs) は公式 Q02UCPU 例と R04ENCPU、未知型式・破損・拒否を検査する。native の SLMP には現時点で 0101 処理がなく、共通の 4E ヘッダー・応答検査のみ静的照合した。
