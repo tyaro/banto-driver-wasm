@@ -34,6 +34,7 @@
 - `BANTO_COMPONENT_WASM=... cargo +1.98.1 test --manifest-path runtime-comparison/Cargo.toml --locked` は3/3成功。実コンポーネントを Wasmtime 50.0.0 でインスタンス化し、共有12フィクスチャの10一致・2厳密拒否、probe / parse / config / handshake / plan を検査した。別テストで Wasmtime の `memory.grow` 上限失敗が `-1` を返し trap ではないこと、`unreachable` trap と epoch 割込を型付き原因として区別できることを確認した。
 - 最終ローカル確認: Rust 1.98.1 でコア単体7/7、コンポーネント単体4/4・doc1/1、native 比較2/2、実 WASM 比較3/3、各クレートの整形・Clippy、コア `wasm32` 型検査が成功。Node.js 24.19.0 の変更判定15/15、構成ガードの通常・`sdk`・`slmp`、CI YAML 解析、manifest の現値確認、`git diff --check` も成功した。
 - [PR #3](https://github.com/tyaro/banto-driver-wasm/pull/3) を Ready で公開した。CI の成果物パスをリポジトリ基準の絶対パスに修正し、同じ配置で実 WASM 比較3/3を再実行した。[修正版 CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40150441856) は `component-build` / `component-compare` / `ci-gate` を含む全9ジョブ成功。Rust 1.85.1 のコア CI も成功した。修正前の実行は次の push によりキャンセルされた。
+- PR #3 の最終 head `742aa507ef8304258ca4a61bcbf8e737f0214383` は [CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40150933235) 全9ジョブ成功、未解決レビューなしと確認し、`9e1a77010d62276736718a7c6f832c296e5aa6c6` で main に squash merge した。main を同 SHA へ fast-forward して引き継いだ。
 
 ## 未検証
 
@@ -49,8 +50,9 @@
 
 ## 次作業
 
-1. PR #3 の最終レビューと CI を確認し、修正必須事項があれば同 PR で解消する。マージは別途判断する。
-2. Hub 側の最小変更範囲を調整し、manifest 検証、loader / runtime、既存 `FrameSession` と接続テストへのアダプターを作る。ワード順、文字列、複数レジスタ等はまだ範囲外。
+1. Hub 側の既存担当作業と衝突しない変更範囲を確認する。最小範囲は新 WASM manifest の `settingsVersion` 必須正整数検証、loader / Wasmtime runtime、`FrameConnection` アダプター、既存 `FrameSession` と接続テストへの登録である。このリポジトリの `component/manifest.json` は試案であり、Hub の受理形式はまだ実装されていない。
+2. Hub 境界で U16 `uint(u64)` の型と `0..=65535` を検査し、既存 `FrameSession` の `covers` / 結果件数検査を再利用する。trap / epoch / memory limit の内部原因と既存 API への写像を実装・検証する。接続テストでは `probe` のエラー伝播、保存設定 fingerprint によるセッション再利用と設定変更拒否を確認する。
+3. 実 Modbus TCP 通信と Hub 経由の native / WASM 比較を実施する。FC3・単一 U16・TCP・読み取り専用を維持し、シリアル、複数レジスタ、文字列、書き込みへ広げる判断は別途行う。
 
 ## 判断
 
