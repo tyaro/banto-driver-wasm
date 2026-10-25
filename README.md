@@ -13,6 +13,7 @@ Hub にある公開 `banto-driver-api`（`FrameDriver`）、`banto-driver-engine
 - [docs/STATUS.md](docs/STATUS.md): 確認済みの進捗、残件、次作業。新しいセッションはここから開始します。
 - [docs/PLAN.md](docs/PLAN.md): 段階計画、完了条件、CI の拡張順。
 - [docs/CONTRACT.md](docs/CONTRACT.md): 現行 API と承認済み初版 WIT 境界の照合。
+- [drivers/slmp/README.md](drivers/slmp/README.md): 標準 Q / iQ-R・ENCPU の SLMP 型式・設定点数・タグ範囲判定の設計案。
 - [AGENTS.md](AGENTS.md): 作業・引継ぎの規約。
 
 ## 現在の CI
