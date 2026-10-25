@@ -17,6 +17,7 @@
 - CI に `component-build` と `component-compare` を加え、WIT 検査、コンポーネント生成・検証、成果物を使った Wasmtime 実行を配線した。既存の Rust 1.85.1 コア CI と native 比較は維持した。`component/manifest.json` は初版メタデータの試案であり、Hub 側の検証器や配布形式ではない。
 - 新規セッションで main `8a6d0a5d03e4e300731930a2c6ed685d28fbbc42`、本書・CONTRACT・両リポジトリの作業規約を確認した。Hub main は `aab51f437a303fd3ca4ef77ec73c46e54d43bcbc`。Hub の並行作業 [PR #842](https://github.com/tyaro/banto-industrial/pull/842) の変更ファイルを照合し、Hub 本体や別担当の作業ツリーは変更していない。独立ブランチ `wasm-host-prep` でテストホストの準備を進めた。
 - 独立 Wasmtime ホストに試案 manifest の `settingsVersion` 必須正整数（`u32` に収まる値）・WIT `uint(u64)` の U16 型と範囲の拒否試験を追加した。ローカル TCP の制御した応答で `probe` → `parse` → `read.plan` → 送受信 → `read.decode` を通し、正常値・機器例外・破損・ID 不一致を確認する試験も追加した。これは Hub loader や `FrameSession` 経由の試験ではない。
+- [PR #4](https://github.com/tyaro/banto-driver-wasm/pull/4) の head `2db459fb437c143b3dee9b442fd5fffe516e0c2a` を、`ed845af9bc1f062b510d804e03d319eb4f3b8fd3` で main に squash merge した。Hub 本体とその並行ブランチには変更を加えていない。
 
 ## 検証
 
@@ -39,11 +40,12 @@
 - PR #3 の最終 head `742aa507ef8304258ca4a61bcbf8e737f0214383` は [CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40150933235) 全9ジョブ成功、未解決レビューなしと確認し、`9e1a77010d62276736718a7c6f832c296e5aa6c6` で main に squash merge した。main を同 SHA へ fast-forward して引き継いだ。
 - PR #3 後の [main CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40151386077) は `component-build` / `component-compare` / `ci-gate` を含む全9ジョブ成功と確認した。これはこのセッションのテストホスト追加前の main に対する結果である。
 - 新規セッションの環境では公式 rustup から Rust 1.98.1 のみを導入し、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0（コンポーネント依存）、Wasmtime 50.0.0（テスト依存）を確認した。Rust 1.85.1 は導入していない。正本 WIT の検証、実コンポーネントのビルド・検証・world 対応、コンポーネント単体4/4・doc1/1、独立 Wasmtime 比較6/6、runtime-comparison の整形・Clippy、Node 変更判定15/15・構成ガード・`git diff --check` が成功。6件には manifest・U16 拒否とローカル TCP 制御通信を含む。
+- PR #4 の [対象 CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40152706179) は完了・成功。`modbus-test` / `native-compare` / `component-build` / `component-compare` / `ci-gate` を含む7ジョブ成功、変更対象外の SDK・SLMP ガード2ジョブは skipped。未解決レビューはなく、[統合レビュー](https://github.com/tyaro/banto-driver-wasm/pull/4#issuecomment-6392262134) も独立テストホスト準備の範囲で修正必須なしと確認した。レビューは Hub 製品境界の実装・実行を認定していない。
 
 ## 未検証
 
 - Hub loader / runtime、manifest の必須正整数検証、`FrameConnection` アダプター、既存接続テストへの登録・呼び出しは未実装。WASM 境界での U16 型・範囲検査、`covers` と結果件数の既存 `FrameSession` 検査への接続、内部原因の構造化診断と API 変換も Hub 側では未検証。
-- 実機への Modbus TCP 通信、SLMP、FC3 以外、複数レジスタ、ワード順、文字列、書き込みは未実装または未検証。ローカル TCP の制御通信は独立テストホスト経由のみ。アドレス解析と設定検証はゲスト内だけで実装した。
+- 実機への Modbus TCP 通信、SLMP、FC3 以外、複数レジスタ、ワード順、文字列、書き込みは未実装または未検証。ローカル TCP の制御通信は独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。アドレス解析と設定検証はゲスト内だけで実装した。
 - ローカルでは Rust 1.85.1 を導入・実行していない。CI では既存の 1.85.1 コア検証と WASM artifact のジョブ間再利用が成功した。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
 
 ## 残件
@@ -58,7 +60,9 @@
 2. Hub 境界で U16 `uint(u64)` の型と `0..=65535` を検査し、既存 `FrameSession` の `covers` / 結果件数検査を再利用する。trap / epoch / memory limit の内部原因と既存 API への写像を実装・検証する。接続テストでは `probe` のエラー伝播、保存設定 fingerprint によるセッション再利用と設定変更拒否を確認する。
 3. 実 Modbus TCP 通信と Hub 経由の native / WASM 比較を実施する。FC3・単一 U16・TCP・読み取り専用を維持し、シリアル、複数レジスタ、文字列、書き込みへ広げる判断は別途行う。
 
-変更範囲の案: (1) このリポジトリの `runtime-comparison` で契約・ローカル通信を準備、(2) 調整後に Hub の新規 `crates/banto-driver-wasm`（`banto-driver-api`、Wasmtime 50.0.0、serde 系）で manifest / loader / runtime と `FrameConnection` 変換、(3) `crates/banto-drivers/src/lib.rs` と `apps/banto-hub/host/Cargo.toml` の登録、`apps/banto-hub/core/src/rest/plc_connections.rs` の既存接続テスト経路・局所試験へ接続。Hub [PR #842](https://github.com/tyaro/banto-industrial/pull/842) が変更中の `apps/banto-hub/core/src/{runtime,hub,broker_glue}.rs` と `crates/banto-tags` はこの段階では触れない。Hub 本体への書込みは調整結果を待つ。
+独立ホストの準備は PR #4 まで完了。次セッションの変更範囲案: (1) Hub の新規 `crates/banto-driver-wasm`（`banto-driver-api`、Wasmtime 50.0.0、serde / serde_json）で manifest の必須正整数検証・WIT loader/runtime・`FrameConnection` 変換、(2) `crates/banto-drivers/src/lib.rs` と `apps/banto-hub/host/Cargo.toml` の登録、(3) `apps/banto-hub/core/src/rest/plc_connections.rs` の既存接続テスト経路と局所試験へ接続する。既存 `FrameSession` の `covers` / 件数検査と `decode_value`、timeout / 受信上限の分類を再利用する。実装前に Hub [PR #842](https://github.com/tyaro/banto-industrial/pull/842)（R2b-7c、修正版 CI 待ち、未マージ）の最新状態と担当範囲を再照合する。同 PR が変更中の `apps/banto-hub/core/src/{runtime,hub,broker_glue}.rs` と `crates/banto-tags` は範囲調整なしに編集しない。
+
+次セッションの必要環境: Rust 1.98.1 のみ、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0、テスト依存 Wasmtime 50.0.0、Node.js 24。新しいクラウド環境には前セッションの導入が継承されると仮定せず確認する。実通信の自動確認は制御したローカル TCP で行い、実機 PLC は使わない。MSRV 宣言と native descriptor の欠落時 `settings_version=1` は変更しない。
 
 ## 判断
 
