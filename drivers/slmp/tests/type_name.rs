@@ -29,6 +29,23 @@ fn request_and_known_q_r_responses_match_wire_fixtures() {
 }
 
 #[test]
+fn universal_q_udeh_aliases_use_the_codes_in_the_official_table() {
+    // Both pairs share a code with their UDH counterpart (printed p. 139).
+    for (raw_name, code) in [
+        (b"Q10UDEHCPU      ", [0x66, 0x02]),
+        (b"Q20UDEHCPU      ", [0x67, 0x02]),
+    ] {
+        let mut response = Q02UCPU;
+        response[15..31].copy_from_slice(raw_name);
+        response[31..33].copy_from_slice(&code);
+        let parsed = decode_type_name(Route::default(), &response).unwrap();
+        assert_eq!(parsed.raw_name, *raw_name);
+        assert_eq!(parsed.code, u16::from_le_bytes(code));
+        assert_eq!(parsed.family, ModelFamily::StandardQ);
+    }
+}
+
+#[test]
 fn unknown_pairs_remain_unknown_with_exact_name_and_code_preserved() {
     let mut mismatch = Q02UCPU;
     mismatch[31..33].copy_from_slice(&[0x00, 0x48]);
