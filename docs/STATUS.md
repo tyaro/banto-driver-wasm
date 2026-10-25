@@ -2,9 +2,9 @@
 
 ## Current stage: SLMP guest with controlled Wasmtime fixtures
 
-- Based on merged PR #12 main b3c108a886bd5d46de2c0066c0559a2489ca10f2, a separate SLMP component now exports the existing WIT world without changing Modbus. One connection resource sequences 0101, the applicable basic D count SD (Q internal SD302 or R SD280-281), then a single D/u16 0401 read within an exact confirmed count. Static D address parsing does not use connection state.
-- Evidence and pending read plans are scoped to the connection resource. A newly created resource restarts 0101; unsupported type pairs do not trigger an SD plan. Four controlled Q/R, unknown-model, SD-refusal, and reconnection Wasmtime fixtures pass locally. No PLC, Hub, socket, WIT, native driver, or write operation was used.
-- The policy for ordinary reads when the range remains unknown is awaiting a user decision. Hub display is covered by the design-only discovery contract; its versioned WIT compatibility must be tested before implementation. Q SD308-311 total semantics remain open. GitHub CI and review are pending.
+- Based on merged PR #12 main b3c108a886bd5d46de2c0066c0559a2489ca10f2, a separate SLMP component exports the existing WIT world without changing Modbus. One connection resource sequences 0101, the applicable basic D count SD (Q internal SD302 or R complete SD280-281), then a single D/u16 0401 read. Static D address parsing does not use connection state.
+- Evidence and pending read plans are scoped to the connection resource. A newly created resource restarts 0101. With a recognized Q/R wire series, an explicit tag may be read one at a time when its range is unknown, at the operator's responsibility; success does not upgrade the range verdict. A Q address beyond internal D remains unknown, and an address within a saturated Q lower-bound prefix is verified. An R address beyond its exact complete D count is rejected. Unknown name/code pairs and 0101 refusals do not establish the Q/R 0401 wire format, so this guest plans neither SD nor tag reads for them.
+- Five controlled Q/R, unknown-model, 0101-refusal, SD-refusal, and reconnection Wasmtime fixtures pass locally, along with SLMP core 25 tests and the component unit test. Hub display is covered by the design-only discovery contract; versioned WIT compatibility must be tested before implementation. Q SD308-311 total semantics remain open. PR #13 tracks CI and review. No PLC, Hub, socket, native driver, or write operation was used; the existing WIT is unchanged.
 
 ## Previous stage: conditional Q extension fields (merged PR #12)
 
@@ -102,7 +102,7 @@
 
 ## 未検証
 
-- SLMP の機種・経路別 SD 取得、拡張 D/W の ZR 変換、タグ範囲判定、実機 read と write、Hub 表示・品質・監査は設計段階で未検証。判定不能時の運用方針、WIT 拡張、バッチ書込み単位は未決。
+- SLMP の全機種・経路別 SD 取得、拡張 D/W の ZR 変換、全タグ種の範囲判定、実機 read と write、Hub 表示・品質・監査は未検証。既知 Q/R の D/u16 範囲 unknown は利用者責任で明示タグを 1 件ずつ読取り可と決定したが、型式不明・0101 拒否時は本ゲストで Q/R wire を確定できず読まない。WIT 拡張とバッチ書込み単位は未決。
 
 - Hub の loader / runtime、manifest 検証、`FrameConnection` アダプター、U16 接続テストは PR #843 で実装された。この新しい U32 版ゲストの固定 SHA 更新、Hub 側 U32 型・範囲検査と読取り経路は未実施。
 - 実機への Modbus TCP 通信、SLMP、FC3 以外、複数タグ、文字列、書き込みは未実装または未検証。U32 は独立 Wasmtime 比較の対象で、Hub 境界では未対応。ローカル TCP の制御通信は U16 の独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。
