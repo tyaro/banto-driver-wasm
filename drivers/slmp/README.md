@@ -5,14 +5,14 @@
 ## 境界と用語
 
 - WASM ドライバは SLMP フレームの生成・応答解析、0101/0000 の型名・型コード判別、SD からの設定点数取得、タグの範囲判定を担う。ソケット I/O、再接続、接続テストの表示、品質、監査は Hub 側の責務とする。[Hub 側の追跡 Issue #845](https://github.com/tyaro/banto-industrial/issues/845)。
-- 「点数」は PLC に設定されたデバイス個数であり、最終アドレスでも CPU バッファメモリの容量でもない。SD は特殊レジスタとしてデバイス読出しする。bit デバイスの点数、word デバイスの点数、MC/SLMP フレーム内の読出し単位（bit / word）を混同しない。X/Y/B/W/SB/SW/ZR などのアドレス表記は十六進、M/D などは十進というデバイス別の基数も区別する。コマンドの点数上限は設定済みデバイス範囲とは別に確認する。型と基数は [MC p.69](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70)、[SLMP pp.37-46](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=38) に従う。
+- 「点数」は PLC に設定されたデバイス個数であり、最終アドレスでも CPU バッファメモリの容量でもない。SD は特殊レジスタとしてデバイス読出しする。bit デバイスの点数、word デバイスの点数、MC/SLMP フレーム内の読出し単位（bit / word）を混同しない。X/Y/B/W/SB/SW/ZR などのアドレス表記は十六進、M/D などは十進というデバイス別の基数も区別する。コマンドの点数上限は設定済みデバイス範囲とは別に確認する。型と基数は [MC p.68](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70)、[SLMP pp.37-46](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=38) に従う。
 - 型式の公称最大点数を接続先の実設定点数として採用しない。設定点数を取得できない場合は `unknown` とし、範囲外と断定しない。一方、値が取得できても対象機種や経路への適用条件が未確認なら `unknown` を維持する。MC はアクセス先モジュールのデバイス仕様を優先する。[MC pp.69-70](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70)。
 
 ## 型式確認と適用対象
 
 読出し専用の `0101/0000` でアクセス先の 16 文字の型名と型コードを取得し、応答の原文字列（空白埋めを含む）と正規化した比較用文字列を保持する。コードと名称の組で対応表を照合する。コードだけで Q の同一コードに複数型名が対応する場合があり、型名だけで判定を完結させない。フレーム形式・経由局を記録する。[MC pp.166-168](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=167)、[SLMP pp.139-140](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=140)。
 
-経由局が iQ-R 系以外の場合、RCPU への 0101 は `RCPU / 0360H` に丸められることがある。この組から個別の R 型式、ENCPU か否か、機種固有の SD 対応範囲を推定しない。再確認手段が決まるまでは必要な型式固有判定を `unknown` にする。[MC p.168](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=169)、[SLMP p.140](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141)。
+経由局が iQ-R 系以外の場合、RCPU への 0101 は `RCPU / 0360H` に丸められることがある。この組から個別の R 型式、ENCPU か否か、機種固有の SD 対応範囲を推定しない。再確認手段が決まるまでは必要な型式固有判定を `unknown` にする。[MC p.167](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=169)、[SLMP p.140](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141)。
 
 以下の表は標準 Q / iQ-R CPU・ENCPU の候補マップである。安全 CPU、プロセス/二重化 CPU、リモートヘッド、L/FX/MX 等に流用しない。型名・型コード・機能版/シリアル・経路と対象 SD の対応が確認できないときは別途機種対応を設計する。
 
@@ -32,9 +32,11 @@ Q の基本表は各 SD が **1 word の点数**を表す。表の点数をそ�
 
 Universal Q の拡張 M/B は `SD286-287` / `SD288-289` の low/high 32-bit 点数を使えるが、表の注記 *6 に従い serial 先頭 5 桁が `10042` 以降の対象機に限る。高速 Universal QnUDV/QnUDPV の内部 D/W は `SD282-283` / `SD284-285` の low/high 32-bit 点数。適用条件を確認せず旧欄と置き換えない。[Q CPU pp.549,553](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=551)。
 
-QnU の D 合計（内部 + 拡張）は `SD308-309`、W 合計は `SD310-311`、ZR は `SD306-307` の low/high 32-bit 点数。これらの表の注記 *7 は Q00UJCPU を除外する。Q00UJCPU にこの合計マップを適用しない。内部の `SD302/303`、高速型の `SD282-285`、合計の `SD308-311` は意味が異なる。[Q CPU pp.550-553](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=552)、[QnU pp.403-405](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=404)。
+QnU の D 合計（内部 + 拡張）は `SD308-309`、W 合計は `SD310-311` の low/high 32-bit 点数。`SD306-307` は ZR の low/high 32-bit 点数だが、**拡張 D または拡張 W のいずれかを 1K 点以上設定した場合にのみ**点数が格納される。条件外・適用条件不明・取得不能なら ZR の厳密な点数は `unknown` とし、SD306-307 の値を無条件に上限として採用しない。これらの表の注記 *7 は Q00UJCPU を除外する。Q00UJCPU にこの合計マップを適用しない。内部の `SD302/303`、高速型の `SD282-285`、合計の `SD308-311` は意味が異なる。[Q CPU pp.550-553](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=552)、[QnU pp.402-404](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=404)。
 
-Q の拡張 D/W は内部領域の次へ**論理デバイス番号が連続**するが、物理領域は連続しない。経由モジュールの対応可否を別に確認し、未対応の経路で必要な場合はマニュアルに従い ZR 番号へ変換する。この変換と一括読出しの境界は経路別に検証する。QnU p.405 の内部/拡張境界を跨がせない注意は、PLC の自動リフレッシュ・ブロックデータ命令等の指定に関する記述であり、**MC のすべての読出しを一律禁止する根拠にはしない**。[QnU pp.403,405-407](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=404)、[MC p.69](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70)、[SLMP p.39](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=40)。
+`SD647` は現在選択中のファイルレジスタファイルの容量を **1K 点（ZR は word デバイスなので 1K word）単位**で格納し、1K 点未満の端数を切り捨てる。拡張 D/W 使用時のファイル容量は ZR・拡張 D・拡張 W の合計であり、`SD647 × 1024` を ZR 単独の厳密な上限としない。ZR の厳密な点数判定には上記の適用条件を満たす `SD306-307` 等を使い、得られなければ `unknown` とする。[QnU pp.393,400,402-404](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=402)。
+
+Q の拡張 D/W は内部領域の次へ**論理デバイス番号が連続**するが、物理領域は連続しない。経由モジュールの対応可否を別に確認し、未対応の経路で必要な場合はマニュアルに従い ZR 番号へ変換する。この変換と一括読出しの境界は経路別に検証する。QnU p.404 の内部/拡張境界を跨がせない注意は、PLC の自動リフレッシュ・ブロックデータ命令等の指定に関する記述であり、**MC のすべての読出しを一律禁止する根拠にはしない**。[QnU pp.402,404-406](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=404)、[MC p.68](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70)、[SLMP p.39](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=40)。
 
 ## iQ-R / ENCPU: SD の実設定点数
 
@@ -51,7 +53,7 @@ Q の拡張 D/W は内部領域の次へ**論理デバイス番号が連続**す
 | LT | 294 | LST | 296 | RD | 308 |
 | LC | 298 |  |  |  |  |
 
-T/ST/C/LT/LST/LC の設定点数と、接点・コイル・現在値の SLMP デバイスコード/bit-word-double-word 単位は別の情報である。存在しないデバイスコードへ一般化しない。[MC p.69](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70)、[SLMP pp.37-39](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=38)。
+T/ST/C/LT/LST/LC の設定点数と、接点・コイル・現在値の SLMP デバイスコード/bit-word-double-word 単位は別の情報である。存在しないデバイスコードへ一般化しない。[MC p.68](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70)、[SLMP pp.37-39](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=38)。
 
 ## 接続テストとタグ判定の設計案
 
