@@ -1,6 +1,6 @@
 # API と WIT の照合
 
-照合元: banto-industrial `89de2953b59587839d93a182c0bc7c17179adb0e`（2026-10-24 main）の [API 実装](https://github.com/tyaro/banto-industrial/tree/89de2953/crates/banto-driver-api)、[Modbus 実装](https://github.com/tyaro/banto-industrial/tree/89de2953/crates/banto-driver-modbus)、[API 設計 §9.2](https://github.com/tyaro/banto-industrial/blob/89de2953/docs/banto-driver-api-design.md)、[WIT 案 §6.2](https://github.com/tyaro/banto-industrial/blob/89de2953/docs/banto-hub-driver-plugin-design.md)。前回の `a0d01aa2` から、照合対象の API、Modbus、engine、両設計文書には差分がない。本書は照合記録であり、WIT v1 の確定宣言ではない。
+照合元: banto-industrial `aab51f437a303fd3ca4ef77ec73c46e54d43bcbc`（2026-10-25 main）の [API 実装](https://github.com/tyaro/banto-industrial/tree/aab51f43/crates/banto-driver-api)、[Modbus 実装](https://github.com/tyaro/banto-industrial/tree/aab51f43/crates/banto-driver-modbus)、[API 設計 §9.2](https://github.com/tyaro/banto-industrial/blob/aab51f43/docs/banto-driver-api-design.md)、[WIT 案 §6.2](https://github.com/tyaro/banto-industrial/blob/aab51f43/docs/banto-hub-driver-plugin-design.md)。前回の `89de2953` から、照合対象の API、Modbus、engine、WIT 設計に差分はない。本書の次節は承認済みの初版境界であり、Hub の loader / runtime の実装完了を意味しない。
 
 | Hub の現行 API | WIT 案 | 今回の状態 |
 | --- | --- | --- |
@@ -12,33 +12,22 @@
 
 `drivers/modbus` の要求は Hub native の FC3 単一レジスタ要求と同じ MBAP 形である。[独立した比較試験](../comparison/src/lib.rs) は Hub `a0d01aa2` の公開 `FrameDriver` / `FrameConnection` を Git 依存で実行し、同一応答フィクスチャ 12 件をコアへも渡す。正常値、機器例外、ID 不一致、破損フレームの 10 件は値とエラー分類が一致する。残り 2 件は**意図的な差**: native の PDU 解析は宣言したデータの後ろの余剰バイトを受理するが、新コアは正常応答を 4 byte、例外応答を 2 byte に厳格化して `Framing` で拒否する。比較はこの差を明示的に検査する。Hub の engine / WASM 実行は通していない。ワード順、文字列、複数タグ、FC1/2/4 も対象外。
 
-## WIT v1 を決める前の論点
+## 初版境界の決定
 
-1. **通信間隔**: 現行 API の `FrameConnection::inter_frame_gap` は WIT 案にない。engine は送信前にこれを読み、500 ms 超を契約違反として拒否する。比較試験で native Modbus TCP はゼロと確認した。推奨: TCP 限定の v1 ではゼロを契約に明記し、シリアルを許す版で時間の単位と上限を WIT / Hub 両方へ追加する。WIT が間隔を持たないままシリアルを宣言しない。
-2. **接続テストと設定版**: 現行 `DriverBase::probe` は接続テスト用の 1 点を返し、native Modbus は `40001` の `U16` を返す。WIT 案の接続テストは handshake 完了だけなので、この点の読み取りを表現できない。推奨: stateless な `probe() -> option<tag-spec>` を address 側に加え、Hub が `parse` → `plan` → `decode` で 1 点読む。`None` は handshake のみ。`DriverDescriptor::settings_version` は native で 1、WIT 案の manifest には `version`（プラグイン版）と `hubApi`（WIT メジャー）しかない。推奨: `settingsVersion: u32` を manifest の必須項目として別に持ち、Hub の設定保存・移行規則と同時に確定する。プラグイン版や Hub API 版から推測しない。
-3. **生値**: API `RawValue::{Bool, Int, Uint, Float, Bytes}` は WIT `types.value` と型が対応する。FC3・`U16` の native は `RawValue::Uint(u64)` を返し、engine の `decode_value` は数値タグを `Value::F64` に写す。推奨: 将来のアダプターはコアの `u16` を `uint(u64)` に拡張し、Hub の既存 `decode_value` を再利用する。`float` に先回りして変換しない。型不一致は Hub の `ItemError::Unsupported` にする。文字列の NUL・符号化規則や多語数値は別の比較試験が必要。
-4. **trap と上限**: WIT `fatal-error` は `framing` / `protocol` / `invalid-config` だけで、trap・実行時間超過・メモリ上限超過はゲストからの返値ではない。Hub 設計 §6.1、§6.3、§6.4 は接続用のこれらを接続致命としてインスタンスを破棄し、検証用の trap は検証エラーとして接続へ波及させない。`step.max-len` 超と応答タイムアウトもホスト側の接続致命。推奨: Hub runtime にホスト起因の失敗を保持する内部分類を置き、broker へ致命として渡す。文言の解析や `item-error` への変換はしない。`FatalError::InvalidConfig` は接続設定の誤りだけに使う。
+2026-10-25 に以下の初版方針を承認済み。WIT の `world driver` は設計 §6.2 の `session` / `read` / `address` / `config` を全て export する。読み取り専用 world を使用し、縮小した独自 world や WASI import を作らない。最初のゲストは Modbus TCP の FC3・単一 U16 だけを扱う。書き込み、シリアル、SerialOverTcp、複数レジスタ、文字列は対象外。
 
-照合元は Hub `89de2953` の `crates/banto-driver-api/src/{driver,frame,error,types}.rs`、`crates/banto-driver-engine/src/{lib,decode}.rs`、`crates/banto-driver-modbus/src/{base,frame_conn}.rs`、`docs/banto-hub-driver-plugin-design.md` §4.2・§6.2–6.4。上記は推薦案であり、Hub 側の WIT / runtime を変更・確定していない。
+1. **接続テスト**: `address` に `use types.{tag-spec}; probe: func() -> option<tag-spec>` を加える。Modbus は `40001` / `u16` を返す。Hub が `parse` してから `read.plan` → 送受信 → `read.decode` を実行し、エラーを成功扱いにしない。`none` の場合だけ handshake 完了で成功とする。Hub の既存テスト経路に合わせ、`connectionId` なし、または既存セッションなしなら直接接続する。保存済み接続が稼働中で設定 fingerprint が一致すればセッションを再利用する。設定変更済みなら別接続せず「保存してからテスト」を返す。`probe` の取得は状態を変えない検証用 export とする。
+2. **設定版**: 新しい WASM manifest の `settingsVersion` は必須の正整数で、初版は `1`。欠落、`0`、整数以外は拒否する。`version`（プラグイン SemVer）と `hubApi`（WIT メジャー）とは独立させる。native の古い descriptor に対する欠落時 `1` の補完は変更しない。
+3. **通信間隔**: v1 の `transports` は `tcp` のみ。`inter_frame_gap` はゼロとして Hub 側の既存 engine 契約に写す。シリアルと SerialOverTcp をこの契約で受理しない。時間単位と上限を伴う WIT 拡張はシリアル導入時に設計する。
+4. **生値と分類**: FC3 の `u16` は WIT `types.value.uint(u64)` に拡張して返す。WASM 境界で U16 の型と `0..=65535` を検査し、範囲外を丸めない。`banto-driver-engine::decode_value` は変更しない。機器例外は `item-error.device`、破損フレームは `fatal-error.framing`、要求と異なる ID は `fatal-error.protocol`。`covers` の範囲・重複と結果件数は既存 `FrameSession` の検査を再利用し、独自の「全タグ必須」条件は足さない。
+5. **ホスト起因の失敗**: trap、epoch 超過、メモリ上限はゲストの `fatal-error` ではない。Hub runtime の内部型で原因を保持して構造化診断に記録し、既存 API への正規化を一か所に集約する。接続用の runtime 実行失敗は `Protocol`、受信上限は現行どおり `Framing`、実通信 timeout は現行どおり `Timeout`。`FrameConnection` が `Io` / `Timeout` を返してはいけない現行規則を保つ。失敗した接続用インスタンスは破棄する。検証用の trap・実行上限は検証エラーとし、接続へ波及させない。`memory.grow` の失敗が必ず trap になるとは仮定せず、選択した runtime の実行試験で分類を確かめる。
 
-## 判断待ちの境界案と実装条件
+この決定は製品としての Hub loader / runtime が実装済みであることを意味しない。Hub 本体で必要な最小変更範囲は、manifest の検証、WASM loader / runtime、`FrameConnection` へのアダプター、既存の接続テストへの driver 登録・呼び出しである。Hub の既存担当作業と調整した上で行う。
 
-次の形は**提案**であり、確定 WIT や製品コードにまだ反映しない。Hub の設計・API と同時に採否を決める。
+## 最小比較経路と検証の区別
 
-| 境界 | 提案する最小形 | 採用時の互換性・検証 |
-| --- | --- | --- |
-| `probe` | `address` に `use types.{tag-spec}; probe: func() -> option<tag-spec>` を追加する。返すアドレスは人が入力する表記とし、Hub が `address.parse` で正規化した後、接続して一度だけ `read.plan` → 送受信 → `read.decode` を実行する。`none` は handshake のみ。 | 現行 §5 の「handshake 完了だけで接続テスト成功」を改める。Modbus は `40001` / `u16` の読み取りが成功することを比較する。`probe` の値は接続設定ではないため、接続用と検証用のどちらのインスタンスから取得するかを Hub 側で決める。 |
-| `settingsVersion` | manifest に `settingsVersion: u32` を追加し、native `DriverDescriptor::settings_version` と同じ意味で保存・版比較する。Modbus の初期値は 1。 | manifest の必須欄を増やす。既存 native の旧い descriptor は欠落時に 1 と読むが、未導入のプラグイン manifest の欠落時の扱いは別途決める。`version` / `hubApi` で代用しない。 |
-| `inter_frame_gap` | `transports = [tcp]` の v1 ではゼロと契約に明記し、WIT に呼び出しを増やさない。 | TCP 以外のプラグインはこの版では導入しない。将来シリアルを追加する際、単位と 500 ms 上限、Hub が送信前に待つ時点を明示する必要がある。 |
-| `RawValue` | `u16` の FC3 読み取り結果は `types.value.uint(u64)`、機器例外は `item-error.device`、破損フレームは `fatal-error.framing`、要求と異なる ID は `fatal-error.protocol`。 | Hub の `decode_value` を通すと U16 の数値は `Value::F64` になる。WIT に `f64` として先に渡すと生値の型が失われる。余剰 PDU の native との既知の差は維持し、比較結果に明記する。 |
-| trap・上限 | ゲストが返す `fatal-error` と、ホストが検出した失敗を分ける。接続用の trap、epoch 超過、メモリ上限、受信上限、応答タイムアウトは接続致命。検証用の trap と実行上限は検証エラー。 | WIT `fatal-error` にホスト起因の variant を足さない。内部では原因・実行文脈を型で保持し、文字列から逆算しない。Hub runtime がまだないため、最終的な内部型と broker への写像は Hub 側で決める。 |
+1. 上記の `world driver` 全 export を持つ読み取り専用ゲストをビルドする。アドレス解析と設定検証は export として実装し、対応しないタグ型や設定は明示的に拒否する。ソケットはゲストに渡さない。
+2. 既存の [native 比較試験](../comparison/src/lib.rs) の要求・応答フィクスチャ12件を共通入力として再利用する。実コンポーネントの `read.plan` / `read.decode` を呼び、10件の値・分類一致と余剰 PDU 2件の意図的な厳密拒否を検査する。native の要求 MBAP と `RawValue::Uint` も比較する。
+3. `wasm32-unknown-unknown` の `cargo check` はコアの型検査であり、コンポーネントの生成や実行ではない。WIT 型検査、コンポーネント生成、テストホストでの実行、Hub runtime 経由の実行を別々に記録する。Hub runtime が実装されるまで、テストホストの結果を Hub 経由の適合と呼ばない。
 
-接続用で `step.max-len` を超える応答は、現行 engine では `FatalError::Framing` に写る。WASM ホストでも接続致命を保ち、原因を「受信上限」として内部で識別する提案である。`step` 自体の不正、`read.decode` が返した項目エラー、ホスト側の I/O 失敗・タイムアウトはそれぞれ発生源が異なる。`FatalError::InvalidConfig` を trap や資源枯渇の代用にしない。
-
-## 決定後の最小比較経路
-
-1. Hub と同じ版の WIT を確定し、`driver` world の最小実装をビルドする。`address` / `config` など必須 export は実際に用意し、今回の比較対象は Modbus TCP FC3・単一 `u16` に限定する。ソケットはゲストに渡さない。
-2. 既存の [native 比較試験](../comparison/src/lib.rs) の要求・応答フィクスチャを共通入力として使う。ゲストの `read.plan` / `read.decode` を**実コンポーネントとして実行**し、要求バイト、`value.uint`、機器例外、致命分類を native と比較する。既知の余剰 PDU 2 件は差として検査する。
-3. `wasm32-unknown-unknown` の `cargo check` はコアの型検査と記録し、コンポーネントのビルド・型の照合・実行結果とは別に報告する。Hub loader が完成するまではテスト用ホストでの実行と Hub runtime 経由の検証を区別する。
-
-これらを決めるまでは独自 ABI や確定 WIT ファイルを追加しない。FC3 単一レジスタの比較は完了した。次は Hub と WIT v1 の境界を決めてから最小アダプターを設計する。
+照合元は Hub `aab51f43` の `crates/banto-driver-api/src/{driver,frame,error,types}.rs`、`crates/banto-driver-engine/src/{lib,decode}.rs`、`crates/banto-driver-modbus/src/{base,frame_conn}.rs`、`apps/banto-hub/core/src/rest/plc_connections.rs`、`docs/banto-hub-driver-plugin-design.md` §4.2・§6.2–6.4。
