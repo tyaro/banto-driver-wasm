@@ -1,4 +1,4 @@
-//! Binary 4E SLMP guest for D/u16 reads and an optional restricted R write.
+//! Binary 4E SLMP guest for numeric D and standard iQ-R W reads, plus restricted D/u16 write.
 //! The host owns transport. Each connection owns its discovery evidence.
 
 use std::cell::{Cell, RefCell};
@@ -41,6 +41,7 @@ struct SlmpConnection {
     word_order: WordOrder,
     next_serial: Cell<u16>,
     phase: RefCell<Phase>,
+    w_count: Cell<PointCount>,
     pending: RefCell<BTreeMap<u16, PendingRead>>,
     pending_write: RefCell<Option<PendingWrite>>,
     write_poisoned: Cell<bool>,
@@ -244,9 +245,34 @@ fn parse_d_number(text: &str) -> Result<u32, String> {
         .map_err(|_| "D address exceeds u32".into())
 }
 
-fn canonical(number: i64) -> Result<String, String> {
-    let number = u32::try_from(number).map_err(|_| "D address exceeds u32".to_string())?;
-    Ok(format!("D{number}"))
+fn parse_read_address(
+    text: &str,
+    data_type: &str,
+    words: Option<u32>,
+) -> Result<(Device, u32, DKind), String> {
+    let kind = DKind::parse(data_type, words)?;
+    if text.starts_with('D') {
+        let (number, kind) = parse_read_d(text, data_type, words)?;
+        return Ok((Device::D, number, kind));
+    }
+    let digits = text.strip_prefix('W').ok_or("D or W address required")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid W hexadecimal address".into());
+    }
+    let number = u32::from_str_radix(digits, 16).map_err(|_| "W address exceeds u32")?;
+    number
+        .checked_add(u32::from(kind.words() - 1))
+        .ok_or("W tag address overflows u32")?;
+    Ok((Device::W, number, kind))
+}
+
+fn canonical_read(device: Device, number: i64) -> Result<String, String> {
+    let number = u32::try_from(number).map_err(|_| "read address exceeds u32")?;
+    match device {
+        Device::D => Ok(format!("D{number}")),
+        Device::W => Ok(format!("W{number:X}")),
+        _ => Err("unsupported read area".into()),
+    }
 }
 
 fn known_series(model: &TypeName) -> Option<Series> {
@@ -287,20 +313,32 @@ fn assess_d_span(model: &TypeName, count: PointCount, number: u32, words: u16) -
     }
 }
 
-fn checked_d_span(
+fn checked_read_span(
     spec: &TagSpec,
     model: &TypeName,
-    count: PointCount,
+    d_count: PointCount,
+    w_count: PointCount,
 ) -> Result<ReadSpan, FatalError> {
-    let (number, kind) = parse_read_d(&spec.address, &spec.data_type, spec.string_words)
-        .map_err(FatalError::InvalidConfig)?;
+    let (device, number, kind) =
+        parse_read_address(&spec.address, &spec.data_type, spec.string_words)
+            .map_err(FatalError::InvalidConfig)?;
+    if device == Device::W && model.family != ModelFamily::StandardR {
+        return Err(FatalError::InvalidConfig(
+            "W reads require a confirmed standard iQ-R CPU".into(),
+        ));
+    }
+    let count = if device == Device::W {
+        w_count
+    } else {
+        d_count
+    };
     if assess_d_span(model, count, number, kind.words()) == RangeAssessment::VerifiedOutside {
         return Err(FatalError::InvalidConfig(
-            "D address exceeds verified configured count".into(),
+            "address exceeds verified configured count".into(),
         ));
     }
     Ok(ReadSpan {
-        device: Device::D,
+        device,
         start: number,
         count: kind.words(),
     })
@@ -319,6 +357,7 @@ impl session::GuestConnection for SlmpConnection {
             },
             next_serial: Cell::new(1),
             phase: RefCell::new(Phase::Start),
+            w_count: Cell::new(PointCount::Unknown),
             pending: RefCell::new(BTreeMap::new()),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
@@ -363,7 +402,11 @@ impl session::GuestConnection for SlmpConnection {
                         return Ok(None);
                     }
                 };
-                let span = plan_basic_sd(&model, area).expect("known model has D count SD");
+                let mut span = plan_basic_sd(&model, area).expect("known model has D count SD");
+                // R SD280-283 is a contiguous D/W count snapshot in one read.
+                if model.family == ModelFamily::StandardR {
+                    span.count = 4;
+                }
                 let sd_route = self.route();
                 let series = known_series(&model).expect("known model has series");
                 let send = encode_read(sd_route, series, span)
@@ -397,15 +440,21 @@ impl session::GuestConnection for SlmpConnection {
                 } else {
                     BasicArea::D
                 };
-                let count = basic_sd_count(
-                    &model,
-                    area,
-                    BasicEvidence {
-                        route_confirmed: true,
-                        r_firmware: None,
-                    },
-                    Some(&words),
-                );
+                let evidence = BasicEvidence {
+                    route_confirmed: true,
+                    r_firmware: None,
+                };
+                let count = if model.family == ModelFamily::StandardR {
+                    self.w_count.set(basic_sd_count(
+                        &model,
+                        BasicArea::W,
+                        evidence,
+                        words.get(2..4),
+                    ));
+                    basic_sd_count(&model, area, evidence, words.get(0..2))
+                } else {
+                    basic_sd_count(&model, area, evidence, Some(&words))
+                };
                 *self.phase.borrow_mut() = Phase::Ready { model, count };
                 Ok(None)
             }
@@ -462,13 +511,21 @@ impl read::Guest for Component {
             .iter()
             .enumerate()
             .filter_map(|(index, spec)| {
-                let span = checked_d_span(spec, model, *count).ok()?;
+                let span = checked_read_span(spec, model, *count, conn.w_count.get()).ok()?;
                 encode_read(conn.base_route, series, span).ok()?;
                 Some((
                     u32::try_from(index).ok()?,
                     span,
-                    assess_d_span(model, *count, span.start, span.count)
-                        == RangeAssessment::VerifiedInside,
+                    assess_d_span(
+                        model,
+                        if span.device == Device::W {
+                            conn.w_count.get()
+                        } else {
+                            *count
+                        },
+                        span.start,
+                        span.count,
+                    ) == RangeAssessment::VerifiedInside,
                 ))
             })
             .collect::<Vec<_>>();
@@ -478,8 +535,17 @@ impl read::Guest for Component {
             // addresses, or an unverified range starts a separate request.
             let joined = if verified {
                 groups.last_mut().is_some_and(|last| {
-                    if assess_d_span(model, *count, last.span.start, last.span.count)
-                        != RangeAssessment::VerifiedInside
+                    if last.span.device != span.device
+                        || assess_d_span(
+                            model,
+                            if span.device == Device::W {
+                                conn.w_count.get()
+                            } else {
+                                *count
+                            },
+                            last.span.start,
+                            last.span.count,
+                        ) != RangeAssessment::VerifiedInside
                     {
                         return false;
                     }
@@ -590,16 +656,25 @@ impl read::Guest for Component {
             let spec = specs
                 .get(*cover as usize)
                 .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
-            let tag = checked_d_span(spec, model, *count)?;
+            let tag = checked_read_span(spec, model, *count, conn.w_count.get())?;
             let expected_d = pending
                 .span
                 .start
                 .checked_add(u32::from(word_offset))
                 .ok_or_else(|| FatalError::Protocol("batch address overflow".into()))?;
-            if tag.start != expected_d
+            if tag.device != pending.span.device
+                || tag.start != expected_d
                 || (p.covers.len() > 1
-                    && assess_d_span(model, *count, tag.start, tag.count)
-                        != RangeAssessment::VerifiedInside)
+                    && assess_d_span(
+                        model,
+                        if tag.device == Device::W {
+                            conn.w_count.get()
+                        } else {
+                            *count
+                        },
+                        tag.start,
+                        tag.count,
+                    ) != RangeAssessment::VerifiedInside)
             {
                 return Err(FatalError::Protocol("plan does not match specs".into()));
             }
@@ -776,13 +851,13 @@ impl address::Guest for Component {
         data_type: String,
         string_words: Option<u32>,
     ) -> Result<address::Parsed, String> {
-        let (number, kind) = parse_read_d(&text, &data_type, string_words)?;
+        let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
         Ok(address::Parsed {
-            canonical: format!("D{number}"),
-            area: "D".into(),
+            canonical: canonical_read(device, i64::from(number))?,
+            area: if device == Device::W { "W" } else { "D" }.into(),
             // The existing write extension remains restricted to D/u16.
             // write-next also requires StandardR and a verified range.
-            writable_area: kind == DKind::U16,
+            writable_area: device == Device::D && kind == DKind::U16,
             bit: None,
             word_count: u32::from(kind.words()),
             index: Some(u64::from(number)),
@@ -795,15 +870,15 @@ impl address::Guest for Component {
         string_words: Option<u32>,
         n: i64,
     ) -> Result<String, String> {
-        let (number, kind) = parse_read_d(&text, &data_type, string_words)?;
+        let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
         let word_offset = n
             .checked_mul(i64::from(kind.words()))
             .ok_or("offset overflow")?;
         let next = i64::from(number)
             .checked_add(word_offset)
             .ok_or("offset overflow")?;
-        let next = canonical(next)?;
-        parse_read_d(&next, &data_type, string_words)?;
+        let next = canonical_read(device, next)?;
+        parse_read_address(&next, &data_type, string_words)?;
         Ok(next)
     }
 
@@ -815,12 +890,15 @@ impl address::Guest for Component {
     }
 
     fn offset_words(text: String, n: i64) -> Result<String, String> {
-        let number = parse_d(&text, "u16", None)?;
-        canonical(i64::from(number).checked_add(n).ok_or("offset overflow")?)
+        let (device, number, _) = parse_read_address(&text, "u16", None)?;
+        canonical_read(
+            device,
+            i64::from(number).checked_add(n).ok_or("offset overflow")?,
+        )
     }
 
     fn help() -> String {
-        "SLMP D decimal numeric reads (1/2/4 words); range may remain unknown after handshake"
+        "SLMP D decimal and standard iQ-R W hexadecimal numeric reads (1/2/4 words); range may remain unknown after handshake"
             .into()
     }
 
@@ -899,6 +977,55 @@ mod tests {
             code: 0,
             family,
         }
+    }
+
+    #[test]
+    fn r_w_hex_address_is_read_only_and_checks_complete_tag() {
+        let r = model(ModelFamily::StandardR);
+        let spec = TagSpec {
+            address: "W1E".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        };
+        assert_eq!(
+            checked_read_span(&spec, &r, PointCount::Unknown, PointCount::Exact(32)).unwrap(),
+            ReadSpan {
+                device: Device::W,
+                start: 30,
+                count: 2
+            }
+        );
+        let outside = TagSpec {
+            address: "W1F".into(),
+            ..spec.clone()
+        };
+        assert!(
+            checked_read_span(&outside, &r, PointCount::Unknown, PointCount::Exact(32)).is_err()
+        );
+        assert!(checked_read_span(&spec, &r, PointCount::Unknown, PointCount::Unknown).is_ok());
+        assert!(checked_read_span(
+            &spec,
+            &model(ModelFamily::StandardQ),
+            PointCount::Unknown,
+            PointCount::Unknown
+        )
+        .is_err());
+        assert!(parse_read_address("W1G", "u16", None).is_err());
+        assert!(parse_read_address("WFFFFFFFF", "f64", None).is_err());
+        let parsed =
+            <Component as address::Guest>::parse("W0a".into(), "u16".into(), None).unwrap();
+        assert_eq!(parsed.canonical, "WA");
+        assert_eq!(parsed.area, "W");
+        assert!(!parsed.writable_area);
+        assert_eq!(
+            <Component as address::Guest>::offset("WA".into(), "i32".into(), None, 1).unwrap(),
+            "WC"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("WA".into(), 1).unwrap(),
+            "WB"
+        );
+        assert!(parse_d("WA", "u16", None).is_err());
     }
 
     #[test]
