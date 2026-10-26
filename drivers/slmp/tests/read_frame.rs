@@ -49,6 +49,14 @@ fn q_word_and_r_bit_match_independent_wire_fixtures() {
 fn subcommands_device_code_and_number_width_are_series_specific() {
     let q = encode_read(Route::default(), Series::Q, span(Device::X, 0x1234, 1)).unwrap();
     assert_eq!(&q[17..25], &[1, 0, 0x34, 0x12, 0, 0x9c, 1, 0]);
+    let q_y = encode_read(Route::default(), Series::Q, span(Device::Y, 0x1a, 3)).unwrap();
+    assert_eq!(&q_y[17..25], &[1, 0, 0x1a, 0, 0, 0x9d, 3, 0]);
+    let q_b = encode_read(Route::default(), Series::Q, span(Device::B, 0x2f, 1)).unwrap();
+    assert_eq!(&q_b[17..25], &[1, 0, 0x2f, 0, 0, 0xa0, 1, 0]);
+    let r_y = encode_read(Route::default(), Series::R, span(Device::Y, 0x1234_5678, 1)).unwrap();
+    assert_eq!(&r_y[17..27], &[3, 0, 0x78, 0x56, 0x34, 0x12, 0x9d, 0, 1, 0]);
+    let r_b = encode_read(Route::default(), Series::R, span(Device::B, 0x2f, 3)).unwrap();
+    assert_eq!(&r_b[17..27], &[3, 0, 0x2f, 0, 0, 0, 0xa0, 0, 3, 0]);
     let r = encode_read(
         Route::default(),
         Series::R,
@@ -61,11 +69,48 @@ fn subcommands_device_code_and_number_width_are_series_specific() {
 }
 
 #[test]
+fn additional_bit_and_word_codes_keep_q_r_units_and_radices() {
+    // MC device-code table, printed p.68. Addresses here are already parsed
+    // according to each device's decimal or hexadecimal notation.
+    for (device, code) in [
+        (Device::L, 0x92),
+        (Device::F, 0x93),
+        (Device::V, 0x94),
+        (Device::SB, 0xa1),
+        (Device::SM, 0x91),
+    ] {
+        let q = encode_read(Route::default(), Series::Q, span(device, 0x123, 1)).unwrap();
+        let r = encode_read(Route::default(), Series::R, span(device, 0x123, 1)).unwrap();
+        assert_eq!(&q[17..25], &[1, 0, 0x23, 1, 0, code, 1, 0]);
+        assert_eq!(&r[17..27], &[3, 0, 0x23, 1, 0, 0, code, 0, 1, 0]);
+        assert_eq!(
+            decode_read(
+                Route::default(),
+                span(device, 0x123, 1),
+                &[0xd4, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 3, 0, 0, 0, 0x10]
+            ),
+            Ok(Values::Bits(vec![true]))
+        );
+    }
+    for (device, code) in [(Device::SW, 0xb5), (Device::SD, 0xa9)] {
+        let q = encode_read(Route::default(), Series::Q, span(device, 0x123, 2)).unwrap();
+        let r = encode_read(Route::default(), Series::R, span(device, 0x123, 2)).unwrap();
+        assert_eq!(&q[17..25], &[0, 0, 0x23, 1, 0, code, 2, 0]);
+        assert_eq!(&r[17..27], &[2, 0, 0x23, 1, 0, 0, code, 0, 2, 0]);
+        assert_eq!(
+            decode_read(Route::default(), span(device, 0x123, 2), &D100_RESPONSE),
+            Ok(Values::Words(vec![0x1234, 0xbeef]))
+        );
+    }
+}
+
+#[test]
 fn point_counts_and_complete_number_ranges_are_checked() {
     for (series, request, expected) in [
         (Series::Q, span(Device::D, 0, 0), RequestError::Count),
         (Series::Q, span(Device::D, 0, 961), RequestError::Count),
         (Series::R, span(Device::M, 0, 7169), RequestError::Count),
+        (Series::Q, span(Device::B, 0, 7169), RequestError::Count),
         (
             Series::Q,
             span(Device::D, 0x00ff_ffff, 2),
@@ -85,6 +130,7 @@ fn point_counts_and_complete_number_ranges_are_checked() {
     assert!(encode_read(Route::default(), Series::Q, span(Device::D, 0x00ff_ffff, 1)).is_ok());
     assert!(encode_read(Route::default(), Series::R, span(Device::D, u32::MAX, 1)).is_ok());
     assert!(encode_read(Route::default(), Series::Q, span(Device::M, 0, 7168)).is_ok());
+    assert!(encode_read(Route::default(), Series::Q, span(Device::B, 0, 7168)).is_ok());
     assert!(encode_read(Route::default(), Series::R, span(Device::W, 0, 960)).is_ok());
 }
 

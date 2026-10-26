@@ -1,5 +1,16 @@
 # STATUS
 
+## Q/R additional device reads (2026-10-26)
+
+- Built on the unpublished M/X/Y/B bit-read worktree. L/F/V/SM decimal and SB hexadecimal bit tags, plus SD decimal and SW hexadecimal numeric tags, use their official Q/R 0401 device codes. These areas have no proven configured count in the current D/W-only handshake, so explicit reads remain individual and range-Unknown. Static write capability is false; the D/u16 write policy and both WIT worlds are unchanged.
+- The new device codes and radices were compared with the [Mitsubishi MC code table, printed p.68](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=70) and local `tyaro/slmp` rev `4500aea4e1cdf072e41eb844d6a4caf4d550feb8`. S, timer/counter variants, Q W/extended areas, file registers, and word-bit syntax remain separate work. No PLC or Hub integration was performed.
+- Rust 1.98.1 local checks: SLMP core 34 fixtures, guest 11 unit tests and one doc test, real Wasmtime 23 controlled fixtures, Clippy for all three SLMP crates, wasm32 component build/validation and both unchanged WIT world target checks, scaffold guard, and 17 CI classification tests. This verifies framing and controlled decoding, not PLC model-specific support or a physical device range.
+
+## SLMP M/X/Y/B bit-read stage (2026-10-26)
+
+- This stage starts at merged main `c5ce7477b75f2d7dd263936b4fad21b3fa4e0a27`. It adds read-only `bit` tags for M decimal and X/Y/B hexadecimal device points; existing WIT, D/W numeric reads, and D/u16-only write gates remain unchanged.
+- The current 0101/SD handshake obtains D/W counts, not bit-area counts. Explicit M/X/Y/B reads therefore remain range-Unknown and use one 0401 bit-unit request per tag, including Q25PRH. Local verification with Rust 1.98.1 passed: SLMP core 33 fixtures, guest 10 unit tests plus 1 doc test, real Wasmtime component 22 fixtures, Clippy for all three crates, core wasm32 check, unchanged WIT old and write-v1 world target checks, scaffold and CI classification guards (17 cases), and `git diff --check`. No Hub integration or PLC communication was performed.
+
 ## Local normal D/u16 write policy (verified simulation, 2026-10-26)
 
 - Separate worktree from main `0e05d5b2a955923c8bc37237bd2b5ae4f0eb7253`. The guest declares `d_u16_write_mode` (default disabled) and `d_u16_write_allowlist` (default empty), matching the separately developed Host policy grammar. Enabled mode requires a nonempty, ascending, nonoverlapping list of up to 16 decimal D ranges, 256 ASCII characters, 1–960 words per range, within 24-bit addressing. Any configured or requested span crossing D3000/D3001 is refused.

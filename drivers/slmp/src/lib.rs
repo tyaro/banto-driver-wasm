@@ -30,8 +30,16 @@ pub enum Series {
 pub enum Device {
     M,
     X,
+    Y,
+    B,
+    L,
+    F,
+    V,
+    SB,
+    SM,
     D,
     W,
+    SW,
     SD,
 }
 
@@ -40,19 +48,38 @@ impl Device {
         match self {
             Self::M => 0x90,
             Self::X => 0x9c,
+            Self::Y => 0x9d,
+            Self::B => 0xa0,
+            Self::L => 0x92,
+            Self::F => 0x93,
+            Self::V => 0x94,
+            Self::SB => 0xa1,
+            Self::SM => 0x91,
             Self::D => 0xa8,
             Self::W => 0xb4,
+            Self::SW => 0xb5,
             Self::SD => 0xa9,
         }
     }
 
-    const fn is_bit(self) -> bool {
-        matches!(self, Self::M | Self::X)
+    pub const fn is_bit(self) -> bool {
+        matches!(
+            self,
+            Self::M
+                | Self::X
+                | Self::Y
+                | Self::B
+                | Self::L
+                | Self::F
+                | Self::V
+                | Self::SB
+                | Self::SM
+        )
     }
 }
 
 /// `start` is a numeric device number, already parsed in the device's radix.
-/// `count` is in device points (bits for M/X, words for D/W/SD).
+/// `count` is in device points (bits for M/X/Y/B, words for D/W/SD).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadSpan {
     pub device: Device,

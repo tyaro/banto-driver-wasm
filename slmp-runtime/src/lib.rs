@@ -181,6 +181,14 @@ mod tests {
         for invalid in [
             WriteItem {
                 spec: TagSpec {
+                    address: "M31".into(),
+                    data_type: "bit".into(),
+                    ..item.spec.clone()
+                },
+                ..item.clone()
+            },
+            WriteItem {
+                spec: TagSpec {
                     address: "D32".into(),
                     ..item.spec.clone()
                 },
@@ -1032,6 +1040,264 @@ mod tests {
                 string_words: None,
             })
             .collect()
+    }
+
+    fn bit_spec(address: &str) -> banto::driver::types::TagSpec {
+        banto::driver::types::TagSpec {
+            address: address.into(),
+            data_type: "bit".into(),
+            string_words: None,
+        }
+    }
+
+    #[test]
+    fn mxyb_bits_use_separate_q_requests_and_typed_boolean_values() -> wasmtime::Result<()> {
+        use banto::driver::types::{ItemError, Value};
+        let (mut store, driver) = load()?;
+        let conn = ready_q(&mut store, &driver, 100)?;
+        let specs = [
+            bit_spec("M10"),
+            bit_spec("X0F"),
+            bit_spec("Y10"),
+            bit_spec("B1A"),
+            banto::driver::types::TagSpec {
+                address: "D10".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plans");
+        assert_eq!(
+            plans.len(),
+            5,
+            "unknown bit counts never cause adjacent batching"
+        );
+        for (index, plan) in plans.iter().enumerate() {
+            assert_eq!(plan.covers, [index as u32]);
+            let expected = match index {
+                0 => [1, 0, 10, 0, 0, 0x90, 1, 0],
+                1 => [1, 0, 15, 0, 0, 0x9c, 1, 0],
+                2 => [1, 0, 16, 0, 0, 0x9d, 1, 0],
+                3 => [1, 0, 26, 0, 0, 0xa0, 1, 0],
+                _ => [0, 0, 10, 0, 0, 0xa8, 1, 0],
+            };
+            assert_eq!(&plan.step.send[17..25], &expected);
+            let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+            let body: &[u8] = if index == 4 {
+                &[0x34, 0x12]
+            } else if index % 2 == 0 {
+                &[0x10]
+            } else {
+                &[0]
+            };
+            let results = driver
+                .banto_driver_read()
+                .call_decode(&mut store, conn, plan, &specs, &response(serial, body))?
+                .expect("decode");
+            assert!(
+                matches!(results.as_slice(), [Ok(Value::Uint(0x1234))]) && index == 4
+                    || matches!(results.as_slice(), [Ok(Value::Bool(true))])
+                        && index < 4
+                        && index % 2 == 0
+                    || matches!(results.as_slice(), [Ok(Value::Bool(false))])
+                        && index < 4
+                        && index % 2 == 1
+            );
+        }
+        let plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &[bit_spec("Y11")])?
+            .expect("refusal plan")
+            .remove(0);
+        let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+        let mut refused = response(serial, &[]);
+        refused[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+        let result = driver
+            .banto_driver_read()
+            .call_decode(&mut store, conn, &plan, &[bit_spec("Y11")], &refused)?
+            .expect("item error");
+        assert!(
+            matches!(result.as_slice(), [Err(ItemError::Device(error))] if error.code == 0xc05b)
+        );
+        let plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &[bit_spec("B1B")])?
+            .expect("bad bit plan")
+            .remove(0);
+        let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    conn,
+                    &plan,
+                    &[bit_spec("B1B")],
+                    &response(serial, &[0x11])
+                )
+                .expect("component call")
+                .is_err(),
+            "odd final padding nibble must be zero"
+        );
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn additional_q_r_areas_read_with_unknown_counts_and_no_write_capability(
+    ) -> wasmtime::Result<()> {
+        use banto::driver::types::{TagSpec, Value};
+        let (mut store, driver) = load()?;
+        for (name, code, sd_words, bit_sub, word_sub, code_at) in [
+            ("Q02UCPU", 0x0263, vec![100], [1, 0], [0, 0], 22),
+            ("R04CPU", 0x4800, vec![100, 0, 100, 0], [3, 0], [2, 0], 23),
+        ] {
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings())?
+                .expect("settings");
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101")
+                .is_some());
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+                .expect("SD request")
+                .is_some());
+            let sd_bytes: Vec<u8> = sd_words.into_iter().flat_map(u16::to_le_bytes).collect();
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&response(2, &sd_bytes)))?
+                .expect("ready")
+                .is_none());
+            let mut specs = ["L10", "F11", "V12", "SB1A", "SM13"].map(bit_spec).to_vec();
+            specs.extend(
+                [("SW1A", "u32"), ("SD290", "u16")].map(|(address, data_type)| TagSpec {
+                    address: address.into(),
+                    data_type: data_type.into(),
+                    string_words: None,
+                }),
+            );
+            let plans = driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs)?
+                .expect("plans");
+            assert_eq!(plans.len(), specs.len(), "unknown counts remain individual");
+            for (index, plan) in plans.iter().enumerate() {
+                let (device_code, subcommand, body): (u8, [u8; 2], &[u8]) = match index {
+                    0 => (0x92, bit_sub, &[0x10]),
+                    1 => (0x93, bit_sub, &[0]),
+                    2 => (0x94, bit_sub, &[0x10]),
+                    3 => (0xa1, bit_sub, &[0]),
+                    4 => (0x91, bit_sub, &[0x10]),
+                    5 => (0xb5, word_sub, &[0x34, 0x12, 0xcd, 0xab]),
+                    _ => (0xa9, word_sub, &[0x78, 0x56]),
+                };
+                assert_eq!(plan.covers, [index as u32]);
+                assert_eq!(&plan.step.send[17..19], &subcommand);
+                assert_eq!(plan.step.send[code_at], device_code);
+                let parsed = driver
+                    .banto_driver_address()
+                    .call_parse(
+                        &mut store,
+                        &specs[index].address,
+                        &specs[index].data_type,
+                        None,
+                    )?
+                    .expect("static address");
+                assert!(!parsed.writable_area);
+                let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+                let values = driver
+                    .banto_driver_read()
+                    .call_decode(&mut store, conn, plan, &specs, &response(serial, body))?
+                    .expect("values");
+                assert!(matches!(
+                    (index, values.as_slice()),
+                    (0 | 2 | 4, [Ok(Value::Bool(true))])
+                        | (1 | 3, [Ok(Value::Bool(false))])
+                        | (5, [Ok(Value::Uint(0xabcd_1234))])
+                        | (6, [Ok(Value::Uint(0x5678))])
+                ));
+            }
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r_and_q25prh_bit_reads_keep_unproven_ranges_unknown() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        for (name, code, sd_words, subcommand, width) in [
+            ("R04CPU", 0x4800, vec![32, 0, 32, 0], [3, 0], 10),
+            ("Q25PRHCPU", 0x004c, vec![32], [1, 0], 8),
+        ] {
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings())?
+                .expect("settings");
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101");
+            let sd = driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+                .expect("SD request")
+                .expect("SD step");
+            assert_eq!(
+                &sd.send[17..19],
+                if width == 10 { &[2, 0] } else { &[0, 0] }
+            );
+            let sd_bytes: Vec<u8> = sd_words.into_iter().flat_map(u16::to_le_bytes).collect();
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&response(2, &sd_bytes)))?
+                .expect("ready")
+                .is_none());
+            let specs = [bit_spec("B1A"), bit_spec("B1B")];
+            let plans = driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs)?
+                .expect("bit plans");
+            assert_eq!(plans.len(), 2, "SD D/W values must not verify the B range");
+            assert_eq!(plans[0].covers, [0]);
+            assert_eq!(plans[1].covers, [1]);
+            for (index, plan) in plans.iter().enumerate() {
+                assert_eq!(&plan.step.send[17..19], &subcommand);
+                assert_eq!(plan.step.send[if width == 10 { 23 } else { 22 }], 0xa0);
+                let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+                let result = driver
+                    .banto_driver_read()
+                    .call_decode(
+                        &mut store,
+                        conn,
+                        plan,
+                        &specs,
+                        &response(serial, &[if index == 0 { 0x10 } else { 0 }]),
+                    )?
+                    .expect("bit value");
+                assert!(
+                    matches!(result.as_slice(), [Ok(Value::Bool(true))]) && index == 0
+                        || matches!(result.as_slice(), [Ok(Value::Bool(false))]) && index == 1
+                );
+            }
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
     }
 
     fn ready_q(
