@@ -1,5 +1,11 @@
 # STATUS
 
+## Local stage 1: shared numeric codec for existing types (2026-10-26)
+
+- Branch `feat/shared-register-codec-existing-types` starts at driver-wasm main `7853a6a920abb5f1a74ce9019115bc8177c77f27`. This is local work only: no commit, push, PR, or PLC/DB connection.
+- Modbus FC3 U32 word joining and SLMP two-word SD point counts now call dependency-free `banto-register-codec::decode_u32` from Industrial Git rev `e4afe793cbae08ab4afd88467c8577010020957f`. Existing U16 byte decoding, public word-order settings, frame parsing, WIT, and write limits are unchanged. The six affected Cargo lockfiles pin the same rev.
+- Local checks passed: Modbus core 10 tests at Rust 1.85.1, SLMP core 28 tests at Rust 1.98.1, both wasm32 core checks, native Modbus comparison 4 tests, both guest unit/doc tests and component WIT target checks, Modbus native/real Wasmtime comparison 8 tests, and SLMP real Wasmtime fixtures 14 tests. Formatting, Clippy, scaffold guard, and CI classification tests also passed. This stage has no hosted CI or live PLC/DB verification.
+
 ## Current stage: Q25PRHCPU wire-only read
 
 - The exact `Q25PRHCPU / 004CH` 0101 pair now establishes Q word-read framing without classifying it as standard Q for SD planning. The guest sends no SD request, retains an unknown D count, and sends explicit D/u16 tags individually, including adjacent tags. Mismatched names/codes and 0101 refusals do not establish the wire format. [SLMP Reference Manual, printed p.139](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141).

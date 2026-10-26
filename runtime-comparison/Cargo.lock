@@ -119,6 +119,9 @@ dependencies = [
 [[package]]
 name = "banto-modbus-read-core"
 version = "0.0.0"
+dependencies = [
+ "banto-register-codec",
+]
 
 [[package]]
 name = "banto-plc"
@@ -149,6 +152,11 @@ dependencies = [
  "thiserror",
  "tokio",
 ]
+
+[[package]]
+name = "banto-register-codec"
+version = "0.3.0-alpha.1"
+source = "git+https://github.com/tyaro/banto-industrial.git?rev=e4afe793cbae08ab4afd88467c8577010020957f#e4afe793cbae08ab4afd88467c8577010020957f"
 
 [[package]]
 name = "banto-storage"

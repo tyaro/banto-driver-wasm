@@ -1,6 +1,7 @@
 //! Read-only SD point-count planning for the basic standard Q/R maps.
 //! A decoded count is not a device address, a wire read limit, or a tag verdict.
 use crate::{Device, ModelFamily, ReadSpan, TypeName};
+use banto_register_codec::{decode_u32, WordOrder};
 
 /// Logical point-count field. Timer/counter fields mean configured points;
 /// they do not select a bit/word contact, coil, or current-value wire code.
@@ -94,7 +95,7 @@ pub fn basic_sd_count(
     let count = if plan.count == 1 {
         u32::from(words[0])
     } else {
-        u32::from(words[0]) | (u32::from(words[1]) << 16)
+        decode_u32([words[0], words[1]], WordOrder::LowHigh)
     };
     if model.family == ModelFamily::StandardQ
         && matches!(

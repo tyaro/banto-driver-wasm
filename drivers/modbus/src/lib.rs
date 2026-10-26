@@ -9,6 +9,8 @@
 
 #![no_std]
 
+use banto_register_codec::{decode_u32, WordOrder as CodecWordOrder};
+
 /// The largest Modbus TCP response accepted by the Hub's frame driver.
 pub const MAX_RESPONSE_LEN: usize = 260;
 
@@ -97,11 +99,11 @@ impl ReadHoldingU32 {
         let data = decode_fc3(response, self.transaction_id, self.unit_id, 4)?;
         let first = u16::from_be_bytes([data[0], data[1]]);
         let second = u16::from_be_bytes([data[2], data[3]]);
-        let (high, low) = match self.word_order {
-            WordOrder::LowHigh => (second, first),
-            WordOrder::HighLow => (first, second),
+        let order = match self.word_order {
+            WordOrder::LowHigh => CodecWordOrder::LowHigh,
+            WordOrder::HighLow => CodecWordOrder::HighLow,
         };
-        Ok((u32::from(high) << 16) | u32::from(low))
+        Ok(decode_u32([first, second], order))
     }
 }
 
