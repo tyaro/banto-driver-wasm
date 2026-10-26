@@ -1,11 +1,12 @@
-//! Read-only Modbus TCP component for the full `banto:driver/driver` world.
+//! Read-only Modbus TCP FC3/FC4 component for the full `banto:driver/driver` world.
 //! The host owns sockets, timeouts, retries, and connection policy.
 
 use std::cell::Cell;
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_modbus_read_core::{
-    NumericKind, NumericValue, ReadError, ReadHoldingNumeric, WordOrder, MAX_RESPONSE_LEN,
+    NumericKind, NumericValue, ReadError, ReadHoldingNumeric, RegisterFunction, WordOrder,
+    MAX_RESPONSE_LEN,
 };
 use exports::banto::driver::{address, config, read, session};
 
@@ -147,11 +148,14 @@ fn parse_holding(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16
         ("u64", None) => Kind::U64,
         ("f32", None) => Kind::F32,
         ("f64", None) => Kind::F64,
-        _ => return Err("FC3 supports i16/u16/i32/u32/i64/u64/f32/f64 holding registers".into()),
+        _ => return Err("FC3/FC4 support i16/u16/i32/u32/i64/u64/f32/f64 registers".into()),
     };
     let text = text.trim();
     let bytes = text.as_bytes();
-    if !matches!(bytes.len(), 5 | 6) || bytes[0] != b'4' || !bytes.iter().all(u8::is_ascii_digit) {
+    if !matches!(bytes.len(), 5 | 6)
+        || !matches!(bytes[0], b'3' | b'4')
+        || !bytes.iter().all(u8::is_ascii_digit)
+    {
         return Err(format!("{text:?} は保持レジスタの参照番号ではありません"));
     }
     let number = text[1..]
@@ -165,8 +169,25 @@ fn parse_holding(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16
     Ok((offset, kind))
 }
 
+#[cfg(test)]
 fn canonical(offset: u16) -> String {
-    format!("4{:05}", u32::from(offset) + 1)
+    canonical_register(offset, RegisterFunction::Holding)
+}
+
+fn canonical_register(offset: u16, function: RegisterFunction) -> String {
+    let prefix = match function {
+        RegisterFunction::Holding => 4,
+        RegisterFunction::Input => 3,
+    };
+    format!("{prefix}{:05}", u32::from(offset) + 1)
+}
+
+fn register_function(text: &str) -> RegisterFunction {
+    if text.trim().starts_with('3') {
+        RegisterFunction::Input
+    } else {
+        RegisterFunction::Holding
+    }
 }
 
 fn request_bytes(
@@ -174,6 +195,7 @@ fn request_bytes(
     transaction_id: u16,
     offset: u16,
     kind: Kind,
+    function: RegisterFunction,
 ) -> [u8; 12] {
     ReadHoldingNumeric {
         transaction_id,
@@ -182,7 +204,7 @@ fn request_bytes(
         kind: kind.core_kind(),
         word_order: conn.word_order,
     }
-    .request()
+    .request_with_function(function)
     .expect("validated numeric start offset")
 }
 
@@ -210,7 +232,13 @@ fn planned_read(conn: &ModbusConnection, specs: &[TagSpec]) -> Vec<read::Planned
             let transaction_id = conn.next_transaction_id.get();
             conn.next_transaction_id.set(transaction_id.wrapping_add(1));
             Some(read::Planned {
-                step: step(request_bytes(conn, transaction_id, offset, kind)),
+                step: step(request_bytes(
+                    conn,
+                    transaction_id,
+                    offset,
+                    kind,
+                    register_function(&spec.address),
+                )),
                 covers: vec![index as u32],
             })
         })
@@ -238,7 +266,15 @@ fn decode_planned(
         .try_into()
         .map_err(|_| FatalError::Protocol("FC3 要求長が不正です".into()))?;
     let transaction_id = u16::from_be_bytes([send[0], send[1]]);
-    if send != request_bytes(conn, transaction_id, offset, kind) {
+    if send
+        != request_bytes(
+            conn,
+            transaction_id,
+            offset,
+            kind,
+            register_function(&spec.address),
+        )
+    {
         return Err(FatalError::Protocol(
             "計画と要求バイトが一致しません".into(),
         ));
@@ -250,14 +286,21 @@ fn decode_planned(
         kind: kind.core_kind(),
         word_order: conn.word_order,
     }
-    .decode(response);
+    .decode_with_function(response, register_function(&spec.address));
     let value = match decoded {
         Ok(NumericValue::Int(value)) => Ok(Value::Int(value)),
         Ok(NumericValue::Uint(value)) => Ok(Value::Uint(value)),
         Ok(NumericValue::Float(value)) => Ok(Value::Float(value)),
         Err(ReadError::Device(code)) => Err(ItemError::Device(banto::driver::types::DeviceError {
             code: u32::from(code),
-            message: format!("FC=0x03 Modbus exception 0x{code:02X}"),
+            message: format!(
+                "FC=0x{:02X} Modbus exception 0x{code:02X}",
+                if register_function(&spec.address) == RegisterFunction::Input {
+                    4
+                } else {
+                    3
+                }
+            ),
         })),
         Err(ReadError::Framing) => {
             return Err(FatalError::Framing("FC3 応答フレームが不正です".into()))
@@ -341,9 +384,14 @@ impl address::Guest for Component {
     ) -> Result<address::Parsed, String> {
         let (offset, kind) = parse_holding(&text, &data_type, string_words)?;
         Ok(address::Parsed {
-            canonical: canonical(offset),
-            area: "holding_register".into(),
-            writable_area: true,
+            canonical: canonical_register(offset, register_function(&text)),
+            area: if register_function(&text) == RegisterFunction::Input {
+                "input_register"
+            } else {
+                "holding_register"
+            }
+            .into(),
+            writable_area: register_function(&text) == RegisterFunction::Holding,
             bit: None,
             word_count: kind.word_count(),
             index: Some(u64::from(offset)),
@@ -363,7 +411,7 @@ impl address::Guest for Component {
         let next = i64::from(offset)
             .checked_add(words)
             .ok_or("オフセットが範囲外です")?;
-        canonical_for(next, kind)
+        canonical_for(next, kind, register_function(&canonical))
     }
 
     fn supported_kinds() -> Vec<String> {
@@ -378,11 +426,11 @@ impl address::Guest for Component {
         let next = i64::from(offset)
             .checked_add(n)
             .ok_or("オフセットが範囲外です")?;
-        canonical_for(next, Kind::U16)
+        canonical_for(next, Kind::U16, register_function(&canonical))
     }
 
     fn help() -> String {
-        "FC3 numeric holding registers: 1/2/4 words; final starts 465536/465535/465533 respectively"
+        "FC3 holding (4) and FC4 input (3) numeric registers: 1/2/4 words; FC3 probe remains 40001"
             .into()
     }
 
@@ -395,12 +443,12 @@ impl address::Guest for Component {
     }
 }
 
-fn canonical_for(offset: i64, kind: Kind) -> Result<String, String> {
+fn canonical_for(offset: i64, kind: Kind, function: RegisterFunction) -> Result<String, String> {
     let offset = u16::try_from(offset).map_err(|_| "保持レジスタの範囲を超えています")?;
     if u32::from(offset) + kind.word_count() > u32::from(u16::MAX) + 1 {
         return Err("numeric tag exceeds holding-register address space".into());
     }
-    Ok(canonical(offset))
+    Ok(canonical_register(offset, function))
 }
 
 impl config::Guest for Component {
@@ -495,6 +543,75 @@ mod tests {
     }
 
     #[test]
+    fn fc4_input_address_plan_and_decode_preserve_fc3_probe() {
+        let parsed =
+            <Component as address::Guest>::parse("30001".into(), "i32".into(), None).unwrap();
+        assert_eq!(parsed.canonical, "300001");
+        assert_eq!(parsed.area, "input_register");
+        assert!(!parsed.writable_area);
+        assert_eq!(
+            <Component as address::Guest>::offset("300001".into(), "i32".into(), None, 1).unwrap(),
+            "300003"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("300001".into(), 1).unwrap(),
+            "300002"
+        );
+        assert!(parse_holding("365536", "u32", None).is_err());
+        assert_eq!(
+            <Component as address::Guest>::probe().unwrap().address,
+            "40001"
+        );
+        let conn = conn();
+        let specs = [TagSpec {
+            address: "30001".into(),
+            data_type: "i32".into(),
+            string_words: None,
+        }];
+        let plans = planned_read(&conn, &specs);
+        assert_eq!(plans[0].covers, [0]);
+        assert_eq!(plans[0].step.send, [0, 0, 0, 0, 0, 6, 1, 4, 0, 0, 0, 2]);
+        assert!(matches!(
+            decode_planned(
+                &conn,
+                &plans[0],
+                &specs,
+                &[0, 0, 0, 0, 0, 7, 1, 4, 4, 0, 0, 0x80, 0]
+            )
+            .as_deref(),
+            Ok([Ok(Value::Int(-2147483648))])
+        ));
+        let high_low = ModbusConnection {
+            unit_id: conn.unit_id,
+            word_order: WordOrder::HighLow,
+            next_transaction_id: Cell::new(0),
+        };
+        assert!(matches!(
+            decode_planned(
+                &high_low,
+                &plans[0],
+                &specs,
+                &[0, 0, 0, 0, 0, 7, 1, 4, 4, 0x80, 0, 0, 0]
+            )
+            .as_deref(),
+            Ok([Ok(Value::Int(-2147483648))])
+        ));
+        assert!(matches!(
+            decode_planned(&conn, &plans[0], &specs, &[0, 0, 0, 0, 0, 3, 1, 0x84, 2]).as_deref(),
+            Ok([Err(ItemError::Device(_))])
+        ));
+        assert!(matches!(
+            decode_planned(
+                &conn,
+                &plans[0],
+                &specs,
+                &[0, 0, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x80, 0]
+            ),
+            Err(FatalError::Framing(_))
+        ));
+    }
+
+    #[test]
     fn address_and_probe_agree_with_fc3_scope() {
         assert_eq!(parse_holding("40001", "u16", None), Ok((0, Kind::U16)));
         assert_eq!(
@@ -507,7 +624,7 @@ mod tests {
         );
         assert!(parse_holding("465536", "u32", None).is_err());
         assert_eq!(canonical(0), "400001");
-        assert!(parse_holding("30001", "u16", None).is_err());
+        assert_eq!(parse_holding("30001", "u16", None), Ok((0, Kind::U16)));
         assert!(parse_holding("40001.3", "u16", None).is_err());
         assert_eq!(parse_holding("40001", "i16", None), Ok((0, Kind::I16)));
         assert_eq!(

@@ -1,6 +1,6 @@
 //! A small, transport-free Modbus TCP read core.
 //!
-//! This is an FC3 single-tag numeric read core, not a `FrameDriver` or a WIT
+//! This is an FC3/FC4 single-tag numeric read core, not a `FrameDriver` or a WIT
 //! component. The Hub still owns I/O and the production Modbus driver.
 //! The shape is checked against the native implementation at
 //! `banto-plc/src/modbus/frame.rs` and `banto-driver-modbus/src/frame_conn.rs`
@@ -160,7 +160,23 @@ impl ReadHoldingI32 {
     }
 }
 
-/// Numeric FC3 read width and interpretation, independent of wire framing.
+/// Register table selects FC3 holding or FC4 input reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterFunction {
+    Holding,
+    Input,
+}
+
+impl RegisterFunction {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Holding => 3,
+            Self::Input => 4,
+        }
+    }
+}
+
+/// Numeric FC3/FC4 read width and interpretation, independent of wire framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumericKind {
     I16,
@@ -202,23 +218,40 @@ pub struct ReadHoldingNumeric {
 
 impl ReadHoldingNumeric {
     pub fn request(self) -> Result<[u8; 12], RequestError> {
+        self.request_with_function(RegisterFunction::Holding)
+    }
+
+    pub fn request_with_function(
+        self,
+        function: RegisterFunction,
+    ) -> Result<[u8; 12], RequestError> {
         self.offset
             .checked_add(self.kind.word_count() - 1)
             .ok_or(RequestError::AddressRange)?;
-        Ok(request(
+        Ok(request_function(
             self.transaction_id,
             self.unit_id,
             self.offset,
             self.kind.word_count(),
+            function.code(),
         ))
     }
 
     pub fn decode(self, response: &[u8]) -> Result<NumericValue, ReadError> {
-        let data = decode_fc3(
+        self.decode_with_function(response, RegisterFunction::Holding)
+    }
+
+    pub fn decode_with_function(
+        self,
+        response: &[u8],
+        function: RegisterFunction,
+    ) -> Result<NumericValue, ReadError> {
+        let data = decode_function(
             response,
             self.transaction_id,
             self.unit_id,
             usize::from(self.kind.word_count()) * 2,
+            function.code(),
         )?;
         let mut words = [0u16; 4];
         for (index, bytes) in data.chunks_exact(2).enumerate() {
@@ -240,11 +273,21 @@ impl ReadHoldingNumeric {
 }
 
 fn request(transaction_id: u16, unit_id: u8, offset: u16, count: u16) -> [u8; 12] {
+    request_function(transaction_id, unit_id, offset, count, 3)
+}
+
+fn request_function(
+    transaction_id: u16,
+    unit_id: u8,
+    offset: u16,
+    count: u16,
+    function: u8,
+) -> [u8; 12] {
     let [tid_hi, tid_lo] = transaction_id.to_be_bytes();
     let [offset_hi, offset_lo] = offset.to_be_bytes();
     let [count_hi, count_lo] = count.to_be_bytes();
     [
-        tid_hi, tid_lo, 0, 0, 0, 6, unit_id, 3, offset_hi, offset_lo, count_hi, count_lo,
+        tid_hi, tid_lo, 0, 0, 0, 6, unit_id, function, offset_hi, offset_lo, count_hi, count_lo,
     ]
 }
 
@@ -253,6 +296,16 @@ fn decode_fc3(
     transaction_id: u16,
     unit_id: u8,
     data_len: usize,
+) -> Result<&[u8], ReadError> {
+    decode_function(response, transaction_id, unit_id, data_len, 3)
+}
+
+fn decode_function(
+    response: &[u8],
+    transaction_id: u16,
+    unit_id: u8,
+    data_len: usize,
+    function: u8,
 ) -> Result<&[u8], ReadError> {
     if response.len() < 7 || response.len() > MAX_RESPONSE_LEN {
         return Err(ReadError::Framing);
@@ -269,8 +322,16 @@ fn decode_fc3(
     }
     let pdu = &response[7..];
     match pdu.first() {
-        Some(0x83) if pdu.len() == 2 => Err(ReadError::Device(pdu[1])),
-        Some(0x03) if pdu.len() == 2 + data_len && usize::from(pdu[1]) == data_len => Ok(&pdu[2..]),
+        Some(code) if *code == (function | 0x80) && pdu.len() == 2 => {
+            Err(ReadError::Device(pdu[1]))
+        }
+        Some(code)
+            if *code == function
+                && pdu.len() == 2 + data_len
+                && usize::from(pdu[1]) == data_len =>
+        {
+            Ok(&pdu[2..])
+        }
         _ => Err(ReadError::Framing),
     }
 }
@@ -295,6 +356,52 @@ mod tests {
     #[test]
     fn request_matches_native_mbap_shape() {
         assert_eq!(READ.request(), [0x12, 0x34, 0, 0, 0, 6, 1, 3, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn fc4_numeric_reads_reject_fc3_frames_and_handle_exceptions() {
+        let read = ReadHoldingNumeric {
+            transaction_id: 7,
+            unit_id: 1,
+            offset: 65535,
+            kind: NumericKind::U16,
+            word_order: WordOrder::LowHigh,
+        };
+        assert_eq!(
+            read.request_with_function(RegisterFunction::Input).unwrap(),
+            [0, 7, 0, 0, 0, 6, 1, 4, 255, 255, 0, 1]
+        );
+        assert_eq!(
+            read.decode_with_function(
+                &[0, 7, 0, 0, 0, 5, 1, 4, 2, 0x12, 0x34],
+                RegisterFunction::Input
+            ),
+            Ok(NumericValue::Uint(0x1234))
+        );
+        assert_eq!(
+            read.decode_with_function(&[0, 7, 0, 0, 0, 3, 1, 0x84, 2], RegisterFunction::Input),
+            Err(ReadError::Device(2))
+        );
+        assert_eq!(
+            read.decode_with_function(
+                &[0, 7, 0, 0, 0, 5, 1, 3, 2, 0x12, 0x34],
+                RegisterFunction::Input
+            ),
+            Err(ReadError::Framing)
+        );
+        assert_eq!(
+            read.decode_with_function(
+                &[0, 8, 0, 0, 0, 5, 1, 4, 2, 0x12, 0x34],
+                RegisterFunction::Input
+            ),
+            Err(ReadError::Protocol)
+        );
+        assert!(ReadHoldingNumeric {
+            kind: NumericKind::U32,
+            ..read
+        }
+        .request_with_function(RegisterFunction::Input)
+        .is_err());
     }
 
     #[test]

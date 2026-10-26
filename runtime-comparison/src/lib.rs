@@ -98,7 +98,10 @@ mod tests {
         assert_eq!(manifest_settings_version(&valid), Ok(1));
         assert_eq!(valid["version"], "0.3.0");
         assert_eq!(valid["hubApi"], "1");
-        assert_eq!(valid["displayName"], "Modbus TCP FC3 numeric reads (WASM)");
+        assert_eq!(
+            valid["displayName"],
+            "Modbus TCP FC3/FC4 numeric reads (WASM)"
+        );
         for invalid in [
             json!({}),
             json!({ "settingsVersion": null }),
@@ -137,6 +140,78 @@ mod tests {
         assert!(checked_fc3_u32("u32", &Value::Uint(u64::from(u32::MAX) + 1)).is_err());
         assert!(checked_fc3_u32("u32", &Value::Int(42)).is_err());
         assert!(checked_fc3_u32("u16", &Value::Uint(42)).is_err());
+    }
+
+    #[test]
+    fn real_component_fc4_input_reads_keep_fc3_probe() -> wasmtime::Result<()> {
+        use banto::driver::types::{FatalError, ItemError, Setting, TagSpec, Value};
+        let path = std::env::var("BANTO_COMPONENT_WASM")?;
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+        let mut store = wasmtime::Store::new(&engine, ());
+        let driver = Driver::instantiate(&mut store, &component, &linker)?;
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_probe(&mut store)?
+                .unwrap()
+                .address,
+            "40001"
+        );
+        let parsed = driver
+            .banto_driver_address()
+            .call_parse(&mut store, "30001", "u16", None)?
+            .unwrap();
+        assert_eq!(parsed.canonical, "300001");
+        assert_eq!(parsed.area, "input_register");
+        assert!(!parsed.writable_area);
+        let settings = [
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "502".into(),
+            },
+        ];
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .unwrap();
+        let specs = [TagSpec {
+            address: "30001".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        }];
+        let plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .unwrap();
+        assert_eq!(plan[0].covers, [0]);
+        assert_eq!(plan[0].step.send, [0, 0, 0, 0, 0, 6, 1, 4, 0, 0, 0, 1]);
+        assert!(
+            matches!(driver.banto_driver_read().call_decode(&mut store, conn, &plan[0], &specs,
+            &[0,0,0,0,0,5,1,4,2,0x12,0x34])?, Ok(v) if matches!(v.as_slice(), [Ok(Value::Uint(0x1234))]))
+        );
+        assert!(
+            matches!(driver.banto_driver_read().call_decode(&mut store, conn, &plan[0], &specs,
+            &[0,0,0,0,0,3,1,0x84,2])?, Ok(v) if matches!(v.as_slice(), [Err(ItemError::Device(_))]))
+        );
+        assert!(matches!(
+            driver.banto_driver_read().call_decode(
+                &mut store,
+                conn,
+                &plan[0],
+                &specs,
+                &[0, 0, 0, 0, 0, 5, 1, 3, 2, 0x12, 0x34]
+            )?,
+            Err(FatalError::Framing(_))
+        ));
+        conn.resource_drop(&mut store)?;
+        Ok(())
     }
 
     #[test]

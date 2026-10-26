@@ -4,7 +4,7 @@
   "version": "0.3.0",
   "hubApi": "1",
   "settingsVersion": 1,
-  "displayName": "Modbus TCP FC3 numeric reads (WASM)",
+  "displayName": "Modbus TCP FC3/FC4 numeric reads (WASM)",
   "transports": ["tcp"],
   "capabilities": ["read"]
 }

@@ -133,7 +133,11 @@ mod tests {
         driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[32, 0, 0, 0])))?
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[32, 0, 0, 0, 32, 0, 0, 0])),
+            )?
             .expect("ready");
         let item = WriteItem {
             spec: TagSpec {
@@ -572,7 +576,11 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[100, 0, 0, 0])))?
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[100, 0, 0, 0, 32, 0, 0, 0]))
+            )?
             .expect("R ready")
             .is_none());
         let specs: Vec<TagSpec> = [(98, "u32"), (99, "i32"), (100, "u16")]
@@ -860,8 +868,63 @@ mod tests {
     }
 
     #[test]
+    fn r_w_unknown_range_keeps_explicit_tags_separate() -> wasmtime::Result<()> {
+        use banto::driver::types::{TagSpec, Value};
+        let (mut store, driver) = load()?;
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("settings");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("model");
+        let mut refusal = response(2, &[]);
+        refusal[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&refusal))?
+            .expect("SD refusal")
+            .is_none());
+        let specs = ["W1E", "W1F"].map(|address| TagSpec {
+            address: address.into(),
+            data_type: "u16".into(),
+            string_words: None,
+        });
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("explicit W plans");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers, [0]);
+        assert_eq!(plans[1].covers, [1]);
+        assert_eq!(plans[0].step.send[23], 0xb4);
+        let value = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(3, &[0x34, 0x12]),
+            )?
+            .expect("unknown-range W read");
+        assert!(matches!(value.as_slice(), [Ok(Value::Uint(0x1234))]));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
     fn r_exact_count_batches_prefix_and_leaves_outside_uncovered() -> wasmtime::Result<()> {
-        use banto::driver::types::Value;
+        use banto::driver::types::{TagSpec, Value};
         let (mut store, driver) = load()?;
         let conn = driver
             .banto_driver_session()
@@ -883,7 +946,11 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[32, 0, 0, 0])))?
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[32, 0, 0, 0, 32, 0, 0, 0]))
+            )?
             .expect("ready")
             .is_none());
         let specs = d_specs(&[30, 31, 32]);
@@ -907,6 +974,59 @@ mod tests {
         assert!(matches!(
             values.as_slice(),
             [Ok(Value::Uint(0x11)), Ok(Value::Uint(0x22))]
+        ));
+        let w_specs = ["W1E", "W1F", "W20"].map(|address| TagSpec {
+            address: address.into(),
+            data_type: "u16".into(),
+            string_words: None,
+        });
+        let w_plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &w_specs)?
+            .expect("W plans");
+        assert_eq!(w_plans.len(), 1);
+        assert_eq!(w_plans[0].covers, [0, 1]);
+        assert_eq!(&w_plans[0].step.send[19..27], &[30, 0, 0, 0, 0xb4, 0, 2, 0]);
+        let w_values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &w_plans[0],
+                &w_specs,
+                &response(4, &[0x33, 0, 0x44, 0]),
+            )?
+            .expect("W values");
+        assert!(matches!(
+            w_values.as_slice(),
+            [Ok(Value::Uint(0x33)), Ok(Value::Uint(0x44))]
+        ));
+        let w_pair = [TagSpec {
+            address: "W1E".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        }];
+        let pair_plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &w_pair)?
+            .expect("complete W/u32 plan");
+        assert_eq!(
+            &pair_plan[0].step.send[19..27],
+            &[30, 0, 0, 0, 0xb4, 0, 2, 0]
+        );
+        let pair_value = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &pair_plan[0],
+                &w_pair,
+                &response(5, &[0x34, 0x12, 0xcd, 0xab]),
+            )?
+            .expect("complete W/u32 value");
+        assert!(matches!(
+            pair_value.as_slice(),
+            [Ok(Value::Uint(0xabcd_1234))]
         ));
         conn.resource_drop(&mut store)?;
         Ok(())
@@ -1149,7 +1269,11 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[32, 0, 0, 0])))?
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[32, 0, 0, 0, 32, 0, 0, 0]))
+            )?
             .expect("SD280 pair")
             .is_none());
         let specs = [
@@ -1350,11 +1474,15 @@ mod tests {
             .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
             .expect("type decode")
             .expect("SD280 pair");
-        assert_eq!(&sd.send[17..27], &[2, 0, 0x18, 1, 0, 0, 0xa9, 0, 2, 0]);
+        assert_eq!(&sd.send[17..27], &[2, 0, 0x18, 1, 0, 0, 0xa9, 0, 4, 0]);
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[0x20, 0, 0, 0])))?
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[0x20, 0, 0, 0, 32, 0, 0, 0]))
+            )?
             .expect("SD decode")
             .is_none());
         let specs = [TagSpec {
@@ -1417,7 +1545,11 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, fresh, Some(&response(2, &[0x20, 0, 0, 0])))?
+            .call_handshake_next(
+                &mut store,
+                fresh,
+                Some(&response(2, &[0x20, 0, 0, 0, 32, 0, 0, 0]))
+            )?
             .expect("fresh SD")
             .is_none());
         assert!(
