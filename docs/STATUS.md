@@ -1,5 +1,10 @@
 # STATUS
 
+## Local standard Q internal W read stage (2026-10-26)
+
+- On a recognized standard Q model, the guest reads SD302 and SD303 together on the same connection and retains separate internal D and W point counts. Hexadecimal W numeric tags are planned only when the complete tag fits within the SD303 guaranteed prefix. The old 32768 value is a lower bound, not an exact endpoint. Q25PRH keeps its SD302-only exception, while unknown W counts and Q extended W do not gain a read path. R W and existing Q D behavior remain separate.
+- This stage changes no WIT, Hub, write gate, optimizer, or physical connection. Rust 1.98.1 local verification passed 34 SLMP core fixtures, 12 guest unit tests plus one doc test, and 24 controlled real Wasmtime fixtures. Q SD refusal leaves explicit D reads available at unknown range but W uncovered; Q25PRH retains SD302 alone. This is not a PLC or Hub integration test. [QCPU Appendix 3, printed pp.549-553](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=551).
+
 ## Q/R additional device reads (2026-10-26)
 
 - Built on the unpublished M/X/Y/B bit-read worktree. L/F/V/SM decimal and SB hexadecimal bit tags, plus SD decimal and SW hexadecimal numeric tags, use their official Q/R 0401 device codes. These areas have no proven configured count in the current D/W-only handshake, so explicit reads remain individual and range-Unknown. Static write capability is false; the D/u16 write policy and both WIT worlds are unchanged.

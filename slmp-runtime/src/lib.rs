@@ -21,6 +21,12 @@ mod tests {
         frame
     }
 
+    fn q_sd_data(d_internal: u16, w_internal: u16) -> [u8; 4] {
+        let [d0, d1] = d_internal.to_le_bytes();
+        let [w0, w1] = w_internal.to_le_bytes();
+        [d0, d1, w0, w1]
+    }
+
     fn model_response(name: &str, code: u16) -> Vec<u8> {
         let mut data = [b' '; 18];
         data[0..name.len()].copy_from_slice(name.as_bytes());
@@ -318,7 +324,7 @@ mod tests {
 
         for (name, code, sd_count) in [
             ("Q25PRHCPU", 0x004c, Some(3014u16.to_le_bytes().to_vec())),
-            ("Q02UCPU", 0x0263, Some(vec![32, 0])),
+            ("Q02UCPU", 0x0263, Some(vec![32, 0, 32, 0])),
             ("R04CPU", 0x4800, Some(vec![])),
         ] {
             let conn = driver
@@ -1152,7 +1158,7 @@ mod tests {
         use banto::driver::types::{TagSpec, Value};
         let (mut store, driver) = load()?;
         for (name, code, sd_words, bit_sub, word_sub, code_at) in [
-            ("Q02UCPU", 0x0263, vec![100], [1, 0], [0, 0], 22),
+            ("Q02UCPU", 0x0263, vec![100, 32], [1, 0], [0, 0], 22),
             ("R04CPU", 0x4800, vec![100, 0, 100, 0], [3, 0], [2, 0], 23),
         ] {
             let conn = driver
@@ -1334,10 +1340,86 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut *store, conn, Some(&response(2, &count.to_le_bytes())))?
+            .call_handshake_next(&mut *store, conn, Some(&response(2, &q_sd_data(count, 32))))?
             .expect("ready")
             .is_none());
         Ok(conn)
+    }
+
+    #[test]
+    fn standard_q_sd303_gates_complete_w_tags_without_changing_d_reads() -> wasmtime::Result<()> {
+        use banto::driver::types::{TagSpec, Value};
+        let (mut store, driver) = load()?;
+        let conn = ready_q(&mut store, &driver, 100)?; // SD302=100, SD303=32
+        let specs = [
+            TagSpec {
+                address: "W1C".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "W1D".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "W1E".into(),
+                data_type: "u32".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "W1F".into(),
+                data_type: "u32".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "D31".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("verified Q internal W and D tags");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers, [0, 1, 2]);
+        assert_eq!(plans[1].covers, [4]);
+        assert_eq!(&plans[0].step.send[17..25], &[0, 0, 0x1c, 0, 0, 0xb4, 4, 0]);
+        assert_eq!(&plans[1].step.send[17..25], &[0, 0, 31, 0, 0, 0xa8, 1, 0]);
+        let w_serial = u16::from_le_bytes([plans[0].step.send[2], plans[0].step.send[3]]);
+        let w_values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(w_serial, &[0x11, 0, 0x22, 0, 0x34, 0x12, 0xcd, 0xab]),
+            )?
+            .expect("Q W tags preserve value boundaries");
+        assert!(matches!(
+            w_values.as_slice(),
+            [
+                Ok(Value::Uint(0x11)),
+                Ok(Value::Uint(0x22)),
+                Ok(Value::Uint(0xabcd_1234))
+            ]
+        ));
+        let d_serial = u16::from_le_bytes([plans[1].step.send[2], plans[1].step.send[3]]);
+        let d_values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[1],
+                &specs,
+                &response(d_serial, &[0x78, 0x56]),
+            )?
+            .expect("existing Q D/u16 value");
+        assert!(matches!(d_values.as_slice(), [Ok(Value::Uint(0x5678))]));
+        conn.resource_drop(&mut store)?;
+        Ok(())
     }
 
     #[test]
@@ -2012,11 +2094,11 @@ mod tests {
             .expect("type decode")
             .expect("SD302");
         assert_eq!(&sd_step.send[2..4], &[2, 0]);
-        assert_eq!(&sd_step.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 1, 0]);
+        assert_eq!(&sd_step.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 2, 0]);
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[100, 0])))?
+            .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD decode")
             .is_none());
 
@@ -2116,7 +2198,7 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[100, 0])))?
+            .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD302")
             .is_none());
 
@@ -2313,7 +2395,7 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &[100, 0])))?
+            .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD302")
             .is_none());
         let plans = driver
@@ -2357,7 +2439,7 @@ mod tests {
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, fresh, Some(&response(2, &[100, 0])))?
+            .call_handshake_next(&mut store, fresh, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD302")
             .is_none());
         let one = driver
@@ -2634,6 +2716,16 @@ mod tests {
             )?
             .expect("D0 value");
         assert!(matches!(values.as_slice(), [Ok(Value::Uint(0x1234))]));
+        let unverified_w = [TagSpec {
+            address: "W0".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        }];
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &unverified_w)?
+            .expect("refused SD does not make W available")
+            .is_empty());
         assert!(
             driver
                 .banto_driver_read()
