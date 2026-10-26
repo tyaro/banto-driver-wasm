@@ -230,14 +230,22 @@ pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u
     Ok(out)
 }
 
-/// Build one binary 4E iQ-R word write (1401/0002) for contiguous D points.
-/// The caller must establish the CPU model and configured D range first.
-pub fn encode_r_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<u8>, RequestError> {
+/// Build one binary 4E iQ-R word write for contiguous D or W points.
+/// The caller must establish the CPU model and configured area range first.
+pub fn encode_r_dw_words(
+    route: Route,
+    device: Device,
+    number: u32,
+    words: &[u16],
+) -> Result<Vec<u8>, RequestError> {
+    if !matches!(device, Device::D | Device::W) {
+        return Err(RequestError::DeviceNumber);
+    }
     let count = u16::try_from(words.len()).map_err(|_| RequestError::Count)?;
     check_span(
         Series::R,
         ReadSpan {
-            device: Device::D,
+            device,
             start: number,
             count,
         },
@@ -247,7 +255,7 @@ pub fn encode_r_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<
     out.extend_from_slice(&0x1401u16.to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
     out.extend_from_slice(&number.to_le_bytes());
-    out.extend_from_slice(&[Device::D.code(), 0]);
+    out.extend_from_slice(&[device.code(), 0]);
     out.extend_from_slice(&count.to_le_bytes());
     for word in words {
         out.extend_from_slice(&word.to_le_bytes());
@@ -255,19 +263,31 @@ pub fn encode_r_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<
     Ok(out)
 }
 
+pub fn encode_r_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<u8>, RequestError> {
+    encode_r_dw_words(route, Device::D, number, words)
+}
+
 /// Preserve the original single-point API for its existing callers.
 pub fn encode_r_d_write(route: Route, number: u32, value: u16) -> Vec<u8> {
     encode_r_d_words(route, number, &[value]).expect("one D word fits a 4E request")
 }
 
-/// Build one binary 4E Q word write (1401/0000) for contiguous D points.
-/// The caller must establish the exact CPU model and configured D span first.
-pub fn encode_q_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<u8>, RequestError> {
+/// Build one binary 4E Q word write for contiguous D or W points.
+/// The caller must establish the exact CPU model and configured area span first.
+pub fn encode_q_dw_words(
+    route: Route,
+    device: Device,
+    number: u32,
+    words: &[u16],
+) -> Result<Vec<u8>, RequestError> {
+    if !matches!(device, Device::D | Device::W) {
+        return Err(RequestError::DeviceNumber);
+    }
     let count = u16::try_from(words.len()).map_err(|_| RequestError::Count)?;
     check_span(
         Series::Q,
         ReadSpan {
-            device: Device::D,
+            device,
             start: number,
             count,
         },
@@ -276,12 +296,16 @@ pub fn encode_q_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<
     out.extend_from_slice(&0x1401u16.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // Q word-unit subcommand
     out.extend_from_slice(&number.to_le_bytes()[..3]); // 24-bit Q address
-    out.push(Device::D.code());
+    out.push(device.code());
     out.extend_from_slice(&count.to_le_bytes());
     for word in words {
         out.extend_from_slice(&word.to_le_bytes());
     }
     Ok(out)
+}
+
+pub fn encode_q_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<u8>, RequestError> {
+    encode_q_dw_words(route, Device::D, number, words)
 }
 
 /// Preserve the separately gated Q25PRH four-word test frame.

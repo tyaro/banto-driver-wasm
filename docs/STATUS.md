@@ -1,5 +1,11 @@
 # STATUS
 
+## Local common-policy D/W u16 write stage (2026-10-26)
+
+- Separate worktree from merged main `a706f33fc0dc4e867f74cfdfa2fdc1223a3ec62f`. The existing saved `d_u16_write_mode` and `d_u16_write_allowlist` keys remain stable; their schema labels describe one SLMP write control and one area-qualified range list. Existing `D3010-D3013` settings still permit only D. A W range such as `W1A-W1F` must be explicitly included in that same list. There is no per-device enable switch.
+- D/W u16 writes share the 1401 word-run implementation. Standard R uses the same connection's SD280–283 counts; standard Q W uses its SD303 internal prefix. Complete ascending runs of 1–960 words, whole-item value checks, D3000/D3001 protection, ACK verification, and no automatic replay remain mandatory. Q25PRH W is not enabled in this branch because its SD303 path is being developed separately. Bit, word-bit, file/bank, timer/counter, and other numeric writes remain unsupported.
+- This is guest/core local work only. The Host's independent `operational_write_item` and saved-policy parser still accept D/u16 alone, so this component **cannot** be used for operational W writes until the matching Host contract is implemented and tested. Rust 1.98.1 local checks passed 36 core fixtures, 15 guest unit tests plus one doc test, and 26 controlled real Wasmtime fixtures; the WIT world remained unchanged. No real connection, saved production setting change, publication, or merge is included.
+
 ## Local remaining Q/R SLMP read stage (2026-10-26)
 
 - Based on merged main `ee37212dad37fae7e8f0052c0cb8e6827229b1eb`, in a dedicated worktree. Added ordinary Q/R timer and counter contact/coil bit tags and one-word current tags, R long timer/retentive timer/long counter `i32` current tags and R-only `LCS/LCC` bit tags, R hexadecimal serial-number `ZR` numeric tags, and hexadecimal-suffix `Dn.h/bit` reads from one D word. R retentive names are `STS/STC/STN`; Q uses `SS/SC/SN`. Long timer current reads use four response words for one logical timer, with only the first two forming the current value. See [device table and restrictions](../drivers/slmp/README.md#remaining-qr-read-devices-local-controlled-stage).

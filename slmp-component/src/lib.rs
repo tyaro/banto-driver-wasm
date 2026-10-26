@@ -1,4 +1,4 @@
-//! Binary 4E SLMP guest for numeric D and verified Q/R W reads, plus restricted D/u16 write.
+//! Binary 4E SLMP guest for numeric D/W reads and restricted common-policy D/W u16 writes.
 //! The host owns transport. Each connection owns its discovery evidence.
 
 use std::cell::{Cell, RefCell};
@@ -10,7 +10,7 @@ use banto_register_codec::{
 };
 use banto_slmp_read_core::{
     basic_sd_count, decode_read, decode_type_name, decode_write_ack,
-    encode_q25prh_d3010_3013_test_write, encode_q_d_words, encode_r_d_words, encode_read,
+    encode_q25prh_d3010_3013_test_write, encode_q_dw_words, encode_r_dw_words, encode_read,
     encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount,
     ReadSpan, ResponseError, Route, Series, TypeName, Values,
 };
@@ -56,6 +56,7 @@ struct SlmpConnection {
 #[derive(Clone)]
 struct PendingWrite {
     route: Route,
+    device: Device,
     number: u32,
     values: Vec<u16>,
 }
@@ -307,17 +308,30 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
     {
         errors.push(config::FieldError {
             key: MODE_KEY.into(),
-            message: "normal D/u16 mode and Q25PRH test mode cannot both be enabled".into(),
+            message: "normal SLMP write mode and Q25PRH test mode cannot both be enabled".into(),
         });
     }
     errors
 }
 
+#[cfg(test)]
 fn parse_d(text: &str, data_type: &str, words: Option<u32>) -> Result<u32, String> {
     if data_type != "u16" || words.is_some() {
         return Err("only single-word D u16 is supported".into());
     }
     parse_d_number(text)
+}
+
+fn parse_dw_write(
+    text: &str,
+    data_type: &str,
+    words: Option<u32>,
+) -> Result<(Device, u32), String> {
+    let (device, number, kind) = parse_read_address(text, data_type, words)?;
+    if !matches!(device, Device::D | Device::W) || kind != ReadKind::Numeric(DKind::U16) {
+        return Err("write requires a D or W u16 word tag".into());
+    }
+    Ok((device, number))
 }
 
 fn parse_read_d(text: &str, data_type: &str, words: Option<u32>) -> Result<(u32, DKind), String> {
@@ -1106,9 +1120,9 @@ impl write_v1::Guest for Component {
             let pending = conn.pending_write.borrow_mut().take().ok_or_else(|| {
                 FatalError::Protocol("write response without a pending request".into())
             })?;
-            let (number, values) = parse_write_run(&items)
+            let (device, number, values) = parse_write_run(&items)
                 .map_err(|_| FatalError::Protocol("write items changed after send".into()))?;
-            if number != pending.number || values != pending.values {
+            if device != pending.device || number != pending.number || values != pending.values {
                 return Err(FatalError::Protocol("write item changed after send".into()));
             }
             let len = items.len();
@@ -1147,7 +1161,7 @@ impl write_v1::Guest for Component {
         }
         if items.is_empty() {
             return Err(FatalError::InvalidConfig(
-                "write requires at least one D/u16 item".into(),
+                "write requires at least one D or W u16 item".into(),
             ));
         }
         let (model, count) = match &*conn.phase.borrow() {
@@ -1158,17 +1172,21 @@ impl write_v1::Guest for Component {
             && model.name == "Q25PRHCPU"
             && model.code == 0x004c;
         let q25prh_test = q25prh && conn.q25prh_test_write_enabled;
-        if model.family != ModelFamily::StandardR && !q25prh {
+        if !matches!(
+            model.family,
+            ModelFamily::StandardR | ModelFamily::StandardQ
+        ) && !q25prh
+        {
             return Ok(rejected_write_count(
                 items.len(),
-                "write requires confirmed StandardR or exact Q25PRHCPU / 004CH",
+                "write requires a confirmed Q/R model",
             ));
         }
-        let (number, values) = match parse_write_run(&items) {
+        let (device, number, values) = match parse_write_run(&items) {
             Ok(run) => run,
             Err(message) => return Ok(rejected_write_count(items.len(), &message)),
         };
-        if q25prh_test && (number != 3010 || values.len() != 4) {
+        if q25prh_test && (device != Device::D || number != 3010 || values.len() != 4) {
             return Ok(rejected_write_count(
                 items.len(),
                 "Q25PRH test write requires exactly D3010..D3013/u16",
@@ -1180,27 +1198,40 @@ impl write_v1::Guest for Component {
                 "Q25PRH SD302 does not confirm the full D3010..D3013 test span",
             ));
         }
-        if !q25prh_test && !conn.write_policy.allows_span(number, values.len()) {
+        if !q25prh_test
+            && !conn
+                .write_policy
+                .allows_device_span(device, number, values.len())
+        {
             return Ok(rejected_write_count(
                 items.len(),
-                "D span is outside the enabled connection allowlist",
+                "device span is outside the enabled connection allowlist",
             ));
         }
         if !q25prh_test {
             let proven = if model.family == ModelFamily::StandardR {
-                assess_d_span(&model, count, number, values.len() as u16)
+                let area_count = if device == Device::D {
+                    count
+                } else {
+                    conn.w_count.get()
+                };
+                assess_d_span(&model, area_count, number, values.len() as u16)
                     == RangeAssessment::VerifiedInside
-            } else {
+            } else if model.family == ModelFamily::StandardQ && device == Device::W {
+                count_guarantees_span(conn.w_count.get(), number, values.len() as u16)
+            } else if q25prh && device == Device::D {
                 count_guarantees_span(
                     conn.q25prh_internal_d_count.get(),
                     number,
                     values.len() as u16,
                 )
+            } else {
+                false
             };
             if !proven {
                 return Ok(rejected_write_count(
                     items.len(),
-                    "D span is not within the same-connection SD range",
+                    "device span is not within the same-connection SD range",
                 ));
             }
         }
@@ -1210,16 +1241,17 @@ impl write_v1::Guest for Component {
             let words: [u16; 4] = values.as_slice().try_into().expect("checked Q test width");
             encode_q25prh_d3010_3013_test_write(route, words)
         } else if model.family == ModelFamily::StandardR {
-            encode_r_d_words(route, number, &values).map_err(|_| {
+            encode_r_dw_words(route, device, number, &values).map_err(|_| {
                 FatalError::Protocol("validated write span cannot be encoded".into())
             })?
         } else {
-            encode_q_d_words(route, number, &values).map_err(|_| {
+            encode_q_dw_words(route, device, number, &values).map_err(|_| {
                 FatalError::Protocol("validated Q write span cannot be encoded".into())
             })?
         };
         *conn.pending_write.borrow_mut() = Some(PendingWrite {
             route,
+            device,
             number,
             values,
         });
@@ -1235,21 +1267,25 @@ fn valid_word(value: f64) -> bool {
 }
 
 /// Validate the entire request before assigning a serial or producing a frame.
-fn parse_write_run(items: &[write_v1::WriteItem]) -> Result<(u32, Vec<u16>), String> {
+fn parse_write_run(items: &[write_v1::WriteItem]) -> Result<(Device, u32, Vec<u16>), String> {
     if items.is_empty() || items.len() > 960 {
-        return Err("write requires 1..=960 D/u16 words".into());
+        return Err("write requires 1..=960 consecutive D or W u16 words".into());
     }
     let mut start = None;
+    let mut area = None;
     let mut values = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
-        let number = parse_d(
+        let (device, number) = parse_dw_write(
             &item.spec.address,
             &item.spec.data_type,
             item.spec.string_words,
         )?;
+        if area.get_or_insert(device) != &device {
+            return Err("write items must be in one device area".into());
+        }
         let first = *start.get_or_insert(number);
         if first.checked_add(index as u32) != Some(number) {
-            return Err("D write items must be consecutive and ascending".into());
+            return Err("write items must be consecutive and ascending".into());
         }
         let Value::Float(value) = item.value else {
             return Err("write value must be a finite integer in 0..65535".into());
@@ -1259,7 +1295,11 @@ fn parse_write_run(items: &[write_v1::WriteItem]) -> Result<(u32, Vec<u16>), Str
         }
         values.push(value as u16);
     }
-    Ok((start.expect("nonempty request"), values))
+    Ok((
+        area.expect("nonempty request"),
+        start.expect("nonempty request"),
+        values,
+    ))
 }
 
 fn rejected_write_count(len: usize, message: &str) -> write_v1::WriteProgress {
@@ -1313,9 +1353,10 @@ impl address::Guest for Component {
                 Device::ZR => "ZR",
             }
             .into(),
-            // The existing write extension remains restricted to D/u16.
+            // Static capability only; the common setting, SD proof and Host gate still decide writes.
             // write-next also requires StandardR and a verified range.
-            writable_area: device == Device::D && kind == ReadKind::Numeric(DKind::U16),
+            writable_area: matches!(device, Device::D | Device::W)
+                && kind == ReadKind::Numeric(DKind::U16),
             bit: if let ReadKind::WordBit(bit) = kind {
                 Some(bit)
             } else {
@@ -1401,7 +1442,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Writes remain D/u16 only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Local write support is D/W u16 only and still requires a matching Host gate"
             .into()
     }
 
@@ -1485,8 +1526,8 @@ impl config::Guest for Component {
             },
             SettingField {
                 key: MODE_KEY.into(),
-                label: "D/u16 write mode".into(),
-                help: Some("Normal Q25PRH or StandardR D/u16 writes require an explicit connection allowlist, same-connection SD proof, and a separate Host write gate. Default is disabled.".into()),
+                label: "SLMP write mode".into(),
+                help: Some("D/W u16 writes require one explicit connection allowlist, same-connection area SD proof, and a separate Host write gate. Default is disabled. Other device writes remain unsupported.".into()),
                 kind: FieldKind::Choice(vec![
                     ChoiceOption {
                         value: "disabled".into(),
@@ -1503,11 +1544,11 @@ impl config::Guest for Component {
             },
             SettingField {
                 key: ALLOWLIST_KEY.into(),
-                label: "D/u16 write allowlist".into(),
-                help: Some("Comma-separated ascending, nonoverlapping decimal ranges, such as D3010-D3013,D4000-D4009. Up to 16 ranges of 1..960 words; D3000 and D3001 are protected.".into()),
+                label: "SLMP writable ranges".into(),
+                help: Some("Comma-separated nonoverlapping D decimal and W hexadecimal ranges, such as D3010-D3013,W1A-W1F. Up to 16 ranges of 1..960 words; D3000 and D3001 are protected. The saved setting keys remain compatible.".into()),
                 kind: FieldKind::Text(TextSpec {
                     max_len: Some(256),
-                    placeholder: Some("D3010-D3013,D4000-D4009".into()),
+                    placeholder: Some("D3010-D3013,W1A-W1F".into()),
                 }),
                 required: false,
                 default: Some(SettingValue::Text(String::new())),
@@ -1520,6 +1561,31 @@ impl config::Guest for Component {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_write_run_checks_area_order_and_complete_values() {
+        let item = |address: &str, value: f64| write_v1::WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Float(value),
+        };
+        assert_eq!(
+            parse_write_run(&[item("W1A", 1.0), item("W1B", 65535.0)]),
+            Ok((Device::W, 0x1a, vec![1, 65535]))
+        );
+        for run in [
+            vec![item("W1A", 1.0), item("D27", 2.0)],
+            vec![item("W1B", 1.0), item("W1A", 2.0)],
+            vec![item("W1A", 1.0), item("W1C", 2.0)],
+            vec![item("W1A", f64::NAN)],
+            vec![item("W1A", 65536.0)],
+        ] {
+            assert!(parse_write_run(&run).is_err());
+        }
+    }
 
     fn model(family: ModelFamily) -> TypeName {
         TypeName {
@@ -1850,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn r_w_hex_address_is_read_only_and_checks_complete_tag() {
+    fn r_w_hex_address_is_static_u16_writable_and_checks_complete_tag() {
         let r = model(ModelFamily::StandardR);
         let spec = TagSpec {
             address: "W1E".into(),
@@ -1886,7 +1952,7 @@ mod tests {
             <Component as address::Guest>::parse("W0a".into(), "u16".into(), None).unwrap();
         assert_eq!(parsed.canonical, "WA");
         assert_eq!(parsed.area, "W");
-        assert!(!parsed.writable_area);
+        assert!(parsed.writable_area);
         assert_eq!(
             <Component as address::Guest>::offset("WA".into(), "i32".into(), None, 1).unwrap(),
             "WC"

@@ -600,6 +600,111 @@ mod tests {
     }
 
     #[test]
+    fn common_allowlist_w_write_uses_same_sd_evidence_and_word_ack() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        for (name, code, sd, code_offset, subcommand) in [
+            (
+                "R04CPU",
+                0x4800,
+                [100, 0, 0, 0, 32, 0, 0, 0].to_vec(),
+                23,
+                [2, 0],
+            ),
+            ("Q02UCPU", 0x0263, [100, 0, 32, 0].to_vec(), 22, [0, 0]),
+        ] {
+            let settings = [
+                Setting {
+                    key: "host".into(),
+                    value: "fixture.invalid".into(),
+                },
+                Setting {
+                    key: "port".into(),
+                    value: "5000".into(),
+                },
+                Setting {
+                    key: "d_u16_write_mode".into(),
+                    value: "enabled".into(),
+                },
+                Setting {
+                    key: "d_u16_write_allowlist".into(),
+                    value: "D3010-D3013,W1A-W1F".into(),
+                },
+            ];
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings)?
+                .expect("common settings");
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101");
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+                .expect("SD");
+            let item = |address: &str, value: f64| WriteItem {
+                spec: TagSpec {
+                    address: address.into(),
+                    data_type: "u16".into(),
+                    string_words: None,
+                },
+                value: Value::Float(value),
+            };
+            let items = [item("W1A", 1.0), item("W1B", 2.0)];
+            let before_sd = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("SD evidence required");
+            assert!(
+                matches!(before_sd, WriteProgress::Done(results) if results.len() == 2 && results.iter().all(Result::is_err))
+            );
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&response(2, &sd)))?
+                .expect("ready");
+            let send = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("W write preflight");
+            let WriteProgress::Send(plan) = send else {
+                panic!("verified W range should send")
+            };
+            assert_eq!(plan.covers, [0, 1]);
+            assert_eq!(&plan.step.send[17..19], &subcommand);
+            assert_eq!(plan.step.send[code_offset], 0xb4);
+            assert_eq!(&plan.step.send[2..4], &[3, 0]);
+            let done = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, Some(&response(3, &[])))?
+                .expect("ACK");
+            assert!(
+                matches!(done, WriteProgress::Done(results) if results.len() == 2 && results.iter().all(Result::is_ok))
+            );
+            let outside = [item("W1F", 1.0), item("W20", 2.0)];
+            let refused = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &outside, None)?
+                .expect("whole-span refusal");
+            assert!(
+                matches!(refused, WriteProgress::Done(results) if results.len() == 2 && results.iter().all(Result::is_err))
+            );
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn q25prh_test_write_requires_opt_in_exact_pair_and_fixed_four_words() -> wasmtime::Result<()> {
         use write_host::banto::driver::types::{Setting, TagSpec, Value};
         use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
