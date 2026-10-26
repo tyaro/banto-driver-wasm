@@ -185,19 +185,33 @@ pub fn encode_r_d_write(route: Route, number: u32, value: u16) -> Vec<u8> {
     encode_r_d_words(route, number, &[value]).expect("one D word fits a 4E request")
 }
 
-/// Test-only Q25PRH wire frame for exactly D3010..D3013. The guest must
-/// establish the exact 0101 name/code pair and a separate opt-in before use.
-pub fn encode_q25prh_d3010_3013_test_write(route: Route, words: [u16; 4]) -> Vec<u8> {
-    let mut out = request_head(route, 20);
+/// Build one binary 4E Q word write (1401/0000) for contiguous D points.
+/// The caller must establish the exact CPU model and configured D span first.
+pub fn encode_q_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<u8>, RequestError> {
+    let count = u16::try_from(words.len()).map_err(|_| RequestError::Count)?;
+    check_span(
+        Series::Q,
+        ReadSpan {
+            device: Device::D,
+            start: number,
+            count,
+        },
+    )?;
+    let mut out = request_head(route, 12 + count * 2);
     out.extend_from_slice(&0x1401u16.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // Q word-unit subcommand
-    out.extend_from_slice(&[0xc2, 0x0b, 0]); // D3010, 24-bit Q address
+    out.extend_from_slice(&number.to_le_bytes()[..3]); // 24-bit Q address
     out.push(Device::D.code());
-    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
     for word in words {
         out.extend_from_slice(&word.to_le_bytes());
     }
-    out
+    Ok(out)
+}
+
+/// Preserve the separately gated Q25PRH four-word test frame.
+pub fn encode_q25prh_d3010_3013_test_write(route: Route, words: [u16; 4]) -> Vec<u8> {
+    encode_q_d_words(route, 3010, &words).expect("fixed Q25PRH test frame fits")
 }
 
 /// A successful 1401 response has no data after its end code.

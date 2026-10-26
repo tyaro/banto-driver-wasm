@@ -48,6 +48,7 @@ const allowed = new Set([
   'slmp-component/Cargo.toml',
   'slmp-component/Cargo.lock',
   'slmp-component/src/lib.rs',
+  'slmp-component/src/write_policy.rs',
   'slmp-runtime/Cargo.toml',
   'slmp-runtime/Cargo.lock',
   'slmp-runtime/src/lib.rs',
