@@ -155,17 +155,34 @@ pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u
     Ok(out)
 }
 
-/// Build one binary 4E iQ-R word write (1401/0002) for a single D point.
+/// Build one binary 4E iQ-R word write (1401/0002) for contiguous D points.
 /// The caller must establish the CPU model and configured D range first.
-pub fn encode_r_d_write(route: Route, number: u32, value: u16) -> Vec<u8> {
-    let mut out = request_head(route, 16);
+pub fn encode_r_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<u8>, RequestError> {
+    let count = u16::try_from(words.len()).map_err(|_| RequestError::Count)?;
+    check_span(
+        Series::R,
+        ReadSpan {
+            device: Device::D,
+            start: number,
+            count,
+        },
+    )?;
+    let data_length = 14 + count * 2; // 960 words fit in the 4E length field.
+    let mut out = request_head(route, data_length);
     out.extend_from_slice(&0x1401u16.to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
     out.extend_from_slice(&number.to_le_bytes());
     out.extend_from_slice(&[Device::D.code(), 0]);
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&value.to_le_bytes());
-    out
+    out.extend_from_slice(&count.to_le_bytes());
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Preserve the original single-point API for its existing callers.
+pub fn encode_r_d_write(route: Route, number: u32, value: u16) -> Vec<u8> {
+    encode_r_d_words(route, number, &[value]).expect("one D word fits a 4E request")
 }
 
 /// A successful 1401 response has no data after its end code.
