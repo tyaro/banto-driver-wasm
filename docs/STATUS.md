@@ -8,7 +8,7 @@
 
 ## SLMP M/X/Y/B bit-read stage (2026-10-26)
 
-- Dedicated worktree `D:\develop\worktrees\banto-driver-wasm-slmp-bit-mxyb` starts at merged main `c5ce7477b75f2d7dd263936b4fad21b3fa4e0a27`. It adds read-only `bit` tags for M decimal and X/Y/B hexadecimal device points; existing WIT, D/W numeric reads, and D/u16-only write gates remain unchanged.
+- This stage starts at merged main `c5ce7477b75f2d7dd263936b4fad21b3fa4e0a27`. It adds read-only `bit` tags for M decimal and X/Y/B hexadecimal device points; existing WIT, D/W numeric reads, and D/u16-only write gates remain unchanged.
 - The current 0101/SD handshake obtains D/W counts, not bit-area counts. Explicit M/X/Y/B reads therefore remain range-Unknown and use one 0401 bit-unit request per tag, including Q25PRH. Local verification with Rust 1.98.1 passed: SLMP core 33 fixtures, guest 10 unit tests plus 1 doc test, real Wasmtime component 22 fixtures, Clippy for all three crates, core wasm32 check, unchanged WIT old and write-v1 world target checks, scaffold and CI classification guards (17 cases), and `git diff --check`. No Hub integration or PLC communication was performed.
 
 ## Local normal D/u16 write policy (verified simulation, 2026-10-26)
