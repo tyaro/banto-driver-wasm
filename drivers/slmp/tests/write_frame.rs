@@ -1,7 +1,7 @@
 use banto_slmp_read_core::{
-    decode_write_ack, encode_q25prh_d3010_3013_test_write, encode_q_d_words, encode_q_dw_words,
-    encode_r_d_words, encode_r_d_write, encode_r_dw_words, Device, RequestError, ResponseError,
-    Route,
+    decode_write_ack, encode_bits, encode_q25prh_d3010_3013_test_write, encode_q_d_words,
+    encode_q_dw_words, encode_r_d_words, encode_r_d_write, encode_r_dw_words, Device, RequestError,
+    ResponseError, Route, Series,
 };
 
 // Binary 4E, 1401/0002, D31=0x1234; independently transcribed from the
@@ -30,6 +30,74 @@ const Q_W1A_TWO_WRITE: [u8; 29] = [
     0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 16, 0, 0x10, 0, 1, 0x14, 0, 0, 0x1a, 0, 0, 0xb4, 2,
     0, 1, 0, 2, 0,
 ];
+
+// Independent 4E bit-unit fixtures, M100..M102 = on, off, on. The last
+// unused low nibble is zero. Q uses 0001 and R uses 0003.
+const Q_M100_THREE_BITS: [u8; 27] = [
+    0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 14, 0, 0x10, 0, 1, 0x14, 1, 0, 100, 0, 0, 0x90, 3, 0,
+    0x10, 0x10,
+];
+const R_M100_THREE_BITS: [u8; 29] = [
+    0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 16, 0, 0x10, 0, 1, 0x14, 3, 0, 100, 0, 0, 0, 0x90, 0,
+    3, 0, 0x10, 0x10,
+];
+
+#[test]
+fn bit_write_matches_q_r_fixtures_and_rejects_unsupported_device_or_span() {
+    let bits = [true, false, true];
+    assert_eq!(
+        encode_bits(Route::default(), Series::Q, Device::M, 100, &bits),
+        Ok(Q_M100_THREE_BITS.to_vec())
+    );
+    assert_eq!(
+        encode_bits(Route::default(), Series::R, Device::M, 100, &bits),
+        Ok(R_M100_THREE_BITS.to_vec())
+    );
+    assert_eq!(
+        encode_bits(Route::default(), Series::R, Device::X, 100, &bits),
+        Err(RequestError::DeviceNumber)
+    );
+    assert_eq!(
+        encode_bits(Route::default(), Series::R, Device::M, 100, &[]),
+        Err(RequestError::Count)
+    );
+    assert_eq!(
+        encode_bits(Route::default(), Series::Q, Device::M, 0x00ff_ffff, &bits),
+        Err(RequestError::DeviceNumber)
+    );
+    assert!(encode_bits(Route::default(), Series::R, Device::M, 0, &[false; 7168]).is_ok());
+    assert_eq!(
+        encode_bits(Route::default(), Series::R, Device::M, 0, &[false; 7169]),
+        Err(RequestError::Count)
+    );
+    for (series, device, number, tail) in [
+        (
+            Series::Q,
+            Device::Y,
+            0x1a,
+            &vec![0x1a, 0, 0, 0x9d, 2, 0, 0x10],
+        ),
+        (
+            Series::Q,
+            Device::B,
+            0x2f,
+            &vec![0x2f, 0, 0, 0xa0, 2, 0, 0x10],
+        ),
+        (
+            Series::R,
+            Device::L,
+            10,
+            &vec![10, 0, 0, 0, 0x92, 0, 2, 0, 0x10],
+        ),
+    ] {
+        let frame = encode_bits(Route::default(), series, device, number, &[true, false]).unwrap();
+        assert_eq!(
+            &frame[frame.len() - tail.len()..],
+            tail,
+            "{series:?} {device:?}"
+        );
+    }
+}
 
 #[test]
 fn common_word_write_keeps_d_bytes_and_encodes_r_q_w() {

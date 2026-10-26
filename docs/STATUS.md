@@ -1,6 +1,13 @@
 # STATUS
 
-## Local common-policy D/W u16 write stage (2026-10-26)
+## Local typed-word and bit-write stage (2026-10-26, unpublished)
+
+- Based on merged main `9c7d9ec87a467be779e94b0dd3670e566f2e917c`, an isolated worktree extends the existing disabled-by-default common write policy without changing WIT. D/W accept numeric `i16/u16/i32/u32/i64/u64/f32/f64` with full 1/2/4-word spans and both word orders. M/Y/L/B accept Bool bit points with Q/R 1401 bit-unit frames. Existing saved D/W ranges do not grant bit access; D3000/D3001 protection, preflight of the entire request, and no replay after an uncertain ACK remain.
+- An enabled policy with a bit interval triggers same-connection Q SD290-294 or R SD262-275 after 0101 and the existing D/W count request. Bit writes require a confirmed standard Q/R model, their own configured point count, and one complete allowed interval. Refused or missing count remains Unknown and rejects the write. Q25PRH W/bit, X/input, special bit areas, timer/counter writes, word-bit RMW and bank switching are not enabled.
+- The current Host still independently accepts only D/W u16 operational writes. Guest capability metadata does not authorize Host or production writes. This is local core/guest/controlled Wasmtime work only; no PLC/DB communication, saved production setting change, commit, push, PR or merge is included.
+- Local verification: Rust 1.98.1 core and guest suites, 30 controlled Wasmtime cases, Clippy/fmt on all three SLMP crates, wasm32 component validation and both unchanged WIT-world target checks, scaffold guard, CI classification tests (17), and `git diff --check` passed. Core fixtures include independent Q/R bit-write bytes; runtime fixtures include confirmed M/Y/L/B bit counts, refused SD, mixed-width D and Q-internal-W writes, tag covers, and the prior read/write behavior. Hub integration and live PLC behavior remain untested.
+
+## Previous local common-policy D/W u16 write stage (2026-10-26)
 
 - Separate worktree from merged main `a706f33fc0dc4e867f74cfdfa2fdc1223a3ec62f`. The existing saved `d_u16_write_mode` and `d_u16_write_allowlist` keys remain stable; their schema labels describe one SLMP write control and one area-qualified range list. Existing `D3010-D3013` settings still permit only D. A W range such as `W1A-W1F` must be explicitly included in that same list. There is no per-device enable switch.
 - D/W u16 writes share the 1401 word-run implementation. Standard R uses the same connection's SD280–283 counts; standard Q W uses its SD303 internal prefix. Complete ascending runs of 1–960 words, whole-item value checks, D3000/D3001 protection, ACK verification, and no automatic replay remain mandatory. Q25PRH W writes remain disabled; its SD303 read path does not change the write gate. Bit, word-bit, file/bank, timer/counter, and other numeric writes remain unsupported.

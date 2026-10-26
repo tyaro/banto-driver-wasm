@@ -1,4 +1,4 @@
-//! Binary 4E SLMP read (0401) and restricted iQ-R D/u16 write (1401) framing.
+//! Binary 4E SLMP read (0401) and bounded Q/R word or bit write (1401) framing.
 //! This core does no I/O or configured-range lookup; the guest gates writes.
 #![no_std]
 
@@ -311,6 +311,47 @@ pub fn encode_q_dw_words(
 
 pub fn encode_q_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<u8>, RequestError> {
     encode_q_dw_words(route, Device::D, number, words)
+}
+
+/// Build one binary 4E bit-unit write. Model and configured point counts must
+/// be checked by the caller before this wire-only function is used.
+pub fn encode_bits(
+    route: Route,
+    series: Series,
+    device: Device,
+    number: u32,
+    bits: &[bool],
+) -> Result<Vec<u8>, RequestError> {
+    if !matches!(device, Device::M | Device::Y | Device::L | Device::B) {
+        return Err(RequestError::DeviceNumber);
+    }
+    let count = u16::try_from(bits.len()).map_err(|_| RequestError::Count)?;
+    check_span(
+        series,
+        ReadSpan {
+            device,
+            start: number,
+            count,
+        },
+    )?;
+    let bit_bytes = count.div_ceil(2);
+    let data_length = if series == Series::Q { 12 } else { 14 } + bit_bytes;
+    let mut out = request_head(route, data_length);
+    out.extend_from_slice(&0x1401u16.to_le_bytes());
+    out.extend_from_slice(&(if series == Series::Q { 1u16 } else { 3u16 }).to_le_bytes());
+    let address = number.to_le_bytes();
+    out.extend_from_slice(&address[..if series == Series::Q { 3 } else { 4 }]);
+    out.push(device.code());
+    if series == Series::R {
+        out.push(0);
+    }
+    out.extend_from_slice(&count.to_le_bytes());
+    for pair in bits.chunks(2) {
+        out.push(
+            (if pair[0] { 0x10 } else { 0 }) | (if pair.get(1) == Some(&true) { 1 } else { 0 }),
+        );
+    }
+    Ok(out)
 }
 
 /// Preserve the separately gated Q25PRH four-word test frame.
