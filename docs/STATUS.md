@@ -1,5 +1,11 @@
 # STATUS
 
+## Controlled simulation: contiguous StandardR D/u16 write (2026-10-26)
+
+- This range-write stage starts at main `fd0db137139b25f2055ce5019cc1fea4bd0eafdc` (merged FC4/W PR #21). The FC4/W read behavior is retained; its reviewed head is unchanged.
+- The optional write-v1 guest now validates an entire 1–960 item consecutive ascending D/u16 run against the exact StandardR SD280-281 D count, then produces one 1401/0002 frame. It preserves the single-item path and existing WIT. Gaps, duplicates, reversed or out-of-range addresses, unsupported types, and invalid values reject all items before sending. ACK/refusal maps to every cover; a pending write or uncertain ACK cannot be resent on that connection.
+- The independent four-word D3010–D3013 frame fixture and controlled Wasmtime loopback passed, including simulated readback, whole-run rejection, device refusal, wrong-serial ACK, and pending retry rejection. Core fixture tests, 18 Wasmtime runtime tests, wasm32 component build/validation, both WIT world target checks, formatting, and core/guest/runtime Clippy passed. This is **not** an actual PLC write or Hub integration. The controlled Host fixture remains D3010/u16 single-item only, and production write is disabled. Real range write requires separate target/value/restoration approval.
+
 ## Stage 2: numeric reads in Modbus FC3 and SLMP D (2026-10-26)
 
 - Based on main `0cc29009504651c2ec58012d64157cc0f2201102`, this change adds typed `i16/u16/i32/u32/i64/u64/f32/f64` read decoding to the two existing guests using the fixed shared codec rev. The existing WIT `int/uint/float` variants and downstream `f64` projection remain unchanged; 64-bit integer values beyond `2^53` can lose precision after that projection. No PLC or DB operation is part of this stage.

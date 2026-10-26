@@ -214,12 +214,14 @@ mod tests {
                 matches!(outcome, WriteProgress::Done(items) if matches!(items.as_slice(), [Err(_)]))
             );
         }
+        let duplicate = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &[item.clone(), item.clone()], None)?
+            .expect("duplicate preflight");
         assert!(
-            driver
-                .banto_driver_write_v1()
-                .call_write_next(&mut store, conn, &[item.clone(), item.clone()], None)?
-                .is_err(),
-            "multiple items reject before send"
+            matches!(duplicate, WriteProgress::Done(results)
+            if results.len() == 2 && results.iter().all(Result::is_err)),
+            "duplicate addresses reject the entire request before send"
         );
         let next = driver
             .banto_driver_write_v1()
@@ -329,6 +331,199 @@ mod tests {
             );
             conn.resource_drop(&mut store)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn four_word_write_loopback_preflights_and_maps_all_items() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{ItemError, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(
+                &mut store,
+                &settings()
+                    .into_iter()
+                    .map(|s| write_host::banto::driver::types::Setting {
+                        key: s.key,
+                        value: s.value,
+                    })
+                    .collect::<Vec<_>>(),
+            )?
+            .expect("settings");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101")
+            .is_some());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("SD280-283")
+            .is_some());
+        let mut sd_counts = 3014u32.to_le_bytes().to_vec();
+        sd_counts.extend_from_slice(&8192u32.to_le_bytes());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(2, &sd_counts)))?
+            .expect("ready")
+            .is_none());
+        let items: Vec<WriteItem> = (0..4)
+            .map(|i| WriteItem {
+                spec: TagSpec {
+                    address: format!("D{}", 3010 + i),
+                    data_type: "u16".into(),
+                    string_words: None,
+                },
+                value: Value::Float(f64::from(i + 1)),
+            })
+            .collect();
+        let invalid_runs = vec![
+            vec![items[0].clone(), items[2].clone()], // hole
+            vec![items[0].clone(), items[0].clone()], // duplicate
+            vec![items[1].clone(), items[0].clone()], // reverse
+            vec![
+                items[1].clone(),
+                items[2].clone(),
+                items[3].clone(),
+                WriteItem {
+                    spec: TagSpec {
+                        address: "D3014".into(),
+                        ..items[0].spec.clone()
+                    },
+                    ..items[0].clone()
+                },
+            ], // last point outside verified SD count
+            vec![
+                items[0].clone(),
+                WriteItem {
+                    value: Value::Float(f64::NAN),
+                    ..items[1].clone()
+                },
+            ],
+            vec![
+                items[0].clone(),
+                WriteItem {
+                    spec: TagSpec {
+                        data_type: "u32".into(),
+                        ..items[1].spec.clone()
+                    },
+                    ..items[1].clone()
+                },
+            ],
+        ];
+        for invalid in invalid_runs {
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &invalid, None)?
+                .expect("preflight");
+            assert!(matches!(outcome, WriteProgress::Done(results)
+                if results.len() == invalid.len() && results.iter().all(Result::is_err)));
+        }
+        let too_many = vec![items[0].clone(); 961];
+        let over_limit = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &too_many, None)?
+            .expect("word limit preflight");
+        assert!(matches!(over_limit, WriteProgress::Done(results)
+            if results.len() == 961 && results.iter().all(Result::is_err)));
+        assert!(driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &[], None)?
+            .is_err());
+        let progress = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("valid group");
+        let WriteProgress::Send(plan) = progress else {
+            panic!("expected one grouped request")
+        };
+        assert_eq!(plan.covers, [0, 1, 2, 3]);
+        assert_eq!(
+            &plan.step.send[2..4],
+            &[3, 0],
+            "rejected runs did not use serials"
+        );
+        assert_eq!(&plan.step.send[11..13], &[22, 0]);
+        assert_eq!(
+            &plan.step.send[15..],
+            &[1, 0x14, 2, 0, 0xc2, 0x0b, 0, 0, 0xa8, 0, 4, 0, 1, 0, 2, 0, 3, 0, 4, 0,]
+        );
+        // A local PLC loopback applies only this one frame; no socket is opened.
+        let memory = plan.step.send[27..].to_vec();
+        let done = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, Some(&response(3, &[])))?
+            .expect("ACK");
+        assert!(matches!(done, WriteProgress::Done(results)
+            if results.len() == 4 && results.iter().all(Result::is_ok)));
+        let specs: Vec<TagSpec> = items.iter().map(|item| item.spec.clone()).collect();
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("readback plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].covers, [0, 1, 2, 3]);
+        let readback = driver
+            .banto_driver_read()
+            .call_decode(&mut store, conn, &plans[0], &specs, &response(4, &memory))?
+            .expect("loopback readback");
+        assert!(matches!(
+            readback.as_slice(),
+            [
+                Ok(Value::Uint(1)),
+                Ok(Value::Uint(2)),
+                Ok(Value::Uint(3)),
+                Ok(Value::Uint(4))
+            ]
+        ));
+        let second = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("second group");
+        assert!(matches!(second, WriteProgress::Send(_)));
+        let mut refused = response(5, &[]);
+        refused[13..15].copy_from_slice(&0xc051u16.to_le_bytes());
+        let result = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, Some(&refused))?
+            .expect("device refusal");
+        assert!(matches!(result, WriteProgress::Done(results)
+            if results.len() == 4 && results.iter().all(|r| matches!(r, Err(ItemError::Device(e)) if e.code == 0xc051))));
+        let third = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("third group");
+        assert!(matches!(third, WriteProgress::Send(_)));
+        assert!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .is_err(),
+            "pending write cannot be resent"
+        );
+        assert!(driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, Some(&response(99, &[])))?
+            .is_err());
+        assert!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .is_err(),
+            "uncertain ACK poisons session"
+        );
+        conn.resource_drop(&mut store)?;
         Ok(())
     }
 

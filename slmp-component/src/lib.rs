@@ -9,7 +9,7 @@ use banto_register_codec::{
     decode_f32, decode_f64, decode_i16, decode_i32, decode_i64, decode_u32, decode_u64, WordOrder,
 };
 use banto_slmp_read_core::{
-    basic_sd_count, decode_read, decode_type_name, decode_write_ack, encode_r_d_write, encode_read,
+    basic_sd_count, decode_read, decode_type_name, decode_write_ack, encode_r_d_words, encode_read,
     encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount,
     ReadSpan, ResponseError, Route, Series, TypeName, Values,
 };
@@ -47,11 +47,11 @@ struct SlmpConnection {
     write_poisoned: Cell<bool>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingWrite {
     route: Route,
     number: u32,
-    value: u16,
+    values: Vec<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,6 +290,7 @@ enum RangeAssessment {
     Unknown,
 }
 
+#[cfg(test)]
 fn assess_d(model: &TypeName, count: PointCount, number: u32) -> RangeAssessment {
     assess_d_span(model, count, number, 1)
 }
@@ -737,47 +738,37 @@ impl write_v1::Guest for Component {
         prev_response: Option<Vec<u8>>,
     ) -> Result<write_v1::WriteProgress, FatalError> {
         let conn = conn.get::<SlmpConnection>();
-        if items.len() != 1 {
-            if conn.pending_write.borrow().is_some() {
-                conn.write_poisoned.set(true);
-            }
-            return Err(FatalError::InvalidConfig(
-                "exactly one D/u16 write item is required".into(),
-            ));
-        }
-        let item = &items[0];
         if let Some(response) = prev_response {
             // Consume before parsing so a malformed or refused ACK cannot be retried.
             conn.write_poisoned.set(true);
             let pending = conn.pending_write.borrow_mut().take().ok_or_else(|| {
                 FatalError::Protocol("write response without a pending request".into())
             })?;
-            let number = parse_d(
-                &item.spec.address,
-                &item.spec.data_type,
-                item.spec.string_words,
-            )
-            .map_err(FatalError::Protocol)?;
-            let value = match item.value {
-                Value::Float(value) if valid_word(value) => value as u16,
-                _ => return Err(FatalError::Protocol("write item changed after send".into())),
-            };
-            if number != pending.number || value != pending.value {
+            let (number, values) = parse_write_run(&items)
+                .map_err(|_| FatalError::Protocol("write items changed after send".into()))?;
+            if number != pending.number || values != pending.values {
                 return Err(FatalError::Protocol("write item changed after send".into()));
             }
+            let len = items.len();
             return match decode_write_ack(pending.route, &response) {
                 Ok(()) => {
                     conn.write_poisoned.set(false);
-                    Ok(write_v1::WriteProgress::Done(vec![Ok(())]))
+                    Ok(write_v1::WriteProgress::Done(
+                        (0..len).map(|_| Ok(())).collect(),
+                    ))
                 }
                 Err(ResponseError::EndCode(code)) => {
                     conn.write_poisoned.set(false);
-                    Ok(write_v1::WriteProgress::Done(vec![Err(ItemError::Device(
-                        banto::driver::types::DeviceError {
-                            code: u32::from(code),
-                            message: format!("SLMP end code 0x{code:04X}"),
-                        },
-                    ))]))
+                    Ok(write_v1::WriteProgress::Done(
+                        (0..len)
+                            .map(|_| {
+                                Err(ItemError::Device(banto::driver::types::DeviceError {
+                                    code: u32::from(code),
+                                    message: format!("SLMP end code 0x{code:04X}"),
+                                }))
+                            })
+                            .collect(),
+                    ))
                 }
                 Err(error) => Err(response_error(error)),
             };
@@ -792,47 +783,44 @@ impl write_v1::Guest for Component {
                 "a response is pending on this connection".into(),
             ));
         }
+        if items.is_empty() {
+            return Err(FatalError::InvalidConfig(
+                "write requires at least one D/u16 item".into(),
+            ));
+        }
         let (model, count) = match &*conn.phase.borrow() {
             Phase::Ready { model, count } => (model.clone(), *count),
             _ => return Ok(rejected_write("discovery is incomplete")),
         };
         if model.family != ModelFamily::StandardR {
-            return Ok(rejected_write(
+            return Ok(rejected_write_count(
+                items.len(),
                 "write requires a confirmed standard iQ-R CPU",
             ));
         }
-        let number = match parse_d(
-            &item.spec.address,
-            &item.spec.data_type,
-            item.spec.string_words,
-        ) {
-            Ok(number) => number,
-            Err(_) => return Ok(rejected_write("only single D/u16 is supported")),
+        let (number, values) = match parse_write_run(&items) {
+            Ok(run) => run,
+            Err(message) => return Ok(rejected_write_count(items.len(), &message)),
         };
-        if assess_d(&model, count, number) != RangeAssessment::VerifiedInside {
-            return Ok(rejected_write("D address is not within the verified range"));
-        }
-        let Value::Float(value) = item.value else {
-            return Ok(rejected_write(
-                "write value must be a finite integral float",
-            ));
-        };
-        if !valid_word(value) {
-            return Ok(rejected_write(
-                "write value must be a finite integer in 0..65535",
+        if assess_d_span(&model, count, number, values.len() as u16)
+            != RangeAssessment::VerifiedInside
+        {
+            return Ok(rejected_write_count(
+                items.len(),
+                "D span is not within the verified range",
             ));
         }
-        let value = value as u16;
         let route = conn.route();
-        let send = encode_r_d_write(route, number, value);
+        let send = encode_r_d_words(route, number, &values)
+            .map_err(|_| FatalError::Protocol("validated write span cannot be encoded".into()))?;
         *conn.pending_write.borrow_mut() = Some(PendingWrite {
             route,
             number,
-            value,
+            values,
         });
         Ok(write_v1::WriteProgress::Send(read::Planned {
             step: frame_step(send),
-            covers: vec![0],
+            covers: (0..items.len() as u32).collect(),
         }))
     }
 }
@@ -841,8 +829,44 @@ fn valid_word(value: f64) -> bool {
     value.is_finite() && value.fract() == 0.0 && (0.0..=65535.0).contains(&value)
 }
 
+/// Validate the entire request before assigning a serial or producing a frame.
+fn parse_write_run(items: &[write_v1::WriteItem]) -> Result<(u32, Vec<u16>), String> {
+    if items.is_empty() || items.len() > 960 {
+        return Err("write requires 1..=960 D/u16 words".into());
+    }
+    let mut start = None;
+    let mut values = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let number = parse_d(
+            &item.spec.address,
+            &item.spec.data_type,
+            item.spec.string_words,
+        )?;
+        let first = *start.get_or_insert(number);
+        if first.checked_add(index as u32) != Some(number) {
+            return Err("D write items must be consecutive and ascending".into());
+        }
+        let Value::Float(value) = item.value else {
+            return Err("write value must be a finite integer in 0..65535".into());
+        };
+        if !valid_word(value) {
+            return Err("write value must be a finite integer in 0..65535".into());
+        }
+        values.push(value as u16);
+    }
+    Ok((start.expect("nonempty request"), values))
+}
+
 fn rejected_write(message: &str) -> write_v1::WriteProgress {
-    write_v1::WriteProgress::Done(vec![Err(ItemError::Rejected(message.into()))])
+    rejected_write_count(1, message)
+}
+
+fn rejected_write_count(len: usize, message: &str) -> write_v1::WriteProgress {
+    write_v1::WriteProgress::Done(
+        (0..len)
+            .map(|_| Err(ItemError::Rejected(message.into())))
+            .collect(),
+    )
 }
 
 impl address::Guest for Component {
