@@ -1,6 +1,7 @@
 use banto_slmp_read_core::{
-    decode_write_ack, encode_q25prh_d3010_3013_test_write, encode_q_d_words, encode_r_d_words,
-    encode_r_d_write, RequestError, ResponseError, Route,
+    decode_write_ack, encode_q25prh_d3010_3013_test_write, encode_q_d_words, encode_q_dw_words,
+    encode_r_d_words, encode_r_d_write, encode_r_dw_words, Device, RequestError, ResponseError,
+    Route,
 };
 
 // Binary 4E, 1401/0002, D31=0x1234; independently transcribed from the
@@ -20,6 +21,39 @@ const Q_D3010_FOUR_TEST_WRITE: [u8; 33] = [
     0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 20, 0, 0x10, 0, 1, 0x14, 0, 0, 0xc2, 0x0b, 0, 0xa8,
     4, 0, 1, 0, 2, 0, 3, 0, 4, 0,
 ];
+// Independent 4E word-unit fixtures: hexadecimal W1A/W1B = 1,2.
+const R_W1A_TWO_WRITE: [u8; 31] = [
+    0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 18, 0, 0x10, 0, 1, 0x14, 2, 0, 0x1a, 0, 0, 0, 0xb4,
+    0, 2, 0, 1, 0, 2, 0,
+];
+const Q_W1A_TWO_WRITE: [u8; 29] = [
+    0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 16, 0, 0x10, 0, 1, 0x14, 0, 0, 0x1a, 0, 0, 0xb4, 2,
+    0, 1, 0, 2, 0,
+];
+
+#[test]
+fn common_word_write_keeps_d_bytes_and_encodes_r_q_w() {
+    assert_eq!(
+        encode_r_dw_words(Route::default(), Device::W, 0x1a, &[1, 2]),
+        Ok(R_W1A_TWO_WRITE.to_vec())
+    );
+    assert_eq!(
+        encode_q_dw_words(Route::default(), Device::W, 0x1a, &[1, 2]),
+        Ok(Q_W1A_TWO_WRITE.to_vec())
+    );
+    assert_eq!(
+        encode_r_dw_words(Route::default(), Device::D, 3010, &[1, 2, 3, 4]),
+        Ok(R_D3010_FOUR_WRITE.to_vec())
+    );
+    assert_eq!(
+        encode_q_dw_words(Route::default(), Device::D, 3010, &[1, 2, 3, 4]),
+        Ok(Q_D3010_FOUR_TEST_WRITE.to_vec())
+    );
+    assert_eq!(
+        encode_r_dw_words(Route::default(), Device::M, 0, &[1]),
+        Err(RequestError::DeviceNumber)
+    );
+}
 
 #[test]
 fn r_single_d_write_matches_independent_wire_fixture() {

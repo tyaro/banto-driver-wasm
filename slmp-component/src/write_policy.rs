@@ -1,5 +1,7 @@
-//! Guest-side copy of the bounded D/u16 policy grammar. The Host independently
+//! Guest-side copy of the bounded SLMP area policy grammar. The Host independently
 //! validates its saved policy before handing a request to this component.
+
+use banto_slmp_read_core::Device;
 
 pub(super) const MODE_KEY: &str = "d_u16_write_mode";
 pub(super) const ALLOWLIST_KEY: &str = "d_u16_write_allowlist";
@@ -11,7 +13,7 @@ const MAX_DEVICE: u32 = 0x00ff_ffff;
 #[derive(Clone, Debug)]
 pub(super) struct WritePolicy {
     enabled: bool,
-    ranges: Vec<(u32, u32)>,
+    ranges: Vec<(Device, u32, u32)>,
 }
 
 impl WritePolicy {
@@ -35,23 +37,31 @@ impl WritePolicy {
                     return Err((ALLOWLIST_KEY, "too many write ranges"));
                 }
                 let Some((start, end)) = interval.split_once('-') else {
-                    return Err((ALLOWLIST_KEY, "expected Dstart-Dend ranges"));
+                    return Err((ALLOWLIST_KEY, "expected same-area start-end ranges"));
                 };
-                let start = parse_device(start)?;
-                let end = parse_device(end)?;
+                let (device, start) = parse_device(start)?;
+                let (end_device, end) = parse_device(end)?;
+                if device != end_device {
+                    return Err((ALLOWLIST_KEY, "write range must remain in one device area"));
+                }
                 if end < start || end - start >= MAX_WORDS as u32 {
                     return Err((
                         ALLOWLIST_KEY,
                         "write range is reversed or exceeds 960 words",
                     ));
                 }
-                if start <= 3001 && end >= 3000 {
+                if device == Device::D && start <= 3001 && end >= 3000 {
                     return Err((ALLOWLIST_KEY, "D3000 and D3001 are protected"));
                 }
-                if ranges.last().is_some_and(|&(_, last)| start <= last) {
+                if ranges
+                    .iter()
+                    .rev()
+                    .find(|&&(area, _, _)| area == device)
+                    .is_some_and(|&(_, _, last)| start <= last)
+                {
                     return Err((ALLOWLIST_KEY, "write ranges must be ordered and disjoint"));
                 }
-                ranges.push((start, end));
+                ranges.push((device, start, end));
             }
         }
         if enabled && ranges.is_empty() {
@@ -63,7 +73,15 @@ impl WritePolicy {
         Ok(Self { enabled, ranges })
     }
 
+    #[cfg(test)]
     pub(super) fn allows_span(&self, start: u32, len: usize) -> bool {
+        self.allows_device_span(Device::D, start, len)
+    }
+
+    pub(super) fn allows_device_span(&self, device: Device, start: u32, len: usize) -> bool {
+        if !matches!(device, Device::D | Device::W) {
+            return false;
+        }
         if !self.enabled || len == 0 || len > MAX_WORDS {
             return false;
         }
@@ -71,26 +89,42 @@ impl WritePolicy {
             return false;
         };
         end <= MAX_DEVICE
-            && (start > 3001 || end < 3000)
+            && (device != Device::D || start > 3001 || end < 3000)
             && self
                 .ranges
                 .iter()
-                .any(|&(allowed_start, allowed_end)| start >= allowed_start && end <= allowed_end)
+                .any(|&(area, allowed_start, allowed_end)| {
+                    area == device && start >= allowed_start && end <= allowed_end
+                })
     }
 }
 
-fn parse_device(value: &str) -> Result<u32, (&'static str, &'static str)> {
-    let digits = value
-        .strip_prefix('D')
-        .filter(|digits| !digits.is_empty() && digits.bytes().all(|ch| ch.is_ascii_digit()))
-        .ok_or((ALLOWLIST_KEY, "expected decimal D addresses"))?;
-    let number = digits
-        .parse::<u32>()
+fn parse_device(value: &str) -> Result<(Device, u32), (&'static str, &'static str)> {
+    let (device, digits, radix) = if let Some(digits) = value.strip_prefix('D') {
+        (Device::D, digits, 10)
+    } else if let Some(digits) = value.strip_prefix('W') {
+        (Device::W, digits, 16)
+    } else {
+        return Err((ALLOWLIST_KEY, "expected D or W address"));
+    };
+    let digits = Some(digits)
+        .filter(|digits| {
+            !digits.is_empty()
+                && digits.bytes().all(|ch| {
+                    if radix == 10 {
+                        ch.is_ascii_digit()
+                    } else {
+                        ch.is_ascii_hexdigit() && !ch.is_ascii_lowercase()
+                    }
+                })
+        })
+        .ok_or((ALLOWLIST_KEY, "invalid write address"))?;
+    let number = u32::from_str_radix(digits, radix)
         .map_err(|_| (ALLOWLIST_KEY, "write address is out of range"))?;
     if number > MAX_DEVICE {
         return Err((ALLOWLIST_KEY, "write address is out of range"));
     }
-    Ok(number)
+    Ok((device, number))
 }
 
 #[cfg(test)]
@@ -118,6 +152,24 @@ mod tests {
             (3010, 961),
         ] {
             assert!(!policy.allows_span(start, len), "{start} / {len}");
+        }
+    }
+
+    #[test]
+    fn one_common_setting_accepts_explicit_w_without_broadening_old_d_ranges() {
+        let old = WritePolicy::parse(Some("enabled"), Some("D3010-D3013")).unwrap();
+        assert!(old.allows_span(3010, 4));
+        assert!(!old.allows_device_span(Device::W, 0x1a, 1));
+        let mixed = WritePolicy::parse(Some("enabled"), Some("D3010-D3013,W1A-W1F")).unwrap();
+        assert!(mixed.allows_span(3010, 4));
+        assert!(mixed.allows_device_span(Device::W, 0x1a, 6));
+        assert!(!mixed.allows_device_span(Device::W, 0x1f, 2));
+        assert!(!mixed.allows_device_span(Device::M, 0, 1));
+        for bad in ["W1A-D27", "W1A-W20,W1F-W21", "W1G-W1F", "w1a-w1f"] {
+            assert!(
+                WritePolicy::parse(Some("enabled"), Some(bad)).is_err(),
+                "{bad}"
+            );
         }
     }
 
