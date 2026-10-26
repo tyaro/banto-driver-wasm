@@ -279,6 +279,27 @@ mod tests {
         );
         conn.resource_drop(&mut store)?;
 
+        let undiscovered = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("settings");
+        let item = WriteItem {
+            spec: TagSpec {
+                address: "D0".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Float(1.0),
+        };
+        let outcome = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, undiscovered, &[item.clone(), item], None)?
+            .expect("initial discovery rejection");
+        assert!(matches!(outcome, WriteProgress::Done(results)
+            if results.len() == 2 && results.iter().all(Result::is_err)));
+        undiscovered.resource_drop(&mut store)?;
+
         for (name, code, sd_count) in [
             ("Q25PRHCPU", 0x004c, None),
             ("Q02UCPU", 0x0263, Some(vec![32, 0])),
@@ -323,11 +344,21 @@ mod tests {
             };
             let outcome = driver
                 .banto_driver_write_v1()
-                .call_write_next(&mut store, conn, &[item], None)?
+                .call_write_next(&mut store, conn, std::slice::from_ref(&item), None)?
                 .expect("no-send rejection");
             assert!(
                 matches!(outcome, WriteProgress::Done(items) if matches!(items.as_slice(), [Err(_)])),
                 "{name}"
+            );
+            let two_items = [item.clone(), item];
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &two_items, None)?
+                .expect("whole non-ready write rejection");
+            assert!(
+                matches!(outcome, WriteProgress::Done(results)
+                    if results.len() == 2 && results.iter().all(Result::is_err)),
+                "all {name} items need a result"
             );
             conn.resource_drop(&mut store)?;
         }

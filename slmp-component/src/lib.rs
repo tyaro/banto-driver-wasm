@@ -790,7 +790,7 @@ impl write_v1::Guest for Component {
         }
         let (model, count) = match &*conn.phase.borrow() {
             Phase::Ready { model, count } => (model.clone(), *count),
-            _ => return Ok(rejected_write("discovery is incomplete")),
+            _ => return Ok(rejected_write_count(items.len(), "discovery is incomplete")),
         };
         if model.family != ModelFamily::StandardR {
             return Ok(rejected_write_count(
@@ -855,10 +855,6 @@ fn parse_write_run(items: &[write_v1::WriteItem]) -> Result<(u32, Vec<u16>), Str
         values.push(value as u16);
     }
     Ok((start.expect("nonempty request"), values))
-}
-
-fn rejected_write(message: &str) -> write_v1::WriteProgress {
-    rejected_write_count(1, message)
 }
 
 fn rejected_write_count(len: usize, message: &str) -> write_v1::WriteProgress {
