@@ -10,5 +10,6 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+banto-register-codec = { git = "https://github.com/tyaro/banto-industrial.git", rev = "e4afe793cbae08ab4afd88467c8577010020957f" }
 banto-slmp-read-core = { path = "../drivers/slmp" }
 wit-bindgen = "=0.63.0"
