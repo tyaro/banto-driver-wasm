@@ -165,6 +165,32 @@ fn area_counts(
     result
 }
 
+// Q bit SD291/Y and SD293/L are exact bounds. Q M/B are also exact
+// unless the legacy 32768 field saturated, which basic_sd_count marks AtLeast.
+// D/W SD302/303 are internal prefixes and must keep their separate semantics.
+fn assess_tag_span(
+    model: &TypeName,
+    device: Device,
+    count: PointCount,
+    number: u32,
+    points: u16,
+) -> RangeAssessment {
+    if model.family == ModelFamily::StandardQ
+        && matches!(device, Device::M | Device::Y | Device::L | Device::B)
+    {
+        let Some(last) = number.checked_add(u32::from(points - 1)) else {
+            return RangeAssessment::Unknown;
+        };
+        return match count {
+            PointCount::Exact(limit) if last < limit => RangeAssessment::VerifiedInside,
+            PointCount::Exact(_) => RangeAssessment::VerifiedOutside,
+            PointCount::AtLeast(prefix) if last < prefix => RangeAssessment::VerifiedInside,
+            PointCount::AtLeast(_) | PointCount::Unknown => RangeAssessment::Unknown,
+        };
+    }
+    assess_d_span(model, count, number, points)
+}
+
 fn tag_diagnostic(
     conn: &SlmpConnection,
     model: Option<&TypeName>,
@@ -174,6 +200,9 @@ fn tag_diagnostic(
     use diagnostics_v1::TagVerdict;
     let verdict = match parse_read_address(&spec.address, &spec.data_type, spec.string_words) {
         Err(reason) => TagVerdict::Invalid(reason),
+        Ok((_, number, kind)) if number.checked_add(u32::from(kind.points() - 1)).is_none() => {
+            TagVerdict::Invalid("address-span-overflow".into())
+        }
         Ok((device, number, kind)) => match model {
             None => TagVerdict::Unknown("0101-model-unavailable".into()),
             Some(model) if model.family == ModelFamily::Unknown => {
@@ -191,7 +220,7 @@ fn tag_diagnostic(
                         RangeAssessment::Unknown
                     }
                 } else {
-                    assess_d_span(model, count, number, kind.points())
+                    assess_tag_span(model, device, count, number, kind.points())
                 };
                 match range {
                     RangeAssessment::VerifiedOutside => {
