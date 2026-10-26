@@ -3,8 +3,13 @@
 ## Local common-policy D/W u16 write stage (2026-10-26)
 
 - Separate worktree from merged main `a706f33fc0dc4e867f74cfdfa2fdc1223a3ec62f`. The existing saved `d_u16_write_mode` and `d_u16_write_allowlist` keys remain stable; their schema labels describe one SLMP write control and one area-qualified range list. Existing `D3010-D3013` settings still permit only D. A W range such as `W1A-W1F` must be explicitly included in that same list. There is no per-device enable switch.
-- D/W u16 writes share the 1401 word-run implementation. Standard R uses the same connection's SD280–283 counts; standard Q W uses its SD303 internal prefix. Complete ascending runs of 1–960 words, whole-item value checks, D3000/D3001 protection, ACK verification, and no automatic replay remain mandatory. Q25PRH W is not enabled in this branch because its SD303 path is being developed separately. Bit, word-bit, file/bank, timer/counter, and other numeric writes remain unsupported.
+- D/W u16 writes share the 1401 word-run implementation. Standard R uses the same connection's SD280–283 counts; standard Q W uses its SD303 internal prefix. Complete ascending runs of 1–960 words, whole-item value checks, D3000/D3001 protection, ACK verification, and no automatic replay remain mandatory. Q25PRH W writes remain disabled; its SD303 read path does not change the write gate. Bit, word-bit, file/bank, timer/counter, and other numeric writes remain unsupported.
 - This is guest/core local work only. The Host's independent `operational_write_item` and saved-policy parser still accept D/u16 alone, so this component **cannot** be used for operational W writes until the matching Host contract is implemented and tested. Rust 1.98.1 local checks passed 36 core fixtures, 15 guest unit tests plus one doc test, and 26 controlled real Wasmtime fixtures; the WIT world remained unchanged. No real connection, saved production setting change, publication, or merge is included.
+
+## Local conditional Q/R read continuation (2026-10-26)
+
+- Rebased as local work onto merged main `85eb10133649bf85fdeae1f76dd9ef586a643949`. Standard iQ-R `LTS/LTC/LSTS/LSTC` bit tags use a four-word `LTN/LSTN` read and extract coil/contact bits from the status word. Exact `Q25PRHCPU/004CH` now obtains SD302 and SD303 together; only internal W numeric tags wholly inside the SD303 guaranteed prefix are readable. General Q25 D stays range-Unknown. No extended W is inferred.
+- Q ZR still lacks the required route/firmware/extension evidence. Block-switched R would need bank state and is not enabled. The merged common D/W u16 write policy remains intact; Q25PRH W writes remain rejected. No WIT, Hub, read optimizer, or PLC/DB communication changes are included in this read stage. Real PLC and Hub integration remain untested.
 
 ## Local remaining Q/R SLMP read stage (2026-10-26)
 

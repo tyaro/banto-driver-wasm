@@ -22,7 +22,7 @@ fn confirmed() -> BasicEvidence {
 }
 
 #[test]
-fn q25prh_only_sd302_has_a_basic_count_map() {
+fn q25prh_sd302_and_sd303_are_separate_internal_count_maps() {
     let q = model("Q25PRHCPU", 0x004c);
     assert_eq!(q.family, ModelFamily::Q25PrhWireOnly);
     let plan = plan_basic_sd(&q, A::DInternal).expect("QnPRH SD302");
@@ -42,7 +42,13 @@ fn q25prh_only_sd302_has_a_basic_count_map() {
         basic_sd_count(&q, A::DInternal, confirmed(), None),
         PointCount::Unknown
     );
-    for area in [A::D, A::W, A::WInternal, A::M, A::ZR] {
+    let w = plan_basic_sd(&q, A::WInternal).expect("QnPRH SD303");
+    assert_eq!((w.start, w.count), (303, 1));
+    assert_eq!(
+        basic_sd_count(&q, A::WInternal, confirmed(), Some(&[8192])),
+        PointCount::Exact(8192)
+    );
+    for area in [A::D, A::W, A::M, A::ZR] {
         assert_eq!(plan_basic_sd(&q, area), None);
     }
 }

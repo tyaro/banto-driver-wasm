@@ -132,6 +132,8 @@ enum ReadKind {
     WordBit(u8),
     Numeric(DKind),
     LongTimer,
+    /// Third response word: b0 coil, b1 contact (MC manual p.87).
+    LongTimerFlag(u8),
     LongCounter,
 }
 
@@ -141,7 +143,7 @@ impl ReadKind {
             Self::Bit => 1,
             Self::WordBit(_) => 1,
             Self::Numeric(kind) => kind.words(),
-            Self::LongTimer => 4,
+            Self::LongTimer | Self::LongTimerFlag(_) => 4,
             Self::LongCounter => 2,
         }
     }
@@ -150,7 +152,7 @@ impl ReadKind {
     // long timer response (which also includes status and system flags).
     const fn value_words(self) -> u32 {
         match self {
-            Self::Bit | Self::WordBit(_) => 1,
+            Self::Bit | Self::WordBit(_) | Self::LongTimerFlag(_) => 1,
             Self::Numeric(kind) => kind.words() as u32,
             Self::LongTimer | Self::LongCounter => 2,
         }
@@ -167,6 +169,9 @@ impl ReadKind {
                 [words[0], words[1]],
                 WordOrder::LowHigh,
             )))),
+            Self::LongTimerFlag(bit) if words.len() == 4 => {
+                Ok(Value::Bool(words[2] & (1 << bit) != 0))
+            }
             Self::LongCounter if words.len() == 2 => Ok(Value::Int(i64::from(decode_i32(
                 [words[0], words[1]],
                 WordOrder::LowHigh,
@@ -372,9 +377,30 @@ fn parse_read_address(
         let bit = u8::from_str_radix(bit, 16).map_err(|_| "invalid word bit")?;
         return Ok((Device::D, number, ReadKind::WordBit(bit)));
     }
+    // LTS/LTC/LSTS/LSTC cannot head a batch bit read. Read their corresponding
+    // current-value code in word units and take the contact/coil flag from
+    // response word three. One logical timer still consumes four wire words.
+    for (prefix, device, bit) in [
+        ("LSTS", Device::LSTS, 1),
+        ("LSTC", Device::LSTC, 0),
+        ("LTS", Device::LTS, 1),
+        ("LTC", Device::LTC, 0),
+    ] {
+        if let Some(digits) = text.strip_prefix(prefix) {
+            if data_type != "bit" || words.is_some() {
+                return Err("long timer contact/coil requires bit without string_words".into());
+            }
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("invalid long timer address".into());
+            }
+            let number = digits
+                .parse::<u32>()
+                .map_err(|_| "long timer address exceeds u32")?;
+            return Ok((device, number, ReadKind::LongTimerFlag(bit)));
+        }
+    }
     // Long timer current values use four response words, including flags;
-    // long counter current values use two. The contact/coil aliases require
-    // a different word-unit request and are not parsed as ordinary bit tags.
+    // long counter current values use two.
     for (prefix, device, kind) in [
         ("LSTN", Device::LSTN, ReadKind::LongTimer),
         ("LTN", Device::LTN, ReadKind::LongTimer),
@@ -521,6 +547,10 @@ fn canonical_read(device: Device, number: i64) -> Result<String, String> {
         Device::CS => Ok(format!("CS{number}")),
         Device::CC => Ok(format!("CC{number}")),
         Device::CN => Ok(format!("CN{number}")),
+        Device::LTS => Ok(format!("LTS{number}")),
+        Device::LTC => Ok(format!("LTC{number}")),
+        Device::LSTS => Ok(format!("LSTS{number}")),
+        Device::LSTC => Ok(format!("LSTC{number}")),
         Device::LTN => Ok(format!("LTN{number}")),
         Device::LSTN => Ok(format!("LSTN{number}")),
         Device::LCN => Ok(format!("LCN{number}")),
@@ -613,6 +643,10 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
         | Device::CS
         | Device::CC
         | Device::CN
+        | Device::LTS
+        | Device::LTC
+        | Device::LSTS
+        | Device::LSTC
         | Device::LTN
         | Device::LSTN
         | Device::LCN
@@ -651,7 +685,16 @@ fn checked_read_span(
     ) && (model.family == ModelFamily::Q25PrhWireOnly
         || (matches!(
             device,
-            Device::LTN | Device::LSTN | Device::LCN | Device::LCS | Device::LCC | Device::ZR
+            Device::LTS
+                | Device::LTC
+                | Device::LSTS
+                | Device::LSTC
+                | Device::LTN
+                | Device::LSTN
+                | Device::LCN
+                | Device::LCS
+                | Device::LCC
+                | Device::ZR
         ) && model.family != ModelFamily::StandardR))
     {
         return Err(FatalError::InvalidConfig(
@@ -670,6 +713,8 @@ fn checked_read_span(
     if device == Device::W {
         match model.family {
             ModelFamily::StandardR => {}
+            ModelFamily::Q25PrhWireOnly
+                if count_guarantees_span(w_count, number, kind.points()) => {}
             ModelFamily::StandardQ
                 if assess_d_span(model, w_count, number, kind.points())
                     == RangeAssessment::VerifiedInside => {}
@@ -757,7 +802,10 @@ impl session::GuestConnection for SlmpConnection {
                 // Read each family's adjacent D/W count fields in one snapshot.
                 if model.family == ModelFamily::StandardR {
                     span.count = 4; // SD280-283: 32-bit D and W counts.
-                } else if model.family == ModelFamily::StandardQ {
+                } else if matches!(
+                    model.family,
+                    ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly
+                ) {
                     span.count = 2; // SD302-303: 16-bit internal D and W counts.
                 }
                 let sd_route = self.route();
@@ -820,7 +868,13 @@ impl session::GuestConnection for SlmpConnection {
                         basic_sd_count(&model, area, evidence, words.get(0..1))
                     }
                     ModelFamily::Q25PrhWireOnly => {
-                        basic_sd_count(&model, area, evidence, Some(&words))
+                        self.w_count.set(basic_sd_count(
+                            &model,
+                            BasicArea::WInternal,
+                            evidence,
+                            words.get(1..2),
+                        ));
+                        basic_sd_count(&model, area, evidence, words.get(0..1))
                     }
                     ModelFamily::Unknown => unreachable!("unknown model does not plan SD"),
                 };
@@ -1345,6 +1399,10 @@ impl address::Guest for Component {
                 Device::CS => "CS",
                 Device::CC => "CC",
                 Device::CN => "CN",
+                Device::LTS => "LTS",
+                Device::LTC => "LTC",
+                Device::LSTS => "LSTS",
+                Device::LSTC => "LSTC",
                 Device::LTN => "LTN",
                 Device::LSTN => "LSTN",
                 Device::LCN => "LCN",
@@ -1391,7 +1449,10 @@ impl address::Guest for Component {
         } else {
             let width = match kind {
                 ReadKind::Numeric(kind) => i64::from(kind.words()),
-                ReadKind::Bit | ReadKind::LongTimer | ReadKind::LongCounter => 1,
+                ReadKind::Bit
+                | ReadKind::LongTimer
+                | ReadKind::LongTimerFlag(_)
+                | ReadKind::LongCounter => 1,
                 ReadKind::WordBit(_) => unreachable!(),
             };
             let point_offset = n.checked_mul(width).ok_or("offset overflow")?;
@@ -1414,7 +1475,7 @@ impl address::Guest for Component {
     }
 
     fn offset_words(text: String, n: i64) -> Result<String, String> {
-        if ["LTN", "LSTN", "LCN"]
+        if ["LTS", "LTC", "LSTS", "LSTC", "LTN", "LSTN", "LCN"]
             .iter()
             .any(|prefix| text.starts_with(prefix))
         {
@@ -1442,7 +1503,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Local write support is D/W u16 only and still requires a matching Host gate"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Local write support is D/W u16 only and still requires a matching Host gate; Q25PRH W remains read-only"
             .into()
     }
 
@@ -1726,6 +1787,28 @@ mod tests {
             <Component as address::Guest>::offset("LTN4".into(), "i32".into(), None, 1).unwrap(),
             "LTN5"
         );
+        let timer_contact =
+            <Component as address::Guest>::parse("LTS4".into(), "bit".into(), None).unwrap();
+        assert_eq!(
+            (
+                timer_contact.area.as_str(),
+                timer_contact.word_count,
+                timer_contact.writable_area
+            ),
+            ("LTS", 1, false)
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset("LSTC4".into(), "bit".into(), None, 1).unwrap(),
+            "LSTC5"
+        );
+        assert!(matches!(
+            ReadKind::LongTimerFlag(1).decode_words(&[0, 0, 0b10, 0], WordOrder::LowHigh),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            ReadKind::LongTimerFlag(0).decode_words(&[0, 0, 0b10, 0], WordOrder::LowHigh),
+            Ok(Value::Bool(false))
+        ));
         assert_eq!(
             <Component as address::Guest>::offset_words("D10.F".into(), 1).unwrap(),
             "D11.F"
@@ -1739,7 +1822,7 @@ mod tests {
             ("D0.10", "bit"),
             ("D0.0", "u16"),
             ("TN1", "u32"),
-            ("LTS1", "bit"),
+            ("LTS1", "u16"),
             ("LCS1A", "bit"),
             ("LCN1", "u32"),
             ("R1", "u16"),
@@ -2018,6 +2101,13 @@ mod tests {
             &model(ModelFamily::Q25PrhWireOnly),
             PointCount::Unknown,
             PointCount::Exact(32)
+        )
+        .is_ok());
+        assert!(checked_read_span(
+            &pair,
+            &model(ModelFamily::Q25PrhWireOnly),
+            PointCount::Unknown,
+            PointCount::Unknown
         )
         .is_err());
     }

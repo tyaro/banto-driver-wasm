@@ -323,7 +323,7 @@ mod tests {
         undiscovered.resource_drop(&mut store)?;
 
         for (name, code, sd_count) in [
-            ("Q25PRHCPU", 0x004c, Some(3014u16.to_le_bytes().to_vec())),
+            ("Q25PRHCPU", 0x004c, Some(q_sd_data(3014, 32).to_vec())),
             ("Q02UCPU", 0x0263, Some(vec![32, 0, 32, 0])),
             ("R04CPU", 0x4800, Some(vec![])),
         ] {
@@ -764,7 +764,7 @@ mod tests {
             if name == "Q25PRHCPU" && code == 0x004c {
                 let sd = sd.expect("Q25PRH SD302 request");
                 assert_eq!(&sd.send[2..4], &[2, 0]);
-                assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 1, 0]);
+                assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 2, 0]);
                 let before_sd = driver
                     .banto_driver_write_v1()
                     .call_write_next(&mut store, conn, &items, None)?
@@ -777,7 +777,7 @@ mod tests {
                     .call_handshake_next(
                         &mut store,
                         conn,
-                        Some(&response(2, &3014u16.to_le_bytes()))
+                        Some(&response(2, &q_sd_data(3014, 32)))
                     )?
                     .expect("SD302 count")
                     .is_none());
@@ -893,11 +893,11 @@ mod tests {
             .call_handshake_next(&mut store, conn, Some(&model_response("Q25PRHCPU", 0x004c)))?
             .expect("type and SD302")
             .expect("SD302 request");
-        assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 1, 0]);
+        assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 2, 0]);
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &3014u16.to_le_bytes())))?
+            .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(3014, 32))))?
             .expect("SD302 reply")
             .is_none());
         let specs: Vec<TagSpec> = items.iter().map(|item| item.spec.clone()).collect();
@@ -932,7 +932,7 @@ mod tests {
             driver
                 .banto_driver_session()
                 .connection()
-                .call_handshake_next(&mut store, conn, Some(&response(2, &count.to_le_bytes())))?
+                .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(count, 32))))?
                 .expect("SD302 count");
             let outcome = driver
                 .banto_driver_write_v1()
@@ -1029,7 +1029,7 @@ mod tests {
                 },
                 Setting {
                     key: "d_u16_write_allowlist".into(),
-                    value: "D3010-D3013,D4000-D4009".into(),
+                    value: "D3010-D3013,D4000-D4009,W1E-W1F".into(),
                 },
             ];
             let conn = driver
@@ -1061,10 +1061,17 @@ mod tests {
                 .call_handshake_next(
                     &mut store,
                     conn,
-                    Some(&response(2, &sd_count.to_le_bytes())),
+                    Some(&response(2, &q_sd_data(sd_count, 32))),
                 )?
                 .expect("SD302 response");
             for invalid in [
+                vec![WriteItem {
+                    spec: TagSpec {
+                        address: "W1E".into(),
+                        ..items[0].spec.clone()
+                    },
+                    ..items[0].clone()
+                }],
                 vec![WriteItem {
                     spec: TagSpec {
                         address: "D3000".into(),
@@ -1494,12 +1501,69 @@ mod tests {
     }
 
     #[test]
+    fn r_long_timer_flags_use_four_word_current_value_and_decode_bits() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("settings");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("SD");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[100, 0, 0, 0, 100, 0, 0, 0])),
+            )?
+            .expect("ready");
+        let specs = ["LTS7", "LTC7", "LSTS8", "LSTC8"].map(bit_spec);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("R long timer plans");
+        assert_eq!(plans.len(), 4);
+        for (index, plan) in plans.iter().enumerate() {
+            assert_eq!(plan.covers, [index as u32]);
+            assert_eq!(&plan.step.send[17..19], &[2, 0]);
+            assert_eq!(plan.step.send[23], if index < 2 { 0x52 } else { 0x5a });
+            assert_eq!(&plan.step.send[25..27], &[4, 0]);
+            let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+            let flags = if index % 2 == 0 { 2 } else { 1 };
+            let values = driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    conn,
+                    plan,
+                    &specs,
+                    &response(serial, &[0, 0, 0, 0, flags, 0, 0, 0]),
+                )?
+                .expect("long timer flags");
+            assert!(matches!(values.as_slice(), [Ok(Value::Bool(true))]));
+        }
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
     fn r_and_q25prh_bit_reads_keep_unproven_ranges_unknown() -> wasmtime::Result<()> {
         use banto::driver::types::Value;
         let (mut store, driver) = load()?;
         for (name, code, sd_words, subcommand, width) in [
             ("R04CPU", 0x4800, vec![32, 0, 32, 0], [3, 0], 10),
-            ("Q25PRHCPU", 0x004c, vec![32], [1, 0], 8),
+            ("Q25PRHCPU", 0x004c, vec![32, 32], [1, 0], 8),
         ] {
             let conn = driver
                 .banto_driver_session()
@@ -1920,8 +1984,9 @@ mod tests {
     }
 
     #[test]
-    fn q25prh_exact_pair_reads_sd302_but_keeps_general_reads_unknown() -> wasmtime::Result<()> {
-        use banto::driver::types::Value;
+    fn q25prh_exact_pair_reads_sd302_303_but_keeps_general_d_reads_unknown() -> wasmtime::Result<()>
+    {
+        use banto::driver::types::{TagSpec, Value};
         let (mut store, driver) = load()?;
         let conn = driver
             .banto_driver_session()
@@ -1943,11 +2008,11 @@ mod tests {
             .expect("Q wire and SD302 map")
             .expect("SD302 request");
         assert_eq!(&sd.send[2..4], &[2, 0]);
-        assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 1, 0]);
+        assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 2, 0]);
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(2, &3014u16.to_le_bytes())))?
+            .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(3014, 32))))?
             .expect("ready after SD")
             .is_none());
         let specs = d_specs(&[5, 6]);
@@ -1979,6 +2044,43 @@ mod tests {
         assert_eq!(later.len(), 2);
         assert_eq!(later[0].covers, [0]);
         assert_eq!(later[1].covers, [1]);
+
+        let w_specs = [TagSpec {
+            address: "W1E".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        }];
+        let w_plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &w_specs)?
+            .expect("Q25PRH W inside SD303 prefix");
+        assert_eq!(w_plans.len(), 1);
+        assert_eq!(w_plans[0].covers, [0]);
+        assert_eq!(w_plans[0].step.send[22], 0xb4);
+        let serial = u16::from_le_bytes([w_plans[0].step.send[2], w_plans[0].step.send[3]]);
+        let w_values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &w_plans[0],
+                &w_specs,
+                &response(serial, &[1, 0, 2, 0]),
+            )?
+            .expect("Q25PRH W pair");
+        assert!(matches!(
+            w_values.as_slice(),
+            [Ok(Value::Uint(0x0002_0001))]
+        ));
+        let beyond = [TagSpec {
+            address: "W1F".into(),
+            ..w_specs[0].clone()
+        }];
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &beyond)?
+            .expect("unverified W span is uncovered")
+            .is_empty());
         conn.resource_drop(&mut store)?;
 
         let fresh = driver
