@@ -1,4 +1,4 @@
-//! Binary 4E SLMP guest for numeric D and standard iQ-R W reads, plus restricted D/u16 write.
+//! Binary 4E SLMP guest for numeric D and verified Q/R W reads, plus restricted D/u16 write.
 //! The host owns transport. Each connection owns its discovery evidence.
 
 use std::cell::{Cell, RefCell};
@@ -470,10 +470,19 @@ fn checked_read_span(
     let (device, number, kind) =
         parse_read_address(&spec.address, &spec.data_type, spec.string_words)
             .map_err(FatalError::InvalidConfig)?;
-    if device == Device::W && model.family != ModelFamily::StandardR {
-        return Err(FatalError::InvalidConfig(
-            "W reads require a confirmed standard iQ-R CPU".into(),
-        ));
+    if device == Device::W {
+        match model.family {
+            ModelFamily::StandardR => {}
+            ModelFamily::StandardQ
+                if assess_d_span(model, w_count, number, kind.points())
+                    == RangeAssessment::VerifiedInside => {}
+            _ => {
+                return Err(FatalError::InvalidConfig(
+                    "W reads require a confirmed iQ-R count or a verified standard Q internal W span"
+                        .into(),
+                ));
+            }
+        }
     }
     let count = read_count(device, d_count, w_count);
     if assess_d_span(model, count, number, kind.points()) == RangeAssessment::VerifiedOutside {
@@ -548,9 +557,11 @@ impl session::GuestConnection for SlmpConnection {
                     }
                 };
                 let mut span = plan_basic_sd(&model, area).expect("known model has D count SD");
-                // R SD280-283 is a contiguous D/W count snapshot in one read.
+                // Read each family's adjacent D/W count fields in one snapshot.
                 if model.family == ModelFamily::StandardR {
-                    span.count = 4;
+                    span.count = 4; // SD280-283: 32-bit D and W counts.
+                } else if model.family == ModelFamily::StandardQ {
+                    span.count = 2; // SD302-303: 16-bit internal D and W counts.
                 }
                 let sd_route = self.route();
                 let series = known_series(&model).expect("known model has series");
@@ -592,16 +603,29 @@ impl session::GuestConnection for SlmpConnection {
                     route_confirmed: true,
                     r_firmware: None,
                 };
-                let count = if model.family == ModelFamily::StandardR {
-                    self.w_count.set(basic_sd_count(
-                        &model,
-                        BasicArea::W,
-                        evidence,
-                        words.get(2..4),
-                    ));
-                    basic_sd_count(&model, area, evidence, words.get(0..2))
-                } else {
-                    basic_sd_count(&model, area, evidence, Some(&words))
+                let count = match model.family {
+                    ModelFamily::StandardR => {
+                        self.w_count.set(basic_sd_count(
+                            &model,
+                            BasicArea::W,
+                            evidence,
+                            words.get(2..4),
+                        ));
+                        basic_sd_count(&model, area, evidence, words.get(0..2))
+                    }
+                    ModelFamily::StandardQ => {
+                        self.w_count.set(basic_sd_count(
+                            &model,
+                            BasicArea::WInternal,
+                            evidence,
+                            words.get(1..2),
+                        ));
+                        basic_sd_count(&model, area, evidence, words.get(0..1))
+                    }
+                    ModelFamily::Q25PrhWireOnly => {
+                        basic_sd_count(&model, area, evidence, Some(&words))
+                    }
+                    ModelFamily::Unknown => unreachable!("unknown model does not plan SD"),
                 };
                 if model.family == ModelFamily::Q25PrhWireOnly {
                     // Preserve the existing unknown-range read policy. This
@@ -1474,6 +1498,64 @@ mod tests {
             "WB"
         );
         assert!(parse_d("WA", "u16", None).is_err());
+    }
+
+    #[test]
+    fn standard_q_w_requires_a_verified_internal_prefix_for_the_complete_tag() {
+        let q = model(ModelFamily::StandardQ);
+        let pair = TagSpec {
+            address: "W1E".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        };
+        assert_eq!(
+            checked_read_span(&pair, &q, PointCount::Unknown, PointCount::Exact(32)).unwrap(),
+            ReadSpan {
+                device: Device::W,
+                start: 30,
+                count: 2,
+            }
+        );
+        assert!(checked_read_span(
+            &TagSpec {
+                address: "W1F".into(),
+                ..pair.clone()
+            },
+            &q,
+            PointCount::Unknown,
+            PointCount::Exact(32)
+        )
+        .is_err());
+        assert!(checked_read_span(&pair, &q, PointCount::Unknown, PointCount::Unknown).is_err());
+        assert!(checked_read_span(
+            &TagSpec {
+                address: "W7FFF".into(),
+                data_type: "u16".into(),
+                ..pair.clone()
+            },
+            &q,
+            PointCount::Unknown,
+            PointCount::AtLeast(32768)
+        )
+        .is_ok());
+        assert!(checked_read_span(
+            &TagSpec {
+                address: "W8000".into(),
+                data_type: "u16".into(),
+                ..pair.clone()
+            },
+            &q,
+            PointCount::Unknown,
+            PointCount::AtLeast(32768)
+        )
+        .is_err());
+        assert!(checked_read_span(
+            &pair,
+            &model(ModelFamily::Q25PrhWireOnly),
+            PointCount::Unknown,
+            PointCount::Exact(32)
+        )
+        .is_err());
     }
 
     #[test]

@@ -66,6 +66,8 @@ fn subcommands_device_code_and_number_width_are_series_specific() {
     assert_eq!(&r[17..27], &[2, 0, 0x78, 0x56, 0x34, 0x12, 0xa9, 0, 1, 0]);
     let w = encode_read(Route::default(), Series::R, span(Device::W, 0x20, 1)).unwrap();
     assert_eq!(&w[17..27], &[2, 0, 0x20, 0, 0, 0, 0xb4, 0, 1, 0]);
+    let q_w = encode_read(Route::default(), Series::Q, span(Device::W, 0x1e, 2)).unwrap();
+    assert_eq!(&q_w[17..25], &[0, 0, 0x1e, 0, 0, 0xb4, 2, 0]);
 }
 
 #[test]
