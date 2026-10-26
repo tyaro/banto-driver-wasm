@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn write_extension_borrows_the_same_discovered_resource() -> wasmtime::Result<()> {
-        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::banto::driver::types::{ItemError, Setting, TagSpec, Value};
         use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
         let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
         let engine = Engine::default();
@@ -111,6 +111,14 @@ mod tests {
             Setting {
                 key: "port".into(),
                 value: "5000".into(),
+            },
+            Setting {
+                key: "d_u16_write_mode".into(),
+                value: "enabled".into(),
+            },
+            Setting {
+                key: "d_u16_write_allowlist".into(),
+                value: "D31-D31".into(),
             },
         ];
         let conn = driver
@@ -336,7 +344,9 @@ mod tests {
             }
             let item = WriteItem {
                 spec: TagSpec {
-                    address: "D0".into(),
+                    // D31 is allowlisted and was sent above with valid R SD
+                    // evidence. A refusal here must be caused by missing SD.
+                    address: if name == "R04CPU" { "D31" } else { "D0" }.into(),
                     data_type: "u16".into(),
                     string_words: None,
                 },
@@ -346,6 +356,14 @@ mod tests {
                 .banto_driver_write_v1()
                 .call_write_next(&mut store, conn, std::slice::from_ref(&item), None)?
                 .expect("no-send rejection");
+            if name == "R04CPU" {
+                assert!(
+                    matches!(&outcome, WriteProgress::Done(results)
+                    if matches!(results.as_slice(), [Err(ItemError::Rejected(message))]
+                        if message.contains("same-connection SD range"))),
+                    "allowlisted D31 must be rejected specifically for missing R SD evidence"
+                );
+            }
             assert!(
                 matches!(outcome, WriteProgress::Done(items) if matches!(items.as_slice(), [Err(_)])),
                 "{name}"
@@ -375,12 +393,21 @@ mod tests {
         let linker = Linker::new(&engine);
         let mut store = Store::new(&engine, ());
         let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let mut write_settings = settings();
+        write_settings.push(banto::driver::types::Setting {
+            key: "d_u16_write_mode".into(),
+            value: "enabled".into(),
+        });
+        write_settings.push(banto::driver::types::Setting {
+            key: "d_u16_write_allowlist".into(),
+            value: "D3010-D3013".into(),
+        });
         let conn = driver
             .banto_driver_session()
             .connection()
             .call_create(
                 &mut store,
-                &settings()
+                &write_settings
                     .into_iter()
                     .map(|s| write_host::banto::driver::types::Setting {
                         key: s.key,
@@ -838,6 +865,146 @@ mod tests {
                 .expect("unknown SD count rejects write");
             assert!(matches!(outcome, WriteProgress::Done(results)
                 if results.len() == 4 && results.iter().all(Result::is_err)));
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normal_q_write_requires_saved_policy_and_same_connection_sd302() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let items: Vec<WriteItem> = (0..3)
+            .map(|index| WriteItem {
+                spec: TagSpec {
+                    address: format!("D{}", 4000 + index),
+                    data_type: "u16".into(),
+                    string_words: None,
+                },
+                value: Value::Float(f64::from(index + 1)),
+            })
+            .collect();
+        for (mode, sd_count, allowed) in [
+            ("disabled", 5000u16, false),
+            ("enabled", 4002, false),
+            ("enabled", 5000, true),
+        ] {
+            let settings = vec![
+                Setting {
+                    key: "host".into(),
+                    value: "fixture.invalid".into(),
+                },
+                Setting {
+                    key: "port".into(),
+                    value: "5000".into(),
+                },
+                Setting {
+                    key: "d_u16_write_mode".into(),
+                    value: mode.into(),
+                },
+                Setting {
+                    key: "d_u16_write_allowlist".into(),
+                    value: "D3010-D3013,D4000-D4009".into(),
+                },
+            ];
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings)?
+                .expect("valid policy");
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101")
+                .is_some());
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response("Q25PRHCPU", 0x004c)))?
+                .expect("SD302")
+                .is_some());
+            let before_sd = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("no SD proof");
+            assert!(matches!(before_sd, WriteProgress::Done(results)
+                if results.len() == items.len() && results.iter().all(Result::is_err)));
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(
+                    &mut store,
+                    conn,
+                    Some(&response(2, &sd_count.to_le_bytes())),
+                )?
+                .expect("SD302 response");
+            for invalid in [
+                vec![WriteItem {
+                    spec: TagSpec {
+                        address: "D3000".into(),
+                        ..items[0].spec.clone()
+                    },
+                    ..items[0].clone()
+                }],
+                vec![items[0].clone(), items[2].clone()],
+                vec![WriteItem {
+                    spec: TagSpec {
+                        address: "D4010".into(),
+                        ..items[0].spec.clone()
+                    },
+                    ..items[0].clone()
+                }],
+                vec![WriteItem {
+                    spec: TagSpec {
+                        data_type: "u32".into(),
+                        ..items[0].spec.clone()
+                    },
+                    ..items[0].clone()
+                }],
+                vec![WriteItem {
+                    value: Value::Float(f64::NAN),
+                    ..items[0].clone()
+                }],
+            ] {
+                let outcome = driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &invalid, None)?
+                    .expect("preflight");
+                assert!(matches!(outcome, WriteProgress::Done(results)
+                    if results.len() == invalid.len() && results.iter().all(Result::is_err)));
+            }
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("policy");
+            if allowed {
+                let WriteProgress::Send(plan) = outcome else {
+                    panic!("enabled policy must send")
+                };
+                assert_eq!(plan.covers, [0, 1, 2]);
+                assert_eq!(&plan.step.send[2..4], &[3, 0], "rejections use no serial");
+                assert_eq!(&plan.step.send[11..13], &[18, 0]);
+                assert_eq!(
+                    &plan.step.send[15..],
+                    &[1, 0x14, 0, 0, 0xa0, 0x0f, 0, 0xa8, 3, 0, 1, 0, 2, 0, 3, 0]
+                );
+                let done = driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &items, Some(&response(3, &[])))?
+                    .expect("ACK");
+                assert!(matches!(done, WriteProgress::Done(results)
+                    if results.len() == items.len() && results.iter().all(Result::is_ok)));
+            } else {
+                assert!(matches!(outcome, WriteProgress::Done(results)
+                    if results.len() == items.len() && results.iter().all(Result::is_err)));
+            }
             conn.resource_drop(&mut store)?;
         }
         Ok(())

@@ -1,6 +1,6 @@
 use banto_slmp_read_core::{
-    decode_write_ack, encode_q25prh_d3010_3013_test_write, encode_r_d_words, encode_r_d_write,
-    RequestError, ResponseError, Route,
+    decode_write_ack, encode_q25prh_d3010_3013_test_write, encode_q_d_words, encode_r_d_words,
+    encode_r_d_write, RequestError, ResponseError, Route,
 };
 
 // Binary 4E, 1401/0002, D31=0x1234; independently transcribed from the
@@ -43,6 +43,28 @@ fn q25prh_four_word_test_frame_uses_q_subcommand_and_24_bit_address() {
         Q_D3010_FOUR_TEST_WRITE
     );
     assert_eq!(decode_write_ack(Route::default(), &ACK), Ok(()));
+}
+
+#[test]
+fn q_word_write_preserves_test_bytes_and_checks_width_and_address() {
+    assert_eq!(
+        encode_q_d_words(Route::default(), 3010, &[1, 2, 3, 4]),
+        Ok(Q_D3010_FOUR_TEST_WRITE.to_vec())
+    );
+    assert_eq!(
+        encode_q_d_words(Route::default(), 0, &[]),
+        Err(RequestError::Count)
+    );
+    assert!(encode_q_d_words(Route::default(), 0, &[0; 960]).is_ok());
+    assert_eq!(
+        encode_q_d_words(Route::default(), 0, &[0; 961]),
+        Err(RequestError::Count)
+    );
+    assert!(encode_q_d_words(Route::default(), 0x00ff_fffe, &[1, 2]).is_ok());
+    assert_eq!(
+        encode_q_d_words(Route::default(), 0x00ff_fffe, &[1, 2, 3]),
+        Err(RequestError::DeviceNumber)
+    );
 }
 
 #[test]

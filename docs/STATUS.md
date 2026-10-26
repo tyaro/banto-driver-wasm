@@ -1,5 +1,11 @@
 # STATUS
 
+## Local normal D/u16 write policy (verified simulation, 2026-10-26)
+
+- Separate worktree from main `0e05d5b2a955923c8bc37237bd2b5ae4f0eb7253`. The guest declares `d_u16_write_mode` (default disabled) and `d_u16_write_allowlist` (default empty), matching the separately developed Host policy grammar. Enabled mode requires a nonempty, ascending, nonoverlapping list of up to 16 decimal D ranges, 256 ASCII characters, 1–960 words per range, within 24-bit addressing. Any configured or requested span crossing D3000/D3001 is refused.
+- A normal request is one complete consecutive D/u16 run of 1–960 words within one allowlisted range. Same-connection SD280–281 proves a StandardR D span; exact Q25PRHCPU / 004CH and same-connection SD302 prove a Q internal D prefix. Unknown or insufficient evidence refuses the whole request before a write frame. The separate Q four-word test flag remains distinct. No WIT or Host policy changes, PLC/DB communication, or production enablement are included here.
+- Rust 1.98.1 local checks: SLMP core 33 fixtures, guest 9 unit plus 1 doc test, real Wasmtime 20 controlled fixtures, fmt and Clippy for core/guest/runtime, wasm32 component validation and both existing WIT world targets, scaffold guard and 17 CI classification tests. This does not verify the separate Host integration or any physical write.
+
 ## Local Q25PRH four-word write simulation (2026-10-26)
 
 - Based on merged PR #22 main `4d857074ba3bd81ec862d5c8729b4f862b738582`. The advanced test setting defaults to `disabled`; only explicit `enabled`, the exact `Q25PRHCPU / 004CH` 0101 pair, and a same-connection SD302 count guaranteeing all four internal D points gate one Q `1401/0000` frame for only `D3010..D3013/u16` with four validated values. Saving this setting does not open the production Host write gate. Refused, short, missing, or insufficient SD evidence fails closed; SD302=32768 is a guaranteed prefix. General Q read range remains unknown, and the StandardR write path is unchanged. No WIT, Hub, production permission, or PLC connection is changed. [QnPRH assignment, PDF p.22](https://www.mitsubishielectric.com/fa/document/technews/plc/fa-a-0214/faa0214a.pdf#page=22).
