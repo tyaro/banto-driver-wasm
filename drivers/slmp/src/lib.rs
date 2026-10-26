@@ -41,6 +41,22 @@ pub enum Device {
     W,
     SW,
     SD,
+    TS,
+    TC,
+    TN,
+    SS,
+    SC,
+    SN,
+    STS,
+    STC,
+    STN,
+    CS,
+    CC,
+    CN,
+    LTN,
+    LSTN,
+    LCN,
+    ZR,
 }
 
 impl Device {
@@ -59,6 +75,22 @@ impl Device {
             Self::W => 0xb4,
             Self::SW => 0xb5,
             Self::SD => 0xa9,
+            Self::TS => 0xc1,
+            Self::TC => 0xc0,
+            Self::TN => 0xc2,
+            Self::SS => 0xc7,
+            Self::SC => 0xc6,
+            Self::SN => 0xc8,
+            Self::STS => 0xc7,
+            Self::STC => 0xc6,
+            Self::STN => 0xc8,
+            Self::CS => 0xc4,
+            Self::CC => 0xc3,
+            Self::CN => 0xc5,
+            Self::LTN => 0x52,
+            Self::LSTN => 0x5a,
+            Self::LCN => 0x56,
+            Self::ZR => 0xb0,
         }
     }
 
@@ -74,12 +106,22 @@ impl Device {
                 | Self::V
                 | Self::SB
                 | Self::SM
+                | Self::TS
+                | Self::TC
+                | Self::SS
+                | Self::SC
+                | Self::STS
+                | Self::STC
+                | Self::CS
+                | Self::CC
         )
     }
 }
 
 /// `start` is a numeric device number, already parsed in the device's radix.
-/// `count` is in device points (bits for M/X/Y/B, words for D/W/SD).
+/// `count` is the 0401 wire access-point count: bits for bit-unit requests,
+/// words for word-unit requests. An LTN/LSTN logical timer consumes four
+/// wire words, while an LCN logical counter consumes two.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadSpan {
     pub device: Device,

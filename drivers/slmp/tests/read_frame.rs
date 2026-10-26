@@ -107,6 +107,51 @@ fn additional_bit_and_word_codes_keep_q_r_units_and_radices() {
 }
 
 #[test]
+fn timer_counter_and_serial_file_codes_follow_mc_word_and_bit_units() {
+    // Independent MC code table, printed pp.68-69. The long timer request
+    // uses four word access points per one logical timer (printed p.87).
+    for (device, code) in [
+        (Device::TS, 0xc1),
+        (Device::TC, 0xc0),
+        (Device::SS, 0xc7),
+        (Device::SC, 0xc6),
+        (Device::CS, 0xc4),
+        (Device::CC, 0xc3),
+    ] {
+        for (series, tail) in [
+            (Series::Q, vec![1, 0, 0x23, 1, 0, code, 1, 0]),
+            (Series::R, vec![3, 0, 0x23, 1, 0, 0, code, 0, 1, 0]),
+        ] {
+            let frame = encode_read(Route::default(), series, span(device, 0x123, 1)).unwrap();
+            assert_eq!(&frame[17..], tail);
+            assert_eq!(
+                decode_read(
+                    Route::default(),
+                    span(device, 0, 1),
+                    &[0xd4, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 3, 0, 0, 0, 0x10]
+                ),
+                Ok(Values::Bits(vec![true]))
+            );
+        }
+    }
+    for (device, code, count) in [
+        (Device::TN, 0xc2, 1),
+        (Device::SN, 0xc8, 1),
+        (Device::CN, 0xc5, 1),
+        (Device::LTN, 0x52, 4),
+        (Device::LSTN, 0x5a, 4),
+        (Device::LCN, 0x56, 2),
+        (Device::ZR, 0xb0, 1),
+    ] {
+        let frame = encode_read(Route::default(), Series::R, span(device, 0x123, count)).unwrap();
+        assert_eq!(
+            &frame[17..],
+            &[2, 0, 0x23, 1, 0, 0, code, 0, count as u8, 0]
+        );
+    }
+}
+
+#[test]
 fn point_counts_and_complete_number_ranges_are_checked() {
     for (series, request, expected) in [
         (Series::Q, span(Device::D, 0, 0), RequestError::Count),

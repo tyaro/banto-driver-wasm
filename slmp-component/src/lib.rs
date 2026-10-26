@@ -128,14 +128,51 @@ impl DKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadKind {
     Bit,
+    WordBit(u8),
     Numeric(DKind),
+    LongTimer,
+    LongCounter,
 }
 
 impl ReadKind {
     const fn points(self) -> u16 {
         match self {
             Self::Bit => 1,
+            Self::WordBit(_) => 1,
             Self::Numeric(kind) => kind.words(),
+            Self::LongTimer => 4,
+            Self::LongCounter => 2,
+        }
+    }
+
+    // WIT metadata describes the typed value, not every word carried by a
+    // long timer response (which also includes status and system flags).
+    const fn value_words(self) -> u32 {
+        match self {
+            Self::Bit | Self::WordBit(_) => 1,
+            Self::Numeric(kind) => kind.words() as u32,
+            Self::LongTimer | Self::LongCounter => 2,
+        }
+    }
+
+    fn decode_words(self, words: &[u16], order: WordOrder) -> Result<Value, FatalError> {
+        match self {
+            Self::WordBit(bit) if words.len() == 1 => Ok(Value::Bool(words[0] & (1 << bit) != 0)),
+            Self::Numeric(kind) => kind.decode(words, order),
+            // MC batch read returns four words per long timer: two current-value
+            // words, then coil/contact and system flags. These are not four
+            // independent timer values.
+            Self::LongTimer if words.len() == 4 => Ok(Value::Int(i64::from(decode_i32(
+                [words[0], words[1]],
+                WordOrder::LowHigh,
+            )))),
+            Self::LongCounter if words.len() == 2 => Ok(Value::Int(i64::from(decode_i32(
+                [words[0], words[1]],
+                WordOrder::LowHigh,
+            )))),
+            _ => Err(FatalError::Protocol(
+                "tag word count does not match plan".into(),
+            )),
         }
     }
 }
@@ -307,8 +344,51 @@ fn parse_read_address(
     data_type: &str,
     words: Option<u32>,
 ) -> Result<(Device, u32, ReadKind), String> {
+    if let Some((word, bit)) = text.strip_prefix('D').and_then(|rest| rest.split_once('.')) {
+        if data_type != "bit" || words.is_some() {
+            return Err("D word-bit requires bit type without string_words".into());
+        }
+        if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("invalid D word-bit address".into());
+        }
+        if bit.len() != 1 || !bit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("word bit must be one hexadecimal digit".into());
+        }
+        let number = word.parse::<u32>().map_err(|_| "D address exceeds u32")?;
+        let bit = u8::from_str_radix(bit, 16).map_err(|_| "invalid word bit")?;
+        return Ok((Device::D, number, ReadKind::WordBit(bit)));
+    }
+    // Long timer current values use four response words, including flags;
+    // long counter current values use two. The contact/coil aliases require
+    // a different word-unit request and are not parsed as ordinary bit tags.
+    for (prefix, device, kind) in [
+        ("LSTN", Device::LSTN, ReadKind::LongTimer),
+        ("LTN", Device::LTN, ReadKind::LongTimer),
+        ("LCN", Device::LCN, ReadKind::LongCounter),
+    ] {
+        if let Some(digits) = text.strip_prefix(prefix) {
+            if data_type != "i32" || words.is_some() {
+                return Err("long current value requires i32 without string_words".into());
+            }
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("invalid long device address".into());
+            }
+            let number = digits
+                .parse::<u32>()
+                .map_err(|_| "long device address exceeds u32")?;
+            return Ok((device, number, kind));
+        }
+    }
     // Multi-letter prefixes precede their single-letter names.
     let bit_prefixes = [
+        ("STS", Device::STS, 10),
+        ("STC", Device::STC, 10),
+        ("TS", Device::TS, 10),
+        ("TC", Device::TC, 10),
+        ("SS", Device::SS, 10),
+        ("SC", Device::SC, 10),
+        ("CS", Device::CS, 10),
+        ("CC", Device::CC, 10),
         ("SB", Device::SB, 16),
         ("SM", Device::SM, 10),
         ("M", Device::M, 10),
@@ -344,6 +424,25 @@ fn parse_read_address(
         return Ok((device, number, ReadKind::Bit));
     }
     let kind = DKind::parse(data_type, words)?;
+    for (prefix, device) in [
+        ("STN", Device::STN),
+        ("TN", Device::TN),
+        ("SN", Device::SN),
+        ("CN", Device::CN),
+    ] {
+        if let Some(digits) = text.strip_prefix(prefix) {
+            if kind.words() != 1 {
+                return Err("timer/counter current value is one word".into());
+            }
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("invalid timer/counter address".into());
+            }
+            let number = digits
+                .parse::<u32>()
+                .map_err(|_| "timer/counter address exceeds u32")?;
+            return Ok((device, number, ReadKind::Numeric(kind)));
+        }
+    }
     if text.starts_with('D') {
         let (number, kind) = parse_read_d(text, data_type, words)?;
         return Ok((Device::D, number, ReadKind::Numeric(kind)));
@@ -354,6 +453,8 @@ fn parse_read_address(
         (Device::SD, 10, digits)
     } else if let Some(digits) = text.strip_prefix('W') {
         (Device::W, 16, digits)
+    } else if let Some(digits) = text.strip_prefix("ZR") {
+        (Device::ZR, 16, digits)
     } else {
         return Err("unsupported word device address".into());
     };
@@ -392,6 +493,30 @@ fn canonical_read(device: Device, number: i64) -> Result<String, String> {
         Device::W => Ok(format!("W{number:X}")),
         Device::SW => Ok(format!("SW{number:X}")),
         Device::SD => Ok(format!("SD{number}")),
+        Device::TS => Ok(format!("TS{number}")),
+        Device::TC => Ok(format!("TC{number}")),
+        Device::TN => Ok(format!("TN{number}")),
+        Device::SS => Ok(format!("SS{number}")),
+        Device::SC => Ok(format!("SC{number}")),
+        Device::SN => Ok(format!("SN{number}")),
+        Device::STS => Ok(format!("STS{number}")),
+        Device::STC => Ok(format!("STC{number}")),
+        Device::STN => Ok(format!("STN{number}")),
+        Device::CS => Ok(format!("CS{number}")),
+        Device::CC => Ok(format!("CC{number}")),
+        Device::CN => Ok(format!("CN{number}")),
+        Device::LTN => Ok(format!("LTN{number}")),
+        Device::LSTN => Ok(format!("LSTN{number}")),
+        Device::LCN => Ok(format!("LCN{number}")),
+        Device::ZR => Ok(format!("ZR{number:X}")),
+    }
+}
+
+fn canonical_read_tag(device: Device, number: i64, kind: ReadKind) -> Result<String, String> {
+    let base = canonical_read(device, number)?;
+    match kind {
+        ReadKind::WordBit(bit) => Ok(format!("{base}.{bit:X}")),
+        _ => Ok(base),
     }
 }
 
@@ -457,7 +582,23 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
         | Device::SB
         | Device::SM
         | Device::SW
-        | Device::SD => PointCount::Unknown,
+        | Device::SD
+        | Device::TS
+        | Device::TC
+        | Device::TN
+        | Device::SS
+        | Device::SC
+        | Device::SN
+        | Device::STS
+        | Device::STC
+        | Device::STN
+        | Device::CS
+        | Device::CC
+        | Device::CN
+        | Device::LTN
+        | Device::LSTN
+        | Device::LCN
+        | Device::ZR => PointCount::Unknown,
     }
 }
 
@@ -470,6 +611,42 @@ fn checked_read_span(
     let (device, number, kind) =
         parse_read_address(&spec.address, &spec.data_type, spec.string_words)
             .map_err(FatalError::InvalidConfig)?;
+    // Q25PRH has only its separately checked internal-D map. The standard
+    // timer/counter and file-register maps must not be borrowed for it.
+    if !matches!(
+        device,
+        Device::D
+            | Device::W
+            | Device::SW
+            | Device::SD
+            | Device::M
+            | Device::X
+            | Device::Y
+            | Device::B
+            | Device::L
+            | Device::F
+            | Device::V
+            | Device::SB
+            | Device::SM
+    ) && (model.family == ModelFamily::Q25PrhWireOnly
+        || (matches!(
+            device,
+            Device::LTN | Device::LSTN | Device::LCN | Device::ZR
+        ) && model.family != ModelFamily::StandardR))
+    {
+        return Err(FatalError::InvalidConfig(
+            "device is unsupported for this CPU family".into(),
+        ));
+    }
+    if (matches!(device, Device::SS | Device::SC | Device::SN)
+        && model.family != ModelFamily::StandardQ)
+        || (matches!(device, Device::STS | Device::STC | Device::STN)
+            && model.family != ModelFamily::StandardR)
+    {
+        return Err(FatalError::InvalidConfig(
+            "retentive timer name does not match CPU series".into(),
+        ));
+    }
     if device == Device::W {
         match model.family {
             ModelFamily::StandardR => {}
@@ -871,13 +1048,14 @@ impl read::Guest for Component {
                 let mut results = Vec::with_capacity(p.covers.len());
                 for cover in &p.covers {
                     let spec = &specs[*cover as usize];
-                    let kind = DKind::parse(&spec.data_type, spec.string_words)
-                        .map_err(FatalError::Protocol)?;
-                    let end = offset + usize::from(kind.words());
+                    let (_, _, kind) =
+                        parse_read_address(&spec.address, &spec.data_type, spec.string_words)
+                            .map_err(FatalError::Protocol)?;
+                    let end = offset + usize::from(kind.points());
                     let tag_words = words
                         .get(offset..end)
                         .ok_or_else(|| FatalError::Protocol("tag words exceed response".into()))?;
-                    results.push(Ok(kind.decode(tag_words, conn.word_order)?));
+                    results.push(Ok(kind.decode_words(tag_words, conn.word_order)?));
                     offset = end;
                 }
                 if offset != words.len() {
@@ -1094,7 +1272,7 @@ impl address::Guest for Component {
     ) -> Result<address::Parsed, String> {
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
         Ok(address::Parsed {
-            canonical: canonical_read(device, i64::from(number))?,
+            canonical: canonical_read_tag(device, i64::from(number), kind)?,
             area: match device {
                 Device::M => "M",
                 Device::X => "X",
@@ -1109,13 +1287,33 @@ impl address::Guest for Component {
                 Device::W => "W",
                 Device::SW => "SW",
                 Device::SD => "SD",
+                Device::TS => "TS",
+                Device::TC => "TC",
+                Device::TN => "TN",
+                Device::SS => "SS",
+                Device::SC => "SC",
+                Device::SN => "SN",
+                Device::STS => "STS",
+                Device::STC => "STC",
+                Device::STN => "STN",
+                Device::CS => "CS",
+                Device::CC => "CC",
+                Device::CN => "CN",
+                Device::LTN => "LTN",
+                Device::LSTN => "LSTN",
+                Device::LCN => "LCN",
+                Device::ZR => "ZR",
             }
             .into(),
             // The existing write extension remains restricted to D/u16.
             // write-next also requires StandardR and a verified range.
             writable_area: device == Device::D && kind == ReadKind::Numeric(DKind::U16),
-            bit: None,
-            word_count: u32::from(kind.points()),
+            bit: if let ReadKind::WordBit(bit) = kind {
+                Some(bit)
+            } else {
+                None
+            },
+            word_count: kind.value_words(),
             index: Some(u64::from(number)),
         })
     }
@@ -1127,13 +1325,32 @@ impl address::Guest for Component {
         n: i64,
     ) -> Result<String, String> {
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
-        let point_offset = n
-            .checked_mul(i64::from(kind.points()))
-            .ok_or("offset overflow")?;
-        let next = i64::from(number)
-            .checked_add(point_offset)
-            .ok_or("offset overflow")?;
-        let next = canonical_read(device, next)?;
+        let next = if let ReadKind::WordBit(bit) = kind {
+            let start = i64::from(number)
+                .checked_mul(16)
+                .and_then(|v| v.checked_add(i64::from(bit)))
+                .ok_or("offset overflow")?;
+            let next_bit = start.checked_add(n).ok_or("offset overflow")?;
+            if next_bit < 0 {
+                return Err("offset before D0.0".into());
+            }
+            canonical_read_tag(
+                device,
+                next_bit / 16,
+                ReadKind::WordBit((next_bit % 16) as u8),
+            )?
+        } else {
+            let width = match kind {
+                ReadKind::Numeric(kind) => i64::from(kind.words()),
+                ReadKind::Bit | ReadKind::LongTimer | ReadKind::LongCounter => 1,
+                ReadKind::WordBit(_) => unreachable!(),
+            };
+            let point_offset = n.checked_mul(width).ok_or("offset overflow")?;
+            let next = i64::from(number)
+                .checked_add(point_offset)
+                .ok_or("offset overflow")?;
+            canonical_read_tag(device, next, kind)?
+        };
         parse_read_address(&next, &data_type, string_words)?;
         Ok(next)
     }
@@ -1148,24 +1365,35 @@ impl address::Guest for Component {
     }
 
     fn offset_words(text: String, n: i64) -> Result<String, String> {
-        let kind = if ["M", "X", "Y", "B", "L", "F", "V", "SB", "SM"]
+        if ["LTN", "LSTN", "LCN"]
             .iter()
             .any(|prefix| text.starts_with(prefix))
-            && !text.starts_with("SW")
+        {
+            return Err("offset_words is undefined for long current values".into());
+        }
+        let kind = if text.starts_with('D') && text.contains('.')
+            || [
+                "STS", "STC", "TS", "TC", "SS", "SC", "CS", "CC", "M", "X", "Y", "B", "L", "F",
+                "V", "SB", "SM",
+            ]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+                && !text.starts_with("SW")
         {
             "bit"
         } else {
             "u16"
         };
-        let (device, number, _) = parse_read_address(&text, kind, None)?;
-        canonical_read(
+        let (device, number, parsed_kind) = parse_read_address(&text, kind, None)?;
+        canonical_read_tag(
             device,
             i64::from(number).checked_add(n).ok_or("offset overflow")?,
+            parsed_kind,
         )
     }
 
     fn help() -> String {
-        "SLMP M/L/F/V/SM decimal and X/Y/B/SB hexadecimal bit reads; D/SD decimal and SW hexadecimal numeric reads; standard iQ-R also reads W hexadecimal. New area ranges are unknown and use one request per tag. Writes remain D/u16 only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R LTN/LSTN/LCN i32 current values and hexadecimal ZR are supported, but block-switched R is not. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Writes remain D/u16 only"
             .into()
     }
 
@@ -1292,6 +1520,166 @@ mod tests {
             code: 0,
             family,
         }
+    }
+
+    #[test]
+    fn timer_file_and_word_bit_metadata_and_restrictions() {
+        let q = model(ModelFamily::StandardQ);
+        let r = model(ModelFamily::StandardR);
+        let q25 = model(ModelFamily::Q25PrhWireOnly);
+        for (text, kind, device, number, points) in [
+            ("TS12", "bit", Device::TS, 12, 1),
+            ("TC12", "bit", Device::TC, 12, 1),
+            ("TN12", "u16", Device::TN, 12, 1),
+            ("SS4", "bit", Device::SS, 4, 1),
+            ("SC4", "bit", Device::SC, 4, 1),
+            ("SN4", "i16", Device::SN, 4, 1),
+            ("CS3", "bit", Device::CS, 3, 1),
+            ("CC3", "bit", Device::CC, 3, 1),
+            ("CN3", "u16", Device::CN, 3, 1),
+            ("D10.F", "bit", Device::D, 10, 1),
+        ] {
+            let spec = TagSpec {
+                address: text.into(),
+                data_type: kind.into(),
+                string_words: None,
+            };
+            let span =
+                checked_read_span(&spec, &q, PointCount::Exact(32), PointCount::Unknown).unwrap();
+            assert_eq!(
+                (span.device, span.start, span.count),
+                (device, number, points)
+            );
+            assert!(
+                !<Component as address::Guest>::parse(text.into(), kind.into(), None)
+                    .unwrap()
+                    .writable_area
+            );
+            if device != Device::D {
+                assert!(
+                    checked_read_span(&spec, &q25, PointCount::Unknown, PointCount::Unknown)
+                        .is_err()
+                );
+            }
+        }
+        for (text, device, count) in [
+            ("LTN4", Device::LTN, 4),
+            ("LSTN4", Device::LSTN, 4),
+            ("LCN4", Device::LCN, 2),
+        ] {
+            let spec = TagSpec {
+                address: text.into(),
+                data_type: "i32".into(),
+                string_words: None,
+            };
+            assert_eq!(
+                checked_read_span(&spec, &r, PointCount::Unknown, PointCount::Unknown).unwrap(),
+                ReadSpan {
+                    device,
+                    start: 4,
+                    count
+                }
+            );
+            assert!(
+                checked_read_span(&spec, &q, PointCount::Unknown, PointCount::Unknown).is_err()
+            );
+            assert_eq!(
+                <Component as address::Guest>::parse(text.into(), "i32".into(), None)
+                    .unwrap()
+                    .word_count,
+                2
+            );
+        }
+        for (text, kind, device) in [
+            ("STS4", "bit", Device::STS),
+            ("STC4", "bit", Device::STC),
+            ("STN4", "u16", Device::STN),
+        ] {
+            let spec = TagSpec {
+                address: text.into(),
+                data_type: kind.into(),
+                string_words: None,
+            };
+            assert_eq!(
+                checked_read_span(&spec, &r, PointCount::Unknown, PointCount::Unknown)
+                    .unwrap()
+                    .device,
+                device
+            );
+            assert!(
+                checked_read_span(&spec, &q, PointCount::Unknown, PointCount::Unknown).is_err()
+            );
+        }
+        let q_ret = TagSpec {
+            address: "SS4".into(),
+            data_type: "bit".into(),
+            string_words: None,
+        };
+        assert!(checked_read_span(&q_ret, &r, PointCount::Unknown, PointCount::Unknown).is_err());
+        let zr = TagSpec {
+            address: "ZR1a".into(),
+            data_type: "u32".into(),
+            string_words: None,
+        };
+        assert_eq!(
+            checked_read_span(&zr, &r, PointCount::Unknown, PointCount::Unknown).unwrap(),
+            ReadSpan {
+                device: Device::ZR,
+                start: 26,
+                count: 2
+            }
+        );
+        assert!(checked_read_span(&zr, &q, PointCount::Unknown, PointCount::Unknown).is_err());
+        let parsed =
+            <Component as address::Guest>::parse("D10.f".into(), "bit".into(), None).unwrap();
+        assert_eq!(
+            (
+                parsed.canonical.as_str(),
+                parsed.area.as_str(),
+                parsed.index,
+                parsed.bit,
+                parsed.word_count
+            ),
+            ("D10.F", "D", Some(10), Some(15), 1)
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset("D10.F".into(), "bit".into(), None, 1).unwrap(),
+            "D11.0"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset("LTN4".into(), "i32".into(), None, 1).unwrap(),
+            "LTN5"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("D10.F".into(), 1).unwrap(),
+            "D11.F"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset("ZR1A".into(), "u32".into(), None, 1).unwrap(),
+            "ZR1C"
+        );
+        for (text, kind) in [
+            ("D0.G", "bit"),
+            ("D0.10", "bit"),
+            ("D0.0", "u16"),
+            ("TN1", "u32"),
+            ("LTS1", "bit"),
+            ("LCN1", "u32"),
+            ("R1", "u16"),
+        ] {
+            assert!(
+                parse_read_address(text, kind, None).is_err(),
+                "{text}/{kind}"
+            );
+        }
+        assert!(matches!(
+            ReadKind::WordBit(15).decode_words(&[0x8000], WordOrder::LowHigh),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            ReadKind::LongTimer.decode_words(&[0x1234, 0xffff, 3, 0], WordOrder::HighLow),
+            Ok(Value::Int(-60876))
+        ));
     }
 
     #[test]
@@ -1429,7 +1817,6 @@ mod tests {
             ("SW1G", "u16"),
             ("L1", "u16"),
             ("SW1", "bit"),
-            ("D0.0", "bit"),
             ("SWFFFFFFFF", "f64"),
         ] {
             assert!(
