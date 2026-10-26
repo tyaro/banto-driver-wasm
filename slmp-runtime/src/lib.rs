@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn write_extension_borrows_the_same_discovered_resource() -> wasmtime::Result<()> {
-        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::banto::driver::types::{ItemError, Setting, TagSpec, Value};
         use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
         let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
         let engine = Engine::default();
@@ -344,7 +344,9 @@ mod tests {
             }
             let item = WriteItem {
                 spec: TagSpec {
-                    address: "D0".into(),
+                    // D31 is allowlisted and was sent above with valid R SD
+                    // evidence. A refusal here must be caused by missing SD.
+                    address: if name == "R04CPU" { "D31" } else { "D0" }.into(),
                     data_type: "u16".into(),
                     string_words: None,
                 },
@@ -354,6 +356,14 @@ mod tests {
                 .banto_driver_write_v1()
                 .call_write_next(&mut store, conn, std::slice::from_ref(&item), None)?
                 .expect("no-send rejection");
+            if name == "R04CPU" {
+                assert!(
+                    matches!(&outcome, WriteProgress::Done(results)
+                    if matches!(results.as_slice(), [Err(ItemError::Rejected(message))]
+                        if message.contains("same-connection SD range"))),
+                    "allowlisted D31 must be rejected specifically for missing R SD evidence"
+                );
+            }
             assert!(
                 matches!(outcome, WriteProgress::Done(items) if matches!(items.as_slice(), [Err(_)])),
                 "{name}"
