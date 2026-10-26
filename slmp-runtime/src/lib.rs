@@ -1074,6 +1074,7 @@ mod tests {
                 string_words: None,
             },
             bit_spec("D10.F"),
+            bit_spec("LCS1"), // R-only; must remain uncovered on Q.
         ];
         let plans = driver
             .banto_driver_read()
@@ -1155,12 +1156,14 @@ mod tests {
                 data_type: "u16".into(),
                 string_words: None,
             },
+            bit_spec("LCS5"),
+            bit_spec("LCC6"),
         ];
         let plans = driver
             .banto_driver_read()
             .call_plan(&mut store, r, &r_specs)?
             .expect("R plans");
-        assert_eq!(plans.len(), 5, "unproven file/timer ranges stay separate");
+        assert_eq!(plans.len(), 7, "unproven file/timer ranges stay separate");
         for (i, (code, sub, points, body)) in [
             (0xb0, 2u8, 1u8, vec![0x02, 0x01]),
             (
@@ -1172,6 +1175,8 @@ mod tests {
             (0x56, 2u8, 2u8, vec![0xfe, 0xff, 0xff, 0xff]),
             (0xc7, 3u8, 1u8, vec![0x10]),
             (0xc8, 2u8, 1u8, vec![0x78, 0x56]),
+            (0x55, 3u8, 1u8, vec![0x10]),
+            (0x54, 3u8, 1u8, vec![0x00]),
         ]
         .into_iter()
         .enumerate()
@@ -1192,6 +1197,8 @@ mod tests {
                     || matches!(values.as_slice(), [Ok(Value::Int(-2))] if i == 2)
                     || matches!(values.as_slice(), [Ok(Value::Bool(true))] if i == 3)
                     || matches!(values.as_slice(), [Ok(Value::Uint(0x5678))] if i == 4)
+                    || matches!(values.as_slice(), [Ok(Value::Bool(true))] if i == 5)
+                    || matches!(values.as_slice(), [Ok(Value::Bool(false))] if i == 6)
             );
         }
         r.resource_drop(&mut store)?;

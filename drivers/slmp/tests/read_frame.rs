@@ -149,6 +149,20 @@ fn timer_counter_and_serial_file_codes_follow_mc_word_and_bit_units() {
             &[2, 0, 0x23, 1, 0, 0, code, 0, count as u8, 0]
         );
     }
+    // Unlike long timer contacts, the R long counter contact and coil are
+    // allowed as ordinary 0401 bit-unit head devices (MC pp.69, 90-91).
+    for (device, code) in [(Device::LCS, 0x55), (Device::LCC, 0x54)] {
+        let frame = encode_read(Route::default(), Series::R, span(device, 123, 1)).unwrap();
+        assert_eq!(&frame[17..], &[3, 0, 123, 0, 0, 0, code, 0, 1, 0]);
+        assert_eq!(
+            decode_read(
+                Route::default(),
+                span(device, 123, 1),
+                &[0xd4, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 3, 0, 0, 0, 0x10]
+            ),
+            Ok(Values::Bits(vec![true]))
+        );
+    }
 }
 
 #[test]

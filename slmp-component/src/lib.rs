@@ -381,6 +381,8 @@ fn parse_read_address(
     }
     // Multi-letter prefixes precede their single-letter names.
     let bit_prefixes = [
+        ("LCS", Device::LCS, 10),
+        ("LCC", Device::LCC, 10),
         ("STS", Device::STS, 10),
         ("STC", Device::STC, 10),
         ("TS", Device::TS, 10),
@@ -508,6 +510,8 @@ fn canonical_read(device: Device, number: i64) -> Result<String, String> {
         Device::LTN => Ok(format!("LTN{number}")),
         Device::LSTN => Ok(format!("LSTN{number}")),
         Device::LCN => Ok(format!("LCN{number}")),
+        Device::LCS => Ok(format!("LCS{number}")),
+        Device::LCC => Ok(format!("LCC{number}")),
         Device::ZR => Ok(format!("ZR{number:X}")),
     }
 }
@@ -598,6 +602,8 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
         | Device::LTN
         | Device::LSTN
         | Device::LCN
+        | Device::LCS
+        | Device::LCC
         | Device::ZR => PointCount::Unknown,
     }
 }
@@ -631,7 +637,7 @@ fn checked_read_span(
     ) && (model.family == ModelFamily::Q25PrhWireOnly
         || (matches!(
             device,
-            Device::LTN | Device::LSTN | Device::LCN | Device::ZR
+            Device::LTN | Device::LSTN | Device::LCN | Device::LCS | Device::LCC | Device::ZR
         ) && model.family != ModelFamily::StandardR))
     {
         return Err(FatalError::InvalidConfig(
@@ -1302,6 +1308,8 @@ impl address::Guest for Component {
                 Device::LTN => "LTN",
                 Device::LSTN => "LSTN",
                 Device::LCN => "LCN",
+                Device::LCS => "LCS",
+                Device::LCC => "LCC",
                 Device::ZR => "ZR",
             }
             .into(),
@@ -1393,7 +1401,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R LTN/LSTN/LCN i32 current values and hexadecimal ZR are supported, but block-switched R is not. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Writes remain D/u16 only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Writes remain D/u16 only"
             .into()
     }
 
@@ -1594,6 +1602,8 @@ mod tests {
             ("STS4", "bit", Device::STS),
             ("STC4", "bit", Device::STC),
             ("STN4", "u16", Device::STN),
+            ("LCS4", "bit", Device::LCS),
+            ("LCC4", "bit", Device::LCC),
         ] {
             let spec = TagSpec {
                 address: text.into(),
@@ -1664,6 +1674,7 @@ mod tests {
             ("D0.0", "u16"),
             ("TN1", "u32"),
             ("LTS1", "bit"),
+            ("LCS1A", "bit"),
             ("LCN1", "u32"),
             ("R1", "u16"),
         ] {

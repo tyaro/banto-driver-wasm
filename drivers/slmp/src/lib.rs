@@ -56,6 +56,8 @@ pub enum Device {
     LTN,
     LSTN,
     LCN,
+    LCS,
+    LCC,
     ZR,
 }
 
@@ -90,6 +92,8 @@ impl Device {
             Self::LTN => 0x52,
             Self::LSTN => 0x5a,
             Self::LCN => 0x56,
+            Self::LCS => 0x55,
+            Self::LCC => 0x54,
             Self::ZR => 0xb0,
         }
     }
@@ -114,6 +118,8 @@ impl Device {
                 | Self::STC
                 | Self::CS
                 | Self::CC
+                | Self::LCS
+                | Self::LCC
         )
     }
 }
