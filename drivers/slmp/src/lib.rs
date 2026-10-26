@@ -185,6 +185,21 @@ pub fn encode_r_d_write(route: Route, number: u32, value: u16) -> Vec<u8> {
     encode_r_d_words(route, number, &[value]).expect("one D word fits a 4E request")
 }
 
+/// Test-only Q25PRH wire frame for exactly D3010..D3013. The guest must
+/// establish the exact 0101 name/code pair and a separate opt-in before use.
+pub fn encode_q25prh_d3010_3013_test_write(route: Route, words: [u16; 4]) -> Vec<u8> {
+    let mut out = request_head(route, 20);
+    out.extend_from_slice(&0x1401u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // Q word-unit subcommand
+    out.extend_from_slice(&[0xc2, 0x0b, 0]); // D3010, 24-bit Q address
+    out.push(Device::D.code());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
 /// A successful 1401 response has no data after its end code.
 pub fn decode_write_ack(route: Route, frame: &[u8]) -> Result<(), ResponseError> {
     if response_data(route, frame)?.is_empty() {

@@ -9,9 +9,10 @@ use banto_register_codec::{
     decode_f32, decode_f64, decode_i16, decode_i32, decode_i64, decode_u32, decode_u64, WordOrder,
 };
 use banto_slmp_read_core::{
-    basic_sd_count, decode_read, decode_type_name, decode_write_ack, encode_r_d_words, encode_read,
-    encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount,
-    ReadSpan, ResponseError, Route, Series, TypeName, Values,
+    basic_sd_count, decode_read, decode_type_name, decode_write_ack,
+    encode_q25prh_d3010_3013_test_write, encode_r_d_words, encode_read, encode_type_name,
+    plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount, ReadSpan,
+    ResponseError, Route, Series, TypeName, Values,
 };
 use exports::banto::driver::{address, config, read, session, write_v1};
 
@@ -39,6 +40,8 @@ enum Phase {
 struct SlmpConnection {
     base_route: Route,
     word_order: WordOrder,
+    q25prh_test_write_enabled: bool,
+    q25prh_internal_d_count: Cell<PointCount>,
     next_serial: Cell<u16>,
     phase: RefCell<Phase>,
     w_count: Cell<PointCount>,
@@ -179,7 +182,7 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
         }
         if !matches!(
             item.key.as_str(),
-            "host" | "port" | "transport" | "word_order"
+            "host" | "port" | "transport" | "word_order" | "q25prh_d3010_3013_test_write"
         ) {
             errors.push(config::FieldError {
                 key: item.key.clone(),
@@ -214,6 +217,14 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
         errors.push(config::FieldError {
             key: "word_order".into(),
             message: "word_order must be low_high or high_low".into(),
+        });
+    }
+    if setting(settings, "q25prh_d3010_3013_test_write")
+        .is_some_and(|value| !matches!(value, "disabled" | "enabled"))
+    {
+        errors.push(config::FieldError {
+            key: "q25prh_d3010_3013_test_write".into(),
+            message: "Q25PRH test write must be disabled or explicitly enabled".into(),
         });
     }
     errors
@@ -314,6 +325,13 @@ fn assess_d_span(model: &TypeName, count: PointCount, number: u32, words: u16) -
     }
 }
 
+fn count_guarantees_span(count: PointCount, number: u32, words: u16) -> bool {
+    let Some(end_exclusive) = number.checked_add(u32::from(words)) else {
+        return false;
+    };
+    matches!(count, PointCount::Exact(limit) | PointCount::AtLeast(limit) if end_exclusive <= limit)
+}
+
 fn checked_read_span(
     spec: &TagSpec,
     model: &TypeName,
@@ -356,6 +374,9 @@ impl session::GuestConnection for SlmpConnection {
                 Some("high_low") => WordOrder::HighLow,
                 _ => WordOrder::LowHigh,
             },
+            q25prh_test_write_enabled: setting(&settings, "q25prh_d3010_3013_test_write")
+                == Some("enabled"),
+            q25prh_internal_d_count: Cell::new(PointCount::Unknown),
             next_serial: Cell::new(1),
             phase: RefCell::new(Phase::Start),
             w_count: Cell::new(PointCount::Unknown),
@@ -390,14 +411,7 @@ impl session::GuestConnection for SlmpConnection {
                 let area = match model.family {
                     ModelFamily::StandardQ => BasicArea::DInternal,
                     ModelFamily::StandardR => BasicArea::D,
-                    ModelFamily::Q25PrhWireOnly => {
-                        // Q word wire is established, but the SD302 map is not.
-                        *self.phase.borrow_mut() = Phase::Ready {
-                            model,
-                            count: PointCount::Unknown,
-                        };
-                        return Ok(None);
-                    }
+                    ModelFamily::Q25PrhWireOnly => BasicArea::DInternal,
                     ModelFamily::Unknown => {
                         *self.phase.borrow_mut() = Phase::NoRange(Some(model));
                         return Ok(None);
@@ -436,7 +450,10 @@ impl session::GuestConnection for SlmpConnection {
                         return Err(FatalError::Protocol("SD read returned bits".into()));
                     }
                 };
-                let area = if model.family == ModelFamily::StandardQ {
+                let area = if matches!(
+                    model.family,
+                    ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly
+                ) {
                     BasicArea::DInternal
                 } else {
                     BasicArea::D
@@ -456,7 +473,18 @@ impl session::GuestConnection for SlmpConnection {
                 } else {
                     basic_sd_count(&model, area, evidence, Some(&words))
                 };
-                *self.phase.borrow_mut() = Phase::Ready { model, count };
+                if model.family == ModelFamily::Q25PrhWireOnly {
+                    // Preserve the existing unknown-range read policy. This
+                    // separately obtained internal prefix gates only the
+                    // explicit four-word test write on this connection.
+                    self.q25prh_internal_d_count.set(count);
+                    *self.phase.borrow_mut() = Phase::Ready {
+                        model,
+                        count: PointCount::Unknown,
+                    };
+                } else {
+                    *self.phase.borrow_mut() = Phase::Ready { model, count };
+                }
                 Ok(None)
             }
             (Phase::Ready { model, count }, None) => {
@@ -792,18 +820,35 @@ impl write_v1::Guest for Component {
             Phase::Ready { model, count } => (model.clone(), *count),
             _ => return Ok(rejected_write_count(items.len(), "discovery is incomplete")),
         };
-        if model.family != ModelFamily::StandardR {
+        let q25prh_test = conn.q25prh_test_write_enabled
+            && model.family == ModelFamily::Q25PrhWireOnly
+            && model.name == "Q25PRHCPU"
+            && model.code == 0x004c;
+        if model.family != ModelFamily::StandardR && !q25prh_test {
             return Ok(rejected_write_count(
                 items.len(),
-                "write requires a confirmed standard iQ-R CPU",
+                "write requires confirmed StandardR or explicit Q25PRH test mode",
             ));
         }
         let (number, values) = match parse_write_run(&items) {
             Ok(run) => run,
             Err(message) => return Ok(rejected_write_count(items.len(), &message)),
         };
-        if assess_d_span(&model, count, number, values.len() as u16)
-            != RangeAssessment::VerifiedInside
+        if q25prh_test && (number != 3010 || values.len() != 4) {
+            return Ok(rejected_write_count(
+                items.len(),
+                "Q25PRH test write requires exactly D3010..D3013/u16",
+            ));
+        }
+        if q25prh_test && !count_guarantees_span(conn.q25prh_internal_d_count.get(), number, 4) {
+            return Ok(rejected_write_count(
+                items.len(),
+                "Q25PRH SD302 does not confirm the full D3010..D3013 test span",
+            ));
+        }
+        if !q25prh_test
+            && assess_d_span(&model, count, number, values.len() as u16)
+                != RangeAssessment::VerifiedInside
         {
             return Ok(rejected_write_count(
                 items.len(),
@@ -811,8 +856,15 @@ impl write_v1::Guest for Component {
             ));
         }
         let route = conn.route();
-        let send = encode_r_d_words(route, number, &values)
-            .map_err(|_| FatalError::Protocol("validated write span cannot be encoded".into()))?;
+        let send = if q25prh_test {
+            // This opt-in never upgrades Q's unknown configured D count.
+            let words: [u16; 4] = values.as_slice().try_into().expect("checked Q test width");
+            encode_q25prh_d3010_3013_test_write(route, words)
+        } else {
+            encode_r_d_words(route, number, &values).map_err(|_| {
+                FatalError::Protocol("validated write span cannot be encoded".into())
+            })?
+        };
         *conn.pending_write.borrow_mut() = Some(PendingWrite {
             route,
             number,
@@ -980,6 +1032,24 @@ impl config::Guest for Component {
                 ]),
                 required: false,
                 default: Some(SettingValue::Text("low_high".into())),
+                group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "q25prh_d3010_3013_test_write".into(),
+                label: "Q25PRH D3010-D3013 test write".into(),
+                help: Some("Test only. Requires exact Q25PRHCPU / 004CH discovery, same-connection SD302 proof of the full four-word span, and a dedicated Host write gate. Does not enable production writes.".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption {
+                        value: "disabled".into(),
+                        label: "Disabled".into(),
+                    },
+                    ChoiceOption {
+                        value: "enabled".into(),
+                        label: "Enabled for controlled test only".into(),
+                    },
+                ]),
+                required: false,
+                default: Some(SettingValue::Text("disabled".into())),
                 group: FieldGroup::Advanced,
             },
         ]
@@ -1202,6 +1272,48 @@ mod tests {
         assert!(validate_settings(&bad)
             .iter()
             .any(|e| e.key == "word_order"));
+    }
+
+    #[test]
+    fn q25prh_write_setting_is_schema_declared_disabled_by_default() {
+        let mut settings = vec![
+            session::Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            session::Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+        ];
+        assert!(validate_settings(&settings).is_empty());
+        settings.push(session::Setting {
+            key: "q25prh_d3010_3013_test_write".into(),
+            value: "disabled".into(),
+        });
+        assert!(validate_settings(&settings).is_empty());
+        settings.pop();
+        settings.push(session::Setting {
+            key: "q25prh_d3010_3013_test_write".into(),
+            value: "enabled".into(),
+        });
+        assert!(validate_settings(&settings).is_empty());
+        settings[2].value = "true".into();
+        assert!(validate_settings(&settings)
+            .iter()
+            .any(|error| error.key == "q25prh_d3010_3013_test_write"));
+        let schema = <Component as config::Guest>::schema();
+        let field = schema
+            .iter()
+            .find(|field| field.key == "q25prh_d3010_3013_test_write")
+            .expect("controlled test setting must be declared for normal settings validation");
+        assert!(
+            matches!(&field.default, Some(config::SettingValue::Text(value)) if value == "disabled")
+        );
+        assert!(!field.required);
+        assert!(matches!(&field.group, config::FieldGroup::Advanced));
+        assert!(matches!(&field.kind, config::FieldKind::Choice(options)
+            if options.iter().map(|option| option.value.as_str()).collect::<Vec<_>>() == ["disabled", "enabled"]));
     }
 }
 

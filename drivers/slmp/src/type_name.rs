@@ -1,5 +1,5 @@
 //! 0101/0000 Read Type Name (binary 4E). The lookup is deliberately limited
-//! to ordinary Q and iQ-R/EN CPU pairs plus the wire-only Q25PRH pair in
+//! to ordinary Q and iQ-R/EN CPU pairs plus the narrow Q25PRH pair in
 //! the official model-code table.
 use alloc::{string::String, vec::Vec};
 
@@ -9,7 +9,7 @@ use crate::{request_head, response_data, ResponseError, Route};
 pub enum ModelFamily {
     StandardQ,
     StandardR,
-    /// Exact Q25PRHCPU/004CH pair: Q 0401 wire only; SD applicability unverified.
+    /// Exact Q25PRHCPU/004CH pair: Q wire and SD302 internal-D only.
     Q25PrhWireOnly,
     /// Valid 0101 data whose name/code pair is not in the supported table.
     Unknown,

@@ -1,5 +1,6 @@
 use banto_slmp_read_core::{
-    decode_write_ack, encode_r_d_words, encode_r_d_write, RequestError, ResponseError, Route,
+    decode_write_ack, encode_q25prh_d3010_3013_test_write, encode_r_d_words, encode_r_d_write,
+    RequestError, ResponseError, Route,
 };
 
 // Binary 4E, 1401/0002, D31=0x1234; independently transcribed from the
@@ -14,6 +15,11 @@ const R_D3010_FOUR_WRITE: [u8; 35] = [
     0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 22, 0, 0x10, 0, 1, 0x14, 2, 0, 0xc2, 0x0b, 0, 0,
     0xa8, 0, 4, 0, 1, 0, 2, 0, 3, 0, 4, 0,
 ];
+// Independent Q 4E wire fixture: 1401/0000, 24-bit D3010, count 4.
+const Q_D3010_FOUR_TEST_WRITE: [u8; 33] = [
+    0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 20, 0, 0x10, 0, 1, 0x14, 0, 0, 0xc2, 0x0b, 0, 0xa8,
+    4, 0, 1, 0, 2, 0, 3, 0, 4, 0,
+];
 
 #[test]
 fn r_single_d_write_matches_independent_wire_fixture() {
@@ -26,6 +32,15 @@ fn r_four_d_words_match_independent_loopback_fixture() {
     assert_eq!(
         encode_r_d_words(Route::default(), 3010, &[1, 2, 3, 4]),
         Ok(R_D3010_FOUR_WRITE.to_vec())
+    );
+    assert_eq!(decode_write_ack(Route::default(), &ACK), Ok(()));
+}
+
+#[test]
+fn q25prh_four_word_test_frame_uses_q_subcommand_and_24_bit_address() {
+    assert_eq!(
+        encode_q25prh_d3010_3013_test_write(Route::default(), [1, 2, 3, 4]),
+        Q_D3010_FOUR_TEST_WRITE
     );
     assert_eq!(decode_write_ack(Route::default(), &ACK), Ok(()));
 }

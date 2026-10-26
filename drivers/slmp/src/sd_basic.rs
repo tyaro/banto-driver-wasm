@@ -52,12 +52,13 @@ pub enum PointCount {
     Unknown,
 }
 
-/// Return one 0401 word-unit SD read for a recognized standard model and
-/// basic field. No I/O is performed. Unsupported/conditional Q extension
+/// Return one 0401 word-unit SD read for a recognized standard model or the
+/// Q25PRH internal-D field. No I/O is performed. Unsupported/conditional Q extension
 /// fields (including Q ZR and SD647) are deliberately absent from this stage.
 pub fn plan_basic_sd(model: &TypeName, area: BasicArea) -> Option<ReadSpan> {
     let (start, count) = match model.family {
         ModelFamily::StandardQ => (q_sd(area)?, 1),
+        ModelFamily::Q25PrhWireOnly if area == BasicArea::DInternal => (302, 1),
         ModelFamily::StandardR => r_sd(area)?,
         ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => return None,
     };
@@ -97,12 +98,13 @@ pub fn basic_sd_count(
     } else {
         decode_u32([words[0], words[1]], WordOrder::LowHigh)
     };
-    if model.family == ModelFamily::StandardQ
-        && matches!(
-            area,
-            BasicArea::M | BasicArea::B | BasicArea::DInternal | BasicArea::WInternal
-        )
-        && count == 32768
+    if matches!(
+        model.family,
+        ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly
+    ) && matches!(
+        area,
+        BasicArea::M | BasicArea::B | BasicArea::DInternal | BasicArea::WInternal
+    ) && count == 32768
     {
         PointCount::AtLeast(32768)
     } else {

@@ -1,5 +1,10 @@
 # STATUS
 
+## Local Q25PRH four-word write simulation (2026-10-26)
+
+- Based on merged PR #22 main `4d857074ba3bd81ec862d5c8729b4f862b738582`. The advanced test setting defaults to `disabled`; only explicit `enabled`, the exact `Q25PRHCPU / 004CH` 0101 pair, and a same-connection SD302 count guaranteeing all four internal D points gate one Q `1401/0000` frame for only `D3010..D3013/u16` with four validated values. Saving this setting does not open the production Host write gate. Refused, short, missing, or insufficient SD evidence fails closed; SD302=32768 is a guaranteed prefix. General Q read range remains unknown, and the StandardR write path is unchanged. No WIT, Hub, production permission, or PLC connection is changed. [QnPRH assignment, PDF p.22](https://www.mitsubishielectric.com/fa/document/technews/plc/fa-a-0214/faa0214a.pdf#page=22).
+- The controlled Wasmtime fixture checks Q frame bytes, full-item ACK mapping, no-send rejection, and no replay after an uncertain ACK. This is local simulation, not a Q PLC write or confirmation of its physical port.
+
 ## Controlled simulation: contiguous StandardR D/u16 write (2026-10-26)
 
 - This range-write stage starts at main `fd0db137139b25f2055ce5019cc1fea4bd0eafdc` (merged FC4/W PR #21). The FC4/W read behavior is retained; its reviewed head is unchanged.
@@ -19,7 +24,7 @@
 
 ## Current stage: Q25PRHCPU wire-only read
 
-- The exact `Q25PRHCPU / 004CH` 0101 pair now establishes Q word-read framing without classifying it as standard Q for SD planning. The guest sends no SD request, retains an unknown D count, and sends explicit D/u16 tags individually, including adjacent tags. Mismatched names/codes and 0101 refusals do not establish the wire format. [SLMP Reference Manual, printed p.139](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141).
+- The exact `Q25PRHCPU / 004CH` 0101 pair establishes Q word-read framing and plans SD302 only. A same-connection SD302 reply is retained separately for the gated local write test; ordinary explicit D reads remain individual with an unknown range verdict. Mismatched names/codes and 0101 refusals establish neither wire format nor SD302 mapping. [SLMP Reference Manual, printed p.139](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141), [Mitsubishi QnPRH bulletin, PDF p.22](https://www.mitsubishielectric.com/fa/document/technews/plc/fa-a-0214/faa0214a.pdf#page=22).
 - The existing WIT and standard Q/R behavior remain unchanged. No live PLC communication, redundant-route selection, write, or Hub implementation is part of this stage.
 - Rust 1.98.1 local checks cover 26 SLMP core fixtures, the component unit/doc tests, 12 controlled real Wasmtime fixtures, formatting, Clippy, wasm32 target check, WIT target validation, scaffold guard, and 17 CI classification tests.
 
