@@ -9,6 +9,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "banto-register-codec"
+version = "0.3.0-alpha.1"
+source = "git+https://github.com/tyaro/banto-industrial.git?rev=e4afe793cbae08ab4afd88467c8577010020957f#e4afe793cbae08ab4afd88467c8577010020957f"
+
+[[package]]
 name = "banto-slmp-read-component"
 version = "0.0.0"
 dependencies = [
@@ -19,6 +24,9 @@ dependencies = [
 [[package]]
 name = "banto-slmp-read-core"
 version = "0.0.0"
+dependencies = [
+ "banto-register-codec",
+]
 
 [[package]]
 name = "bitflags"

@@ -1,6 +1,7 @@
 //! Conditional QnU ZR point-count read. No file-capacity or D/W-total
 //! inference is performed here.
 use crate::{Device, ModelFamily, PointCount, ReadSpan, TypeName};
+use banto_register_codec::{decode_u32, WordOrder};
 
 /// Evidence provided by a later connection workflow for this exact CPU,
 /// firmware, route, and acquisition generation. Unknown is the default.
@@ -42,7 +43,7 @@ pub fn decode_q_zr_count(
         return PointCount::Unknown;
     }
     match words {
-        Some([low, high]) => PointCount::Exact(u32::from(*low) | (u32::from(*high) << 16)),
+        Some([low, high]) => PointCount::Exact(decode_u32([*low, *high], WordOrder::LowHigh)),
         _ => PointCount::Unknown,
     }
 }

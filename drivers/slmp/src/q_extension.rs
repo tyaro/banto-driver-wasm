@@ -1,6 +1,7 @@
 //! Conditional Q SD282-289 reads. M/B pairs give complete configured counts;
 //! fast D/W pairs give internal counts only. No totals are synthesized.
 use crate::{Device, ModelFamily, PointCount, ReadSpan, TypeName};
+use banto_register_codec::{decode_u32, WordOrder};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QExtensionArea {
@@ -76,7 +77,7 @@ pub fn decode_q_extension_count(
         return PointCount::Unknown;
     }
     match words {
-        Some([low, high]) => PointCount::Exact(u32::from(*low) | (u32::from(*high) << 16)),
+        Some([low, high]) => PointCount::Exact(decode_u32([*low, *high], WordOrder::LowHigh)),
         _ => PointCount::Unknown,
     }
 }
