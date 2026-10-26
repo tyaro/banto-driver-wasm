@@ -59,6 +59,7 @@ pub fn plan_basic_sd(model: &TypeName, area: BasicArea) -> Option<ReadSpan> {
     let (start, count) = match model.family {
         ModelFamily::StandardQ => (q_sd(area)?, 1),
         ModelFamily::Q25PrhWireOnly if area == BasicArea::DInternal => (302, 1),
+        ModelFamily::Q25PrhWireOnly if area == BasicArea::WInternal => (303, 1),
         ModelFamily::StandardR => r_sd(area)?,
         ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => return None,
     };

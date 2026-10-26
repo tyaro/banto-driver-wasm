@@ -108,6 +108,17 @@ fn additional_bit_and_word_codes_keep_q_r_units_and_radices() {
 
 #[test]
 fn timer_counter_and_serial_file_codes_follow_mc_word_and_bit_units() {
+    // MC pp.69,87: LTS/LTC and LSTS/LSTC cannot head a bit-unit batch.
+    // Their logical tags read the LTN/LSTN four-word response flags instead.
+    for (device, code) in [
+        (Device::LTS, 0x52),
+        (Device::LTC, 0x52),
+        (Device::LSTS, 0x5a),
+        (Device::LSTC, 0x5a),
+    ] {
+        let frame = encode_read(Route::default(), Series::R, span(device, 7, 4)).unwrap();
+        assert_eq!(&frame[17..], &[2, 0, 7, 0, 0, 0, code, 0, 4, 0]);
+    }
     // Independent MC code table, printed pp.68-69. The long timer request
     // uses four word access points per one logical timer (printed p.87).
     for (device, code) in [
