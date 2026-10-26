@@ -17,6 +17,7 @@ source = "git+https://github.com/tyaro/banto-industrial.git?rev=e4afe793cbae08ab
 name = "banto-slmp-read-component"
 version = "0.0.0"
 dependencies = [
+ "banto-register-codec",
  "banto-slmp-read-core",
  "wit-bindgen",
 ]

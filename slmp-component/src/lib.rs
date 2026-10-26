@@ -5,6 +5,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
+use banto_register_codec::{
+    decode_f32, decode_f64, decode_i16, decode_i32, decode_i64, decode_u32, decode_u64, WordOrder,
+};
 use banto_slmp_read_core::{
     basic_sd_count, decode_read, decode_type_name, decode_write_ack, encode_r_d_write, encode_read,
     encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount,
@@ -35,6 +38,7 @@ enum Phase {
 
 struct SlmpConnection {
     base_route: Route,
+    word_order: WordOrder,
     next_serial: Cell<u16>,
     phase: RefCell<Phase>,
     pending: RefCell<BTreeMap<u16, PendingRead>>,
@@ -53,6 +57,65 @@ struct PendingWrite {
 struct PendingRead {
     span: ReadSpan,
     covers: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DKind {
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+}
+
+impl DKind {
+    fn parse(data_type: &str, string_words: Option<u32>) -> Result<Self, String> {
+        if string_words.is_some() {
+            return Err("numeric D does not accept string_words".into());
+        }
+        match data_type {
+            "i16" => Ok(Self::I16),
+            "u16" => Ok(Self::U16),
+            "i32" => Ok(Self::I32),
+            "u32" => Ok(Self::U32),
+            "i64" => Ok(Self::I64),
+            "u64" => Ok(Self::U64),
+            "f32" => Ok(Self::F32),
+            "f64" => Ok(Self::F64),
+            _ => Err("unsupported numeric D type".into()),
+        }
+    }
+
+    const fn words(self) -> u16 {
+        match self {
+            Self::I16 | Self::U16 => 1,
+            Self::I32 | Self::U32 | Self::F32 => 2,
+            Self::I64 | Self::U64 | Self::F64 => 4,
+        }
+    }
+
+    fn decode(self, words: &[u16], order: WordOrder) -> Result<Value, FatalError> {
+        if words.len() != usize::from(self.words()) {
+            return Err(FatalError::Protocol(
+                "tag word count does not match plan".into(),
+            ));
+        }
+        let pair = || [words[0], words[1]];
+        let quad = || [words[0], words[1], words[2], words[3]];
+        Ok(match self {
+            Self::I16 => Value::Int(i64::from(decode_i16(words[0]))),
+            Self::U16 => Value::Uint(u64::from(words[0])),
+            Self::I32 => Value::Int(i64::from(decode_i32(pair(), order))),
+            Self::U32 => Value::Uint(u64::from(decode_u32(pair(), order))),
+            Self::I64 => Value::Int(decode_i64(quad(), order)),
+            Self::U64 => Value::Uint(decode_u64(quad(), order)),
+            Self::F32 => Value::Float(f64::from(decode_f32(pair(), order))),
+            Self::F64 => Value::Float(decode_f64(quad(), order)),
+        })
+    }
 }
 
 impl SlmpConnection {
@@ -113,7 +176,10 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
                 message: "duplicate setting".into(),
             });
         }
-        if !matches!(item.key.as_str(), "host" | "port" | "transport") {
+        if !matches!(
+            item.key.as_str(),
+            "host" | "port" | "transport" | "word_order"
+        ) {
             errors.push(config::FieldError {
                 key: item.key.clone(),
                 message: "unsupported setting".into(),
@@ -141,6 +207,14 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
             message: "only tcp is supported".into(),
         });
     }
+    if setting(settings, "word_order")
+        .is_some_and(|value| !matches!(value, "low_high" | "high_low"))
+    {
+        errors.push(config::FieldError {
+            key: "word_order".into(),
+            message: "word_order must be low_high or high_low".into(),
+        });
+    }
     errors
 }
 
@@ -148,6 +222,19 @@ fn parse_d(text: &str, data_type: &str, words: Option<u32>) -> Result<u32, Strin
     if data_type != "u16" || words.is_some() {
         return Err("only single-word D u16 is supported".into());
     }
+    parse_d_number(text)
+}
+
+fn parse_read_d(text: &str, data_type: &str, words: Option<u32>) -> Result<(u32, DKind), String> {
+    let kind = DKind::parse(data_type, words)?;
+    let number = parse_d_number(text)?;
+    number
+        .checked_add(u32::from(kind.words() - 1))
+        .ok_or("D tag address overflows u32")?;
+    Ok((number, kind))
+}
+
+fn parse_d_number(text: &str) -> Result<u32, String> {
     let digits = text.strip_prefix('D').ok_or("D address required")?;
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("invalid D address".into());
@@ -178,15 +265,22 @@ enum RangeAssessment {
 }
 
 fn assess_d(model: &TypeName, count: PointCount, number: u32) -> RangeAssessment {
+    assess_d_span(model, count, number, 1)
+}
+
+fn assess_d_span(model: &TypeName, count: PointCount, number: u32, words: u16) -> RangeAssessment {
     if model.family == ModelFamily::Q25PrhWireOnly {
         return RangeAssessment::Unknown;
     }
+    let Some(last) = number.checked_add(u32::from(words - 1)) else {
+        return RangeAssessment::VerifiedOutside;
+    };
     match count {
-        PointCount::Exact(limit) if number < limit => RangeAssessment::VerifiedInside,
-        PointCount::AtLeast(prefix) if number < prefix => RangeAssessment::VerifiedInside,
+        PointCount::Exact(limit) if last < limit => RangeAssessment::VerifiedInside,
+        PointCount::AtLeast(prefix) if last < prefix => RangeAssessment::VerifiedInside,
         // R SD280-281 is the full D count. Q SD302 covers internal D only;
         // an address beyond it may belong to extended D.
-        PointCount::Exact(limit) if model.family == ModelFamily::StandardR && number >= limit => {
+        PointCount::Exact(limit) if model.family == ModelFamily::StandardR && last >= limit => {
             RangeAssessment::VerifiedOutside
         }
         _ => RangeAssessment::Unknown,
@@ -198,9 +292,9 @@ fn checked_d_span(
     model: &TypeName,
     count: PointCount,
 ) -> Result<ReadSpan, FatalError> {
-    let number = parse_d(&spec.address, &spec.data_type, spec.string_words)
+    let (number, kind) = parse_read_d(&spec.address, &spec.data_type, spec.string_words)
         .map_err(FatalError::InvalidConfig)?;
-    if assess_d(model, count, number) == RangeAssessment::VerifiedOutside {
+    if assess_d_span(model, count, number, kind.words()) == RangeAssessment::VerifiedOutside {
         return Err(FatalError::InvalidConfig(
             "D address exceeds verified configured count".into(),
         ));
@@ -208,7 +302,7 @@ fn checked_d_span(
     Ok(ReadSpan {
         device: Device::D,
         start: number,
-        count: 1,
+        count: kind.words(),
     })
 }
 
@@ -219,6 +313,10 @@ impl session::GuestConnection for SlmpConnection {
         }
         Ok(session::Connection::new(Self {
             base_route: Route::default(),
+            word_order: match setting(&settings, "word_order") {
+                Some("high_low") => WordOrder::HighLow,
+                _ => WordOrder::LowHigh,
+            },
             next_serial: Cell::new(1),
             phase: RefCell::new(Phase::Start),
             pending: RefCell::new(BTreeMap::new()),
@@ -369,7 +467,8 @@ impl read::Guest for Component {
                 Some((
                     u32::try_from(index).ok()?,
                     span,
-                    assess_d(model, *count, span.start) == RangeAssessment::VerifiedInside,
+                    assess_d_span(model, *count, span.start, span.count)
+                        == RangeAssessment::VerifiedInside,
                 ))
             })
             .collect::<Vec<_>>();
@@ -379,7 +478,9 @@ impl read::Guest for Component {
             // addresses, or an unverified range starts a separate request.
             let joined = if verified {
                 groups.last_mut().is_some_and(|last| {
-                    if assess_d(model, *count, last.span.start) != RangeAssessment::VerifiedInside {
+                    if assess_d_span(model, *count, last.span.start, last.span.count)
+                        != RangeAssessment::VerifiedInside
+                    {
                         return false;
                     }
                     let Some(next_cover) = last.covers.last().and_then(|n| n.checked_add(1)) else {
@@ -389,7 +490,7 @@ impl read::Guest for Component {
                     else {
                         return false;
                     };
-                    let Some(next_count) = last.span.count.checked_add(1) else {
+                    let Some(next_count) = last.span.count.checked_add(span.count) else {
                         return false;
                     };
                     let candidate = ReadSpan {
@@ -479,15 +580,13 @@ impl read::Guest for Component {
             .get(&route.serial)
             .cloned()
             .ok_or_else(|| FatalError::Protocol("plan is not pending on this connection".into()))?;
-        if p.covers != pending.covers
-            || p.covers.is_empty()
-            || p.covers.len() != usize::from(pending.span.count)
-        {
+        if p.covers != pending.covers || p.covers.is_empty() {
             return Err(FatalError::Protocol(
                 "plan covers do not match pending read".into(),
             ));
         }
-        for (offset, cover) in p.covers.iter().enumerate() {
+        let mut word_offset = 0u16;
+        for cover in &p.covers {
             let spec = specs
                 .get(*cover as usize)
                 .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
@@ -495,17 +594,23 @@ impl read::Guest for Component {
             let expected_d = pending
                 .span
                 .start
-                .checked_add(
-                    u32::try_from(offset)
-                        .map_err(|_| FatalError::Protocol("batch offset exceeds u32".into()))?,
-                )
+                .checked_add(u32::from(word_offset))
                 .ok_or_else(|| FatalError::Protocol("batch address overflow".into()))?;
             if tag.start != expected_d
                 || (p.covers.len() > 1
-                    && assess_d(model, *count, tag.start) != RangeAssessment::VerifiedInside)
+                    && assess_d_span(model, *count, tag.start, tag.count)
+                        != RangeAssessment::VerifiedInside)
             {
                 return Err(FatalError::Protocol("plan does not match specs".into()));
             }
+            word_offset = word_offset
+                .checked_add(tag.count)
+                .ok_or_else(|| FatalError::Protocol("batch word count overflow".into()))?;
+        }
+        if word_offset != pending.span.count {
+            return Err(FatalError::Protocol(
+                "plan word count does not match specs".into(),
+            ));
         }
         let series = known_series(model).expect("ready model has series");
         let expected = encode_read(route, series, pending.span)
@@ -517,10 +622,25 @@ impl read::Guest for Component {
         }
         conn.pending.borrow_mut().remove(&route.serial);
         match decode_read(route, pending.span, &response) {
-            Ok(Values::Words(words)) => Ok(words
-                .into_iter()
-                .map(|word| Ok(Value::Uint(u64::from(word))))
-                .collect()),
+            Ok(Values::Words(words)) => {
+                let mut offset = 0usize;
+                let mut results = Vec::with_capacity(p.covers.len());
+                for cover in &p.covers {
+                    let spec = &specs[*cover as usize];
+                    let kind = DKind::parse(&spec.data_type, spec.string_words)
+                        .map_err(FatalError::Protocol)?;
+                    let end = offset + usize::from(kind.words());
+                    let tag_words = words
+                        .get(offset..end)
+                        .ok_or_else(|| FatalError::Protocol("tag words exceed response".into()))?;
+                    results.push(Ok(kind.decode(tag_words, conn.word_order)?));
+                    offset = end;
+                }
+                if offset != words.len() {
+                    return Err(FatalError::Protocol("response words exceed covers".into()));
+                }
+                Ok(results)
+            }
             Ok(Values::Bits(_)) => Err(FatalError::Protocol("D read returned bits".into())),
             Err(ResponseError::EndCode(code)) => Ok((0..pending.covers.len())
                 .map(|_| {
@@ -656,15 +776,15 @@ impl address::Guest for Component {
         data_type: String,
         string_words: Option<u32>,
     ) -> Result<address::Parsed, String> {
-        let number = parse_d(&text, &data_type, string_words)?;
+        let (number, kind) = parse_read_d(&text, &data_type, string_words)?;
         Ok(address::Parsed {
             canonical: format!("D{number}"),
             area: "D".into(),
-            // Static D/u16 capability only. write-next separately requires
-            // StandardR and a confirmed configured D range on this session.
-            writable_area: true,
+            // The existing write extension remains restricted to D/u16.
+            // write-next also requires StandardR and a verified range.
+            writable_area: kind == DKind::U16,
             bit: None,
-            word_count: 1,
+            word_count: u32::from(kind.words()),
             index: Some(u64::from(number)),
         })
     }
@@ -675,12 +795,23 @@ impl address::Guest for Component {
         string_words: Option<u32>,
         n: i64,
     ) -> Result<String, String> {
-        let number = parse_d(&text, &data_type, string_words)?;
-        canonical(i64::from(number).checked_add(n).ok_or("offset overflow")?)
+        let (number, kind) = parse_read_d(&text, &data_type, string_words)?;
+        let word_offset = n
+            .checked_mul(i64::from(kind.words()))
+            .ok_or("offset overflow")?;
+        let next = i64::from(number)
+            .checked_add(word_offset)
+            .ok_or("offset overflow")?;
+        let next = canonical(next)?;
+        parse_read_d(&next, &data_type, string_words)?;
+        Ok(next)
     }
 
     fn supported_kinds() -> Vec<String> {
-        vec!["u16".into()]
+        ["u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn offset_words(text: String, n: i64) -> Result<String, String> {
@@ -689,7 +820,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP D decimal address, single-word u16 only; range may remain unknown after handshake"
+        "SLMP D decimal numeric reads (1/2/4 words); range may remain unknown after handshake"
             .into()
     }
 
@@ -710,7 +841,9 @@ impl config::Guest for Component {
         Vec::new()
     }
     fn schema() -> Vec<config::SettingField> {
-        use config::{FieldGroup, FieldKind, IntegerSpec, SettingField, SettingValue};
+        use config::{
+            ChoiceOption, FieldGroup, FieldKind, IntegerSpec, SettingField, SettingValue,
+        };
         vec![
             SettingField {
                 key: "host".into(),
@@ -732,6 +865,24 @@ impl config::Guest for Component {
                 required: true,
                 default: Some(SettingValue::Integer(5000)),
                 group: FieldGroup::Basic,
+            },
+            SettingField {
+                key: "word_order".into(),
+                label: "Word order".into(),
+                help: Some("16-bit word order within one numeric value".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption {
+                        value: "low_high".into(),
+                        label: "Low then high".into(),
+                    },
+                    ChoiceOption {
+                        value: "high_low".into(),
+                        label: "High then low".into(),
+                    },
+                ]),
+                required: false,
+                default: Some(SettingValue::Text("low_high".into())),
+                group: FieldGroup::Advanced,
             },
         ]
     }
@@ -787,6 +938,123 @@ mod tests {
             RangeAssessment::Unknown,
             "a Q25PRH SD count must not become a verified tag range"
         );
+    }
+
+    #[test]
+    fn whole_tag_range_and_static_write_capability_are_distinct() {
+        let q = model(ModelFamily::StandardQ);
+        let r = model(ModelFamily::StandardR);
+        assert_eq!(
+            assess_d_span(&r, PointCount::Exact(100), 98, 2),
+            RangeAssessment::VerifiedInside
+        );
+        assert_eq!(
+            assess_d_span(&r, PointCount::Exact(100), 98, 4),
+            RangeAssessment::VerifiedOutside
+        );
+        assert_eq!(
+            assess_d_span(&q, PointCount::Exact(100), 98, 4),
+            RangeAssessment::Unknown
+        );
+        assert_eq!(
+            assess_d_span(&q, PointCount::AtLeast(32768), 32766, 2),
+            RangeAssessment::VerifiedInside
+        );
+        assert_eq!(
+            assess_d_span(&q, PointCount::AtLeast(32768), 32766, 4),
+            RangeAssessment::Unknown
+        );
+        assert_eq!(
+            parse_read_d("D4294967293", "f64", None),
+            Err("D tag address overflows u32".into())
+        );
+        assert_eq!(parse_read_d("D12", "i32", None), Ok((12, DKind::I32)));
+        assert!(
+            parse_d("D12", "i32", None).is_err(),
+            "write remains D/u16 only"
+        );
+        assert!(
+            !<Component as address::Guest>::parse("D10".into(), "i32".into(), None)
+                .unwrap()
+                .writable_area
+        );
+        assert!(
+            <Component as address::Guest>::parse("D10".into(), "u16".into(), None)
+                .unwrap()
+                .writable_area
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset("D10".into(), "f64".into(), None, 1).unwrap(),
+            "D14"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("D10".into(), 1).unwrap(),
+            "D11"
+        );
+    }
+
+    #[test]
+    fn numeric_d_codec_uses_full_word_order_and_preserves_nonfinite() {
+        assert!(matches!(
+            DKind::I16.decode(&[0x8000], WordOrder::LowHigh),
+            Ok(Value::Int(-32768))
+        ));
+        assert!(matches!(
+            DKind::U16.decode(&[0xffff], WordOrder::HighLow),
+            Ok(Value::Uint(65535))
+        ));
+        assert!(matches!(
+            DKind::I32.decode(&[0, 0x8000], WordOrder::LowHigh),
+            Ok(Value::Int(-2147483648))
+        ));
+        assert!(matches!(
+            DKind::U32.decode(&[0x8000, 0], WordOrder::HighLow),
+            Ok(Value::Uint(0x8000_0000))
+        ));
+        assert!(matches!(
+            DKind::I64.decode(&[0, 0, 0, 0x8000], WordOrder::LowHigh),
+            Ok(Value::Int(i64::MIN))
+        ));
+        assert!(matches!(
+            DKind::U64.decode(&[1, 0, 0, 0x20], WordOrder::LowHigh),
+            Ok(Value::Uint(9_007_199_254_740_993))
+        ));
+        assert!(matches!(
+            DKind::F32.decode(&[0, 0x3fc0], WordOrder::LowHigh),
+            Ok(Value::Float(1.5))
+        ));
+        assert!(matches!(
+            DKind::F64.decode(&[0x3ff8, 0, 0, 0], WordOrder::HighLow),
+            Ok(Value::Float(1.5))
+        ));
+        assert!(
+            matches!(DKind::F32.decode(&[0, 0x7fc0], WordOrder::LowHigh), Ok(Value::Float(v)) if v.is_nan())
+        );
+        assert!(DKind::F64.decode(&[0, 0], WordOrder::LowHigh).is_err());
+    }
+
+    #[test]
+    fn word_order_setting_is_checked_without_changing_default() {
+        let settings = [
+            session::Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            session::Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+            session::Setting {
+                key: "word_order".into(),
+                value: "high_low".into(),
+            },
+        ];
+        assert!(validate_settings(&settings).is_empty());
+        let mut bad = settings.clone();
+        bad[2].value = "middle".into();
+        assert!(validate_settings(&bad)
+            .iter()
+            .any(|e| e.key == "word_order"));
     }
 }
 

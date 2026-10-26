@@ -92,10 +92,13 @@ mod tests {
                 .expect("D/u16 syntax")
                 .writable_area
         );
-        assert!(driver
-            .banto_driver_address()
-            .call_parse(&mut store, "D31", "u32", None)?
-            .is_err());
+        assert!(
+            !driver
+                .banto_driver_address()
+                .call_parse(&mut store, "D31", "u32", None)?
+                .expect("read-only D/u32 syntax")
+                .writable_area
+        );
         assert!(driver
             .banto_driver_address()
             .call_parse(&mut store, "D31", "u16", Some(1))?
@@ -354,10 +357,19 @@ mod tests {
         driver: &Driver,
         count: u16,
     ) -> wasmtime::Result<exports::banto::driver::session::Connection> {
+        ready_q_with_settings(store, driver, count, &settings())
+    }
+
+    fn ready_q_with_settings(
+        store: &mut Store<()>,
+        driver: &Driver,
+        count: u16,
+        settings: &[banto::driver::types::Setting],
+    ) -> wasmtime::Result<exports::banto::driver::session::Connection> {
         let conn = driver
             .banto_driver_session()
             .connection()
-            .call_create(&mut *store, &settings())?
+            .call_create(&mut *store, settings)?
             .expect("settings");
         assert!(driver
             .banto_driver_session()
@@ -378,6 +390,245 @@ mod tests {
             .expect("ready")
             .is_none());
         Ok(conn)
+    }
+
+    #[test]
+    fn mixed_width_numeric_batch_maps_words_to_tag_covers() -> wasmtime::Result<()> {
+        use banto::driver::types::{ItemError, TagSpec, Value};
+        let (mut store, driver) = load()?;
+        let conn = ready_q(&mut store, &driver, 100)?;
+        let specs: Vec<TagSpec> = [
+            (10, "u16"),
+            (11, "i16"),
+            (12, "i32"),
+            (14, "u32"),
+            (16, "f32"),
+            (18, "i64"),
+            (22, "u64"),
+            (26, "f64"),
+        ]
+        .into_iter()
+        .map(|(address, kind)| TagSpec {
+            address: format!("D{address}"),
+            data_type: kind.into(),
+            string_words: None,
+        })
+        .collect();
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].covers, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(&plans[0].step.send[19..25], &[10, 0, 0, 0xa8, 20, 0]);
+        let words: [u16; 20] = [
+            0x1234, 0x8000, 0, 0x8000, 0xabcd, 0x1234, 0, 0x3fc0, 0, 0, 0, 0x8000, 1, 0, 0, 0x20,
+            0, 0, 0, 0x3ff8,
+        ];
+        let data: Vec<u8> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+        let values = driver
+            .banto_driver_read()
+            .call_decode(&mut store, conn, &plans[0], &specs, &response(3, &data))?
+            .expect("values");
+        assert!(matches!(
+            values.as_slice(),
+            [
+                Ok(Value::Uint(0x1234)),
+                Ok(Value::Int(-32768)),
+                Ok(Value::Int(-2147483648)),
+                Ok(Value::Uint(0x1234_abcd)),
+                Ok(Value::Float(1.5)),
+                Ok(Value::Int(i64::MIN)),
+                Ok(Value::Uint(9_007_199_254_740_993)),
+                Ok(Value::Float(1.5)),
+            ]
+        ));
+        let retry = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("new plan");
+        let mut refused = response(4, &[]);
+        refused[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+        let errors = driver
+            .banto_driver_read()
+            .call_decode(&mut store, conn, &retry[0], &specs, &refused)?
+            .expect("per-tag refusal");
+        assert_eq!(errors.len(), 8);
+        assert!(errors
+            .iter()
+            .all(|error| matches!(error, Err(ItemError::Device(e)) if e.code == 0xc05b)));
+        let nan = [TagSpec {
+            address: "D30".into(),
+            data_type: "f32".into(),
+            string_words: None,
+        }];
+        let nan_plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &nan)?
+            .expect("nan plan");
+        let nan_values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &nan_plan[0],
+                &nan,
+                &response(5, &[0, 0, 0xc0, 0x7f]),
+            )?
+            .expect("nan value");
+        assert!(matches!(nan_values.as_slice(), [Ok(Value::Float(value))] if value.is_nan()));
+        conn.resource_drop(&mut store)?;
+
+        let mut high_low = settings();
+        high_low.push(banto::driver::types::Setting {
+            key: "word_order".into(),
+            value: "high_low".into(),
+        });
+        let conn = ready_q_with_settings(&mut store, &driver, 100, &high_low)?;
+        let high_specs = [
+            TagSpec {
+                address: "D0".into(),
+                data_type: "i32".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "D2".into(),
+                data_type: "f64".into(),
+                string_words: None,
+            },
+        ];
+        let high_plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &high_specs)?
+            .expect("high-low plan");
+        assert_eq!(high_plan[0].covers, [0, 1]);
+        assert_eq!(&high_plan[0].step.send[19..25], &[0, 0, 0, 0xa8, 6, 0]);
+        let high_words: [u16; 6] = [0x8000, 0, 0x3ff8, 0, 0, 0];
+        let data: Vec<u8> = high_words.into_iter().flat_map(u16::to_le_bytes).collect();
+        let high_values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &high_plan[0],
+                &high_specs,
+                &response(3, &data),
+            )?
+            .expect("high-low values");
+        assert!(matches!(
+            high_values.as_slice(),
+            [Ok(Value::Int(-2147483648)), Ok(Value::Float(1.5))]
+        ));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multiword_range_boundary_unknown_split_and_960_word_limit() -> wasmtime::Result<()> {
+        use banto::driver::types::TagSpec;
+        let (mut store, driver) = load()?;
+        let conn = ready_q(&mut store, &driver, 20)?;
+        let specs: Vec<TagSpec> = [(16, "f64"), (20, "i16"), (21, "u32")]
+            .into_iter()
+            .map(|(address, kind)| TagSpec {
+                address: format!("D{address}"),
+                data_type: kind.into(),
+                string_words: None,
+            })
+            .collect();
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plans");
+        assert_eq!(
+            plans
+                .iter()
+                .map(|p| p.covers.as_slice())
+                .collect::<Vec<_>>(),
+            vec![&[0][..], &[1][..], &[2][..]]
+        );
+        assert_eq!(&plans[0].step.send[19..25], &[16, 0, 0, 0xa8, 4, 0]);
+        assert_eq!(&plans[1].step.send[19..25], &[20, 0, 0, 0xa8, 1, 0]);
+        assert_eq!(&plans[2].step.send[19..25], &[21, 0, 0, 0xa8, 2, 0]);
+        conn.resource_drop(&mut store)?;
+
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("R settings");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("R 0101")
+            .expect("R type send");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("R SD")
+            .expect("R SD send");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(2, &[100, 0, 0, 0])))?
+            .expect("R ready")
+            .is_none());
+        let specs: Vec<TagSpec> = [(98, "u32"), (99, "i32"), (100, "u16")]
+            .into_iter()
+            .map(|(address, kind)| TagSpec {
+                address: format!("D{address}"),
+                data_type: kind.into(),
+                string_words: None,
+            })
+            .collect();
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("R plans");
+        assert_eq!(
+            plans.len(),
+            1,
+            "R exact count rejects a tag crossing its end"
+        );
+        assert_eq!(plans[0].covers, [0]);
+        assert_eq!(&plans[0].step.send[19..27], &[98, 0, 0, 0, 0xa8, 0, 2, 0]);
+        let result = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(3, &[0x34, 0x12, 0x78, 0x56]),
+            )?
+            .expect("R value");
+        assert!(matches!(
+            result.as_slice(),
+            [Ok(banto::driver::types::Value::Uint(0x5678_1234))]
+        ));
+        conn.resource_drop(&mut store)?;
+
+        let conn = ready_q(&mut store, &driver, 1000)?;
+        let specs: Vec<TagSpec> = (0..241)
+            .map(|n| TagSpec {
+                address: format!("D{}", n * 4),
+                data_type: "f64".into(),
+                string_words: None,
+            })
+            .collect();
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("word limit plans");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers.len(), 240);
+        assert_eq!(plans[1].covers, [240]);
+        assert_eq!(&plans[0].step.send[19..25], &[0, 0, 0, 0xa8, 0xc0, 3]);
+        assert_eq!(&plans[1].step.send[19..25], &[0xc0, 3, 0, 0xa8, 4, 0]);
+        conn.resource_drop(&mut store)?;
+        Ok(())
     }
 
     #[test]
@@ -919,7 +1170,7 @@ mod tests {
             },
             TagSpec {
                 address: "D0".into(),
-                data_type: "u32".into(),
+                data_type: "string".into(),
                 string_words: None,
             },
             TagSpec {
@@ -1324,7 +1575,7 @@ mod tests {
             .is_empty());
         let unsupported = [TagSpec {
             address: "D0".into(),
-            data_type: "u32".into(),
+            data_type: "string".into(),
             string_words: None,
         }];
         assert!(driver

@@ -5,7 +5,7 @@ use std::cell::Cell;
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_modbus_read_core::{
-    ReadError, ReadHoldingU16, ReadHoldingU32, WordOrder, MAX_RESPONSE_LEN,
+    NumericKind, NumericValue, ReadError, ReadHoldingNumeric, WordOrder, MAX_RESPONSE_LEN,
 };
 use exports::banto::driver::{address, config, read, session};
 
@@ -21,15 +21,35 @@ struct ModbusConnection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    I16,
     U16,
+    I32,
     U32,
+    I64,
+    U64,
+    F32,
+    F64,
 }
 
 impl Kind {
     const fn word_count(self) -> u32 {
         match self {
-            Self::U16 => 1,
-            Self::U32 => 2,
+            Self::I16 | Self::U16 => 1,
+            Self::I32 | Self::U32 | Self::F32 => 2,
+            Self::I64 | Self::U64 | Self::F64 => 4,
+        }
+    }
+
+    const fn core_kind(self) -> NumericKind {
+        match self {
+            Self::I16 => NumericKind::I16,
+            Self::U16 => NumericKind::U16,
+            Self::I32 => NumericKind::I32,
+            Self::U32 => NumericKind::U32,
+            Self::I64 => NumericKind::I64,
+            Self::U64 => NumericKind::U64,
+            Self::F32 => NumericKind::F32,
+            Self::F64 => NumericKind::F64,
         }
     }
 }
@@ -116,12 +136,18 @@ fn check_number(
 }
 
 /// Preserve the native parser's 5/6 digit reference and canonical form.
-/// A U32 occupies two complete registers; the final start is offset 65534.
+/// Numeric tags occupy one, two, or four complete holding registers.
 fn parse_holding(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16, Kind), String> {
     let kind = match (data_type, words) {
+        ("i16", None) => Kind::I16,
         ("u16", None) => Kind::U16,
+        ("i32", None) => Kind::I32,
         ("u32", None) => Kind::U32,
-        _ => return Err("FC3 は u16 または u32 の保持レジスタのみ対応します".into()),
+        ("i64", None) => Kind::I64,
+        ("u64", None) => Kind::U64,
+        ("f32", None) => Kind::F32,
+        ("f64", None) => Kind::F64,
+        _ => return Err("FC3 supports i16/u16/i32/u32/i64/u64/f32/f64 holding registers".into()),
     };
     let text = text.trim();
     let bytes = text.as_bytes();
@@ -133,8 +159,8 @@ fn parse_holding(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16
         .map_err(|_| format!("{text:?} は保持レジスタの参照番号ではありません"))?;
     let offset = u16::try_from(number.checked_sub(1).ok_or("レジスタ番号は1からです")?)
         .map_err(|_| "保持レジスタの範囲を超えています".to_string())?;
-    if kind == Kind::U32 && offset == u16::MAX {
-        return Err("u32 の2レジスタが保持レジスタの範囲を超えています".into());
+    if u32::from(offset) + kind.word_count() > u32::from(u16::MAX) + 1 {
+        return Err("numeric tag exceeds holding-register address space".into());
     }
     Ok((offset, kind))
 }
@@ -149,22 +175,15 @@ fn request_bytes(
     offset: u16,
     kind: Kind,
 ) -> [u8; 12] {
-    match kind {
-        Kind::U16 => ReadHoldingU16 {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-        }
-        .request(),
-        Kind::U32 => ReadHoldingU32 {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-            word_order: conn.word_order,
-        }
-        .request()
-        .expect("validated U32 start offset"),
+    ReadHoldingNumeric {
+        transaction_id,
+        unit_id: conn.unit_id,
+        offset,
+        kind: kind.core_kind(),
+        word_order: conn.word_order,
     }
+    .request()
+    .expect("validated numeric start offset")
 }
 
 fn step(send: [u8; 12]) -> session::Step {
@@ -224,25 +243,18 @@ fn decode_planned(
             "計画と要求バイトが一致しません".into(),
         ));
     }
-    let decoded = match kind {
-        Kind::U16 => ReadHoldingU16 {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-        }
-        .decode(response)
-        .map(u64::from),
-        Kind::U32 => ReadHoldingU32 {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-            word_order: conn.word_order,
-        }
-        .decode(response)
-        .map(u64::from),
-    };
+    let decoded = ReadHoldingNumeric {
+        transaction_id,
+        unit_id: conn.unit_id,
+        offset,
+        kind: kind.core_kind(),
+        word_order: conn.word_order,
+    }
+    .decode(response);
     let value = match decoded {
-        Ok(value) => Ok(Value::Uint(value)),
+        Ok(NumericValue::Int(value)) => Ok(Value::Int(value)),
+        Ok(NumericValue::Uint(value)) => Ok(Value::Uint(value)),
+        Ok(NumericValue::Float(value)) => Ok(Value::Float(value)),
         Err(ReadError::Device(code)) => Err(ItemError::Device(banto::driver::types::DeviceError {
             code: u32::from(code),
             message: format!("FC=0x03 Modbus exception 0x{code:02X}"),
@@ -355,7 +367,10 @@ impl address::Guest for Component {
     }
 
     fn supported_kinds() -> Vec<String> {
-        vec!["u16".into(), "u32".into()]
+        ["u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn offset_words(canonical: String, n: i64) -> Result<String, String> {
@@ -367,7 +382,8 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "FC3 保持レジスタ u16（1 word）/ u32（2 words）: 40001〜49999 または 400001〜465536。u32 の最終開始は 465535".into()
+        "FC3 numeric holding registers: 1/2/4 words; final starts 465536/465535/465533 respectively"
+            .into()
     }
 
     fn probe() -> Option<TagSpec> {
@@ -381,8 +397,8 @@ impl address::Guest for Component {
 
 fn canonical_for(offset: i64, kind: Kind) -> Result<String, String> {
     let offset = u16::try_from(offset).map_err(|_| "保持レジスタの範囲を超えています")?;
-    if kind == Kind::U32 && offset == u16::MAX {
-        return Err("u32 の2レジスタが保持レジスタの範囲を超えています".into());
+    if u32::from(offset) + kind.word_count() > u32::from(u16::MAX) + 1 {
+        return Err("numeric tag exceeds holding-register address space".into());
     }
     Ok(canonical(offset))
 }
@@ -436,7 +452,7 @@ impl config::Guest for Component {
             SettingField {
                 key: "word_order".into(),
                 label: "ワード順".into(),
-                help: Some("u32 の先頭レジスタを下位/上位16 bit として扱います".into()),
+                help: Some("Word order within each multiword numeric value".into()),
                 kind: FieldKind::Choice(vec![
                     ChoiceOption {
                         value: "low_high".into(),
@@ -493,7 +509,22 @@ mod tests {
         assert_eq!(canonical(0), "400001");
         assert!(parse_holding("30001", "u16", None).is_err());
         assert!(parse_holding("40001.3", "u16", None).is_err());
-        assert!(parse_holding("40001", "i16", None).is_err());
+        assert_eq!(parse_holding("40001", "i16", None), Ok((0, Kind::I16)));
+        assert_eq!(
+            parse_holding("465536", "i16", None),
+            Ok((u16::MAX, Kind::I16))
+        );
+        assert_eq!(
+            parse_holding("465535", "i32", None),
+            Ok((65_534, Kind::I32))
+        );
+        assert!(parse_holding("465536", "i32", None).is_err());
+        for kind in ["i64", "u64", "f64"] {
+            assert!(parse_holding("465533", kind, None).is_ok());
+            assert!(parse_holding("465534", kind, None).is_err());
+        }
+        assert!(parse_holding("465535", "f32", None).is_ok());
+        assert!(parse_holding("465536", "f32", None).is_err());
         assert!(parse_holding("40001", "u32", Some(2)).is_err());
         assert_eq!(
             <Component as address::Guest>::probe().unwrap().address,
@@ -564,6 +595,131 @@ mod tests {
     }
 
     #[test]
+    fn signed_plan_decode_and_covers_keep_tag_values_distinct() {
+        let mut conn = conn();
+        let specs = [
+            TagSpec {
+                address: "465536".into(),
+                data_type: "i16".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "465535".into(),
+                data_type: "i32".into(),
+                string_words: None,
+            },
+        ];
+        let plans = planned_read(&conn, &specs);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers, [0]);
+        assert_eq!(plans[1].covers, [1]);
+        assert_eq!(plans[0].step.send[8..], [0xff, 0xff, 0, 1]);
+        assert_eq!(plans[1].step.send[8..], [0xff, 0xfe, 0, 2]);
+        assert!(matches!(
+            decode_planned(
+                &conn,
+                &plans[0],
+                &specs,
+                &[0, 0, 0, 0, 0, 5, 1, 3, 2, 0x80, 0]
+            )
+            .as_deref(),
+            Ok([Ok(Value::Int(-32768))])
+        ));
+        assert!(matches!(
+            decode_planned(
+                &conn,
+                &plans[1],
+                &specs,
+                &[0, 1, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x80, 0]
+            )
+            .as_deref(),
+            Ok([Ok(Value::Int(-2147483648))])
+        ));
+        conn.word_order = WordOrder::HighLow;
+        assert!(matches!(
+            decode_planned(
+                &conn,
+                &plans[1],
+                &specs,
+                &[0, 1, 0, 0, 0, 7, 1, 3, 4, 0x80, 0, 0, 0]
+            )
+            .as_deref(),
+            Ok([Ok(Value::Int(-2147483648))])
+        ));
+        let mismatch = read::Planned {
+            covers: vec![0, 1],
+            ..plans[1].clone()
+        };
+        assert!(matches!(
+            decode_planned(&conn, &mismatch, &specs, &[]),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn numeric_four_word_and_float_results_use_existing_wit_variants() {
+        let mut conn = conn();
+        let specs = [
+            TagSpec {
+                address: "465533".into(),
+                data_type: "i64".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "400001".into(),
+                data_type: "u64".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "400001".into(),
+                data_type: "f64".into(),
+                string_words: None,
+            },
+            TagSpec {
+                address: "465535".into(),
+                data_type: "f32".into(),
+                string_words: None,
+            },
+        ];
+        let plans = planned_read(&conn, &specs);
+        assert_eq!(plans.len(), 4);
+        assert_eq!(
+            plans
+                .iter()
+                .map(|p| p.covers.as_slice())
+                .collect::<Vec<_>>(),
+            vec![&[0][..], &[1][..], &[2][..], &[3][..]]
+        );
+        assert_eq!(plans[0].step.send[8..], [0xff, 0xfc, 0, 4]);
+        assert_eq!(plans[3].step.send[8..], [0xff, 0xfe, 0, 2]);
+        let i64_min = [0, 0, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0x80, 0];
+        assert!(matches!(
+            decode_planned(&conn, &plans[0], &specs, &i64_min).as_deref(),
+            Ok([Ok(Value::Int(i64::MIN))])
+        ));
+        let u64_precise = [0, 1, 0, 0, 0, 11, 1, 3, 8, 0, 1, 0, 0, 0, 0, 0, 0x20];
+        assert!(matches!(
+            decode_planned(&conn, &plans[1], &specs, &u64_precise).as_deref(),
+            Ok([Ok(Value::Uint(9_007_199_254_740_993))])
+        ));
+        let f64_value = [0, 2, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0x3f, 0xf8];
+        assert!(matches!(
+            decode_planned(&conn, &plans[2], &specs, &f64_value).as_deref(),
+            Ok([Ok(Value::Float(1.5))])
+        ));
+        let f32_value = [0, 3, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x3f, 0xc0];
+        assert!(matches!(
+            decode_planned(&conn, &plans[3], &specs, &f32_value).as_deref(),
+            Ok([Ok(Value::Float(1.5))])
+        ));
+        conn.word_order = WordOrder::HighLow;
+        let f32_nan = [0, 3, 0, 0, 0, 7, 1, 3, 4, 0x7f, 0xc0, 0, 0];
+        assert!(
+            matches!(decode_planned(&conn, &plans[3], &specs, &f32_nan).as_deref(), Ok([Ok(Value::Float(n))]) if n.is_nan())
+        );
+    }
+
+    #[test]
     fn offset_steps_by_kind_width_while_offset_words_stays_word_based() {
         let offset = |address: &str, kind: &str, n| {
             <Component as address::Guest>::offset(address.into(), kind.into(), None, n)
@@ -576,6 +732,13 @@ mod tests {
         assert!(offset("400001", "u32", i64::MAX).is_err());
         assert!(offset("400001", "u32", i64::MIN).is_err());
         assert_eq!(offset("400001", "u16", 1).as_deref(), Ok("400002"));
+        assert_eq!(offset("400001", "i16", 1).as_deref(), Ok("400002"));
+        assert_eq!(offset("400001", "i32", 1).as_deref(), Ok("400003"));
+        assert_eq!(offset("465533", "i32", 1).as_deref(), Ok("465535"));
+        assert!(offset("465534", "i32", 1).is_err());
+        assert_eq!(offset("400001", "f64", 1).as_deref(), Ok("400005"));
+        assert_eq!(offset("465529", "i64", 1).as_deref(), Ok("465533"));
+        assert!(offset("465530", "u64", 1).is_err());
         assert_eq!(
             <Component as address::Guest>::offset_words("400001".into(), 1).as_deref(),
             Ok("400002")

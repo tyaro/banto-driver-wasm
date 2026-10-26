@@ -1,10 +1,15 @@
 # STATUS
 
-## Local stage 1: shared numeric codec for existing types (2026-10-26)
+## Stage 2: numeric reads in Modbus FC3 and SLMP D (2026-10-26)
 
-- Branch `feat/shared-register-codec-existing-types` starts at driver-wasm main `7853a6a920abb5f1a74ce9019115bc8177c77f27`. This is local work only: no commit, push, PR, or PLC/DB connection.
+- Based on main `0cc29009504651c2ec58012d64157cc0f2201102`, this change adds typed `i16/u16/i32/u32/i64/u64/f32/f64` read decoding to the two existing guests using the fixed shared codec rev. The existing WIT `int/uint/float` variants and downstream `f64` projection remain unchanged; 64-bit integer values beyond `2^53` can lose precision after that projection. No PLC or DB operation is part of this stage.
+- SLMP remains D-only. Its read planner counts words while `covers` retains one original tag index per complete value; unknown ranges stay individual reads. The optional write extension remains StandardR D/u16 only. Controlled local checks passed: Modbus core 13 tests, native comparison 5, Modbus component 8 plus one doc test, and real Modbus Wasmtime 11; SLMP component 4 plus one doc test, real SLMP Wasmtime 16, and unchanged SLMP core regressions. Both component WIT targets and local scaffold/CI classification guards passed. Hub integration, PLC I/O, and DB I/O remain unverified.
+
+## Previous stage: shared numeric codec for existing types (merged PR #19)
+
+- [PR #19](https://github.com/tyaro/banto-driver-wasm/pull/19) merged as `0cc29009504651c2ec58012d64157cc0f2201102` from the reviewed head `cca93e13e81570fe998847ae3adfa6b42c849327`. No PLC or DB connection was used.
 - Modbus FC3 U32 word joining and SLMP two-word SD point counts now call dependency-free `banto-register-codec::decode_u32` from Industrial Git rev `e4afe793cbae08ab4afd88467c8577010020957f`. Existing U16 byte decoding, public word-order settings, frame parsing, WIT, and write limits are unchanged. The six affected Cargo lockfiles pin the same rev.
-- Local checks passed: Modbus core 10 tests at Rust 1.85.1, SLMP core 28 tests at Rust 1.98.1, both wasm32 core checks, native Modbus comparison 4 tests, both guest unit/doc tests and component WIT target checks, Modbus native/real Wasmtime comparison 8 tests, and SLMP real Wasmtime fixtures 14 tests. Formatting, Clippy, scaffold guard, and CI classification tests also passed. This stage has no hosted CI or live PLC/DB verification.
+- Local checks passed: Modbus core 10 tests at Rust 1.85.1, SLMP core 28 tests at Rust 1.98.1, both wasm32 core checks, native Modbus comparison 4 tests, both guest unit/doc tests and component WIT target checks, Modbus native/real Wasmtime comparison 8 tests, and SLMP real Wasmtime fixtures 14 tests. Formatting, Clippy, scaffold guard, and CI classification tests also passed. [Hosted CI 40249385032](https://github.com/tyaro/banto-driver-wasm/actions/runs/40249385032) passed all 9 jobs. Live PLC/DB behavior remains unverified.
 
 ## Current stage: Q25PRHCPU wire-only read
 

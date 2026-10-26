@@ -6,8 +6,10 @@ pub mod fixtures {
         TagSpec,
     };
     use banto_driver_modbus::ModbusDriver;
+    pub use banto_modbus_read_core::NumericValue;
     #[cfg(test)]
     use banto_modbus_read_core::RequestError;
+    use banto_modbus_read_core::{NumericKind, ReadHoldingNumeric};
     use banto_modbus_read_core::{ReadError, ReadHoldingU16, MAX_RESPONSE_LEN};
     use banto_modbus_read_core::{ReadHoldingU32, WordOrder};
 
@@ -219,6 +221,94 @@ pub mod fixtures {
         },
     ];
 
+    pub struct NumericFixture {
+        pub name: &'static str,
+        pub kind: &'static str,
+        pub response: &'static [u8],
+        pub word_order: Option<&'static str>,
+        pub expected: Outcome<NumericValue>,
+    }
+
+    pub const NUMERIC_FIXTURES: &[NumericFixture] = &[
+        NumericFixture {
+            name: "i16_min",
+            kind: "i16",
+            response: &[0, 0, 0, 0, 0, 5, 1, 3, 2, 0x80, 0],
+            word_order: None,
+            expected: Outcome::Value(NumericValue::Int(-32768)),
+        },
+        NumericFixture {
+            name: "i32_low_high_min",
+            kind: "i32",
+            response: &[0, 0, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x80, 0],
+            word_order: Some("low_high"),
+            expected: Outcome::Value(NumericValue::Int(-2147483648)),
+        },
+        NumericFixture {
+            name: "i32_high_low_min",
+            kind: "i32",
+            response: &[0, 0, 0, 0, 0, 7, 1, 3, 4, 0x80, 0, 0, 0],
+            word_order: Some("high_low"),
+            expected: Outcome::Value(NumericValue::Int(-2147483648)),
+        },
+        NumericFixture {
+            name: "i64_low_high_min",
+            kind: "i64",
+            response: &[0, 0, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0x80, 0],
+            word_order: None,
+            expected: Outcome::Value(NumericValue::Int(i64::MIN)),
+        },
+        NumericFixture {
+            name: "u64_at_2pow53",
+            kind: "u64",
+            response: &[0, 0, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0, 0x20],
+            word_order: None,
+            expected: Outcome::Value(NumericValue::Uint(9_007_199_254_740_992)),
+        },
+        NumericFixture {
+            name: "f32_low_high",
+            kind: "f32",
+            response: &[0, 0, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x3f, 0xc0],
+            word_order: None,
+            expected: Outcome::Value(NumericValue::Float(1.5)),
+        },
+        NumericFixture {
+            name: "f32_high_low",
+            kind: "f32",
+            response: &[0, 0, 0, 0, 0, 7, 1, 3, 4, 0x3f, 0xc0, 0, 0],
+            word_order: Some("high_low"),
+            expected: Outcome::Value(NumericValue::Float(1.5)),
+        },
+        NumericFixture {
+            name: "f64_low_high",
+            kind: "f64",
+            response: &[0, 0, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0x3f, 0xf8],
+            word_order: None,
+            expected: Outcome::Value(NumericValue::Float(1.5)),
+        },
+        NumericFixture {
+            name: "f64_high_low",
+            kind: "f64",
+            response: &[0, 0, 0, 0, 0, 11, 1, 3, 8, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0],
+            word_order: Some("high_low"),
+            expected: Outcome::Value(NumericValue::Float(1.5)),
+        },
+        NumericFixture {
+            name: "i32_exception",
+            kind: "i32",
+            response: &[0, 0, 0, 0, 0, 3, 1, 0x83, 2],
+            word_order: None,
+            expected: Outcome::Device(2),
+        },
+        NumericFixture {
+            name: "f64_short",
+            kind: "f64",
+            response: &[0, 0, 0, 0, 0, 9, 1, 3, 8, 0, 0, 0, 0, 0, 0],
+            word_order: None,
+            expected: Outcome::Framing,
+        },
+    ];
+
     pub fn native(response: &[u8]) -> Outcome {
         let driver = ModbusDriver;
         let kind = TagKind::numeric(DataType::U16);
@@ -316,6 +406,98 @@ pub mod fixtures {
             Err(ReadError::Device(code)) => Outcome::Device(code.into()),
             Err(ReadError::Framing) => Outcome::Framing,
             Err(ReadError::Protocol) => Outcome::Protocol,
+        }
+    }
+
+    fn numeric_kinds(kind: &str) -> (DataType, NumericKind) {
+        match kind {
+            "i16" => (DataType::I16, NumericKind::I16),
+            "u16" => (DataType::U16, NumericKind::U16),
+            "i32" => (DataType::I32, NumericKind::I32),
+            "u32" => (DataType::U32, NumericKind::U32),
+            "i64" => (DataType::I64, NumericKind::I64),
+            "u64" => (DataType::U64, NumericKind::U64),
+            "f32" => (DataType::F32, NumericKind::F32),
+            "f64" => (DataType::F64, NumericKind::F64),
+            _ => panic!("unsupported fixture kind: {kind}"),
+        }
+    }
+
+    pub fn native_numeric(fixture: &NumericFixture) -> Outcome<NumericValue> {
+        let (data_type, core_kind) = numeric_kinds(fixture.kind);
+        let driver = ModbusDriver;
+        let kind = TagKind::numeric(data_type);
+        let spec = TagSpec::new(driver.parse_address("40001", &kind).unwrap(), kind);
+        let settings = match fixture.word_order {
+            Some(order) => Settings::from_pairs([("word_order", order)]).unwrap(),
+            None => Settings::new(),
+        };
+        let mut conn = driver.create_connection(&settings).unwrap();
+        let planned = conn.plan_read(std::slice::from_ref(&spec)).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].covers, [0]);
+        assert_eq!(planned[0].step.max_len as usize, MAX_RESPONSE_LEN);
+        let core = ReadHoldingNumeric {
+            transaction_id: 0,
+            unit_id: 1,
+            offset: 0,
+            kind: core_kind,
+            word_order: fixture
+                .word_order
+                .and_then(WordOrder::parse)
+                .unwrap_or_default(),
+        };
+        assert_eq!(planned[0].step.send, core.request().unwrap());
+        match conn.decode_read(&planned[0], &[spec], fixture.response) {
+            Ok(values) => match values.as_slice() {
+                [Ok(RawValue::Int(value))] => Outcome::Value(NumericValue::Int(*value)),
+                [Ok(RawValue::Uint(value))] => Outcome::Value(NumericValue::Uint(*value)),
+                [Ok(RawValue::Float(value))] => Outcome::Value(NumericValue::Float(*value)),
+                [Err(ItemError::Device(error))] => Outcome::Device(error.code),
+                other => panic!("unexpected native numeric result: {other:?}"),
+            },
+            Err(FatalError::Framing(_)) => Outcome::Framing,
+            Err(FatalError::Protocol(_)) => Outcome::Protocol,
+            other => panic!("unexpected native numeric error: {other:?}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn core_numeric(fixture: &NumericFixture) -> Outcome<NumericValue> {
+        let (_, kind) = numeric_kinds(fixture.kind);
+        let read = ReadHoldingNumeric {
+            transaction_id: 0,
+            unit_id: 1,
+            offset: 0,
+            kind,
+            word_order: fixture
+                .word_order
+                .and_then(WordOrder::parse)
+                .unwrap_or_default(),
+        };
+        match read.decode(fixture.response) {
+            Ok(value) => Outcome::Value(value),
+            Err(ReadError::Device(code)) => Outcome::Device(code.into()),
+            Err(ReadError::Framing) => Outcome::Framing,
+            Err(ReadError::Protocol) => Outcome::Protocol,
+        }
+    }
+
+    #[test]
+    fn native_and_core_match_numeric_fixture_set() {
+        for fixture in NUMERIC_FIXTURES {
+            assert_eq!(
+                native_numeric(fixture),
+                fixture.expected,
+                "native: {}",
+                fixture.name
+            );
+            assert_eq!(
+                core_numeric(fixture),
+                fixture.expected,
+                "core: {}",
+                fixture.name
+            );
         }
     }
 

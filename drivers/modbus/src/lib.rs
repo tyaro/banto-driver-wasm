@@ -1,6 +1,6 @@
 //! A small, transport-free Modbus TCP read core.
 //!
-//! This is an FC3, single-tag U16/U32 experiment, not a `FrameDriver` or a WIT
+//! This is an FC3 single-tag numeric read core, not a `FrameDriver` or a WIT
 //! component. The Hub still owns I/O and the production Modbus driver.
 //! The shape is checked against the native implementation at
 //! `banto-plc/src/modbus/frame.rs` and `banto-driver-modbus/src/frame_conn.rs`
@@ -9,7 +9,10 @@
 
 #![no_std]
 
-use banto_register_codec::{decode_u32, WordOrder as CodecWordOrder};
+use banto_register_codec::{
+    decode_f32, decode_f64, decode_i16, decode_i32, decode_i64, decode_u32, decode_u64,
+    WordOrder as CodecWordOrder,
+};
 
 /// The largest Modbus TCP response accepted by the Hub's frame driver.
 pub const MAX_RESPONSE_LEN: usize = 260;
@@ -19,6 +22,14 @@ pub const MAX_RESPONSE_LEN: usize = 260;
 /// the future WIT / `FrameDriver` adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadHoldingU16 {
+    pub transaction_id: u16,
+    pub unit_id: u8,
+    pub offset: u16,
+}
+
+/// One signed holding register, using the same FC3 wire shape as U16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadHoldingI16 {
     pub transaction_id: u16,
     pub unit_id: u8,
     pub offset: u16,
@@ -43,12 +54,28 @@ impl WordOrder {
             _ => None,
         }
     }
+
+    const fn codec(self) -> CodecWordOrder {
+        match self {
+            Self::LowHigh => CodecWordOrder::LowHigh,
+            Self::HighLow => CodecWordOrder::HighLow,
+        }
+    }
 }
 
 /// One two-register holding-register read. The final register must fit in
 /// the 16-bit Modbus offset space, so offset 65534 is the last valid start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadHoldingU32 {
+    pub transaction_id: u16,
+    pub unit_id: u8,
+    pub offset: u16,
+    pub word_order: WordOrder,
+}
+
+/// One signed value spanning two complete holding registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadHoldingI32 {
     pub transaction_id: u16,
     pub unit_id: u8,
     pub offset: u16,
@@ -85,6 +112,17 @@ impl ReadHoldingU16 {
     }
 }
 
+impl ReadHoldingI16 {
+    pub fn request(self) -> [u8; 12] {
+        request(self.transaction_id, self.unit_id, self.offset, 1)
+    }
+
+    pub fn decode(self, response: &[u8]) -> Result<i16, ReadError> {
+        let data = decode_fc3(response, self.transaction_id, self.unit_id, 2)?;
+        Ok(decode_i16(u16::from_be_bytes([data[0], data[1]])))
+    }
+}
+
 impl ReadHoldingU32 {
     /// MBAP + FC3 + start offset + count=2. No socket access occurs here.
     pub fn request(self) -> Result<[u8; 12], RequestError> {
@@ -99,11 +137,105 @@ impl ReadHoldingU32 {
         let data = decode_fc3(response, self.transaction_id, self.unit_id, 4)?;
         let first = u16::from_be_bytes([data[0], data[1]]);
         let second = u16::from_be_bytes([data[2], data[3]]);
-        let order = match self.word_order {
-            WordOrder::LowHigh => CodecWordOrder::LowHigh,
-            WordOrder::HighLow => CodecWordOrder::HighLow,
-        };
-        Ok(decode_u32([first, second], order))
+        Ok(decode_u32([first, second], self.word_order.codec()))
+    }
+}
+
+impl ReadHoldingI32 {
+    pub fn request(self) -> Result<[u8; 12], RequestError> {
+        ReadHoldingU32 {
+            transaction_id: self.transaction_id,
+            unit_id: self.unit_id,
+            offset: self.offset,
+            word_order: self.word_order,
+        }
+        .request()
+    }
+
+    pub fn decode(self, response: &[u8]) -> Result<i32, ReadError> {
+        let data = decode_fc3(response, self.transaction_id, self.unit_id, 4)?;
+        let first = u16::from_be_bytes([data[0], data[1]]);
+        let second = u16::from_be_bytes([data[2], data[3]]);
+        Ok(decode_i32([first, second], self.word_order.codec()))
+    }
+}
+
+/// Numeric FC3 read width and interpretation, independent of wire framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericKind {
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+}
+
+impl NumericKind {
+    pub const fn word_count(self) -> u16 {
+        match self {
+            Self::I16 | Self::U16 => 1,
+            Self::I32 | Self::U32 | Self::F32 => 2,
+            Self::I64 | Self::U64 | Self::F64 => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumericValue {
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+}
+
+/// One complete numeric tag. No socket access or cross-tag word reads occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadHoldingNumeric {
+    pub transaction_id: u16,
+    pub unit_id: u8,
+    pub offset: u16,
+    pub kind: NumericKind,
+    pub word_order: WordOrder,
+}
+
+impl ReadHoldingNumeric {
+    pub fn request(self) -> Result<[u8; 12], RequestError> {
+        self.offset
+            .checked_add(self.kind.word_count() - 1)
+            .ok_or(RequestError::AddressRange)?;
+        Ok(request(
+            self.transaction_id,
+            self.unit_id,
+            self.offset,
+            self.kind.word_count(),
+        ))
+    }
+
+    pub fn decode(self, response: &[u8]) -> Result<NumericValue, ReadError> {
+        let data = decode_fc3(
+            response,
+            self.transaction_id,
+            self.unit_id,
+            usize::from(self.kind.word_count()) * 2,
+        )?;
+        let mut words = [0u16; 4];
+        for (index, bytes) in data.chunks_exact(2).enumerate() {
+            words[index] = u16::from_be_bytes([bytes[0], bytes[1]]);
+        }
+        let pair = [words[0], words[1]];
+        let order = self.word_order.codec();
+        Ok(match self.kind {
+            NumericKind::I16 => NumericValue::Int(i64::from(decode_i16(words[0]))),
+            NumericKind::U16 => NumericValue::Uint(u64::from(words[0])),
+            NumericKind::I32 => NumericValue::Int(i64::from(decode_i32(pair, order))),
+            NumericKind::U32 => NumericValue::Uint(u64::from(decode_u32(pair, order))),
+            NumericKind::I64 => NumericValue::Int(decode_i64(words, order)),
+            NumericKind::U64 => NumericValue::Uint(decode_u64(words, order)),
+            NumericKind::F32 => NumericValue::Float(f64::from(decode_f32(pair, order))),
+            NumericKind::F64 => NumericValue::Float(decode_f64(words, order)),
+        })
     }
 }
 
@@ -299,5 +431,142 @@ mod tests {
         ] {
             assert_eq!(READ_U32.decode(response), Err(ReadError::Framing));
         }
+    }
+
+    #[test]
+    fn i16_uses_one_register_and_preserves_signed_limits() {
+        let read = ReadHoldingI16 {
+            transaction_id: 0x1234,
+            unit_id: 1,
+            offset: u16::MAX,
+        };
+        assert_eq!(
+            read.request(),
+            [0x12, 0x34, 0, 0, 0, 6, 1, 3, 0xff, 0xff, 0, 1]
+        );
+        for (word, expected) in [(0x8000u16, i16::MIN), (0x7fff, i16::MAX), (0xffff, -1)] {
+            let [high, low] = word.to_be_bytes();
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 5, 1, 3, 2, high, low]),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            read.decode(&[0x12, 0x34, 0, 0, 0, 3, 1, 0x83, 2]),
+            Err(ReadError::Device(2))
+        );
+        assert_eq!(
+            read.decode(&[0x12, 0x35, 0, 0, 0, 5, 1, 3, 2, 0, 1]),
+            Err(ReadError::Protocol)
+        );
+        assert_eq!(
+            read.decode(&[0x12, 0x34, 0, 0, 0, 5, 1, 3, 1, 0, 1]),
+            Err(ReadError::Framing)
+        );
+    }
+
+    #[test]
+    fn i32_checks_last_register_and_both_word_orders() {
+        let read = ReadHoldingI32 {
+            transaction_id: 0x1234,
+            unit_id: 1,
+            offset: 65_534,
+            word_order: WordOrder::LowHigh,
+        };
+        assert_eq!(
+            read.request(),
+            Ok([0x12, 0x34, 0, 0, 0, 6, 1, 3, 0xff, 0xfe, 0, 2])
+        );
+        assert_eq!(
+            ReadHoldingI32 {
+                offset: u16::MAX,
+                ..read
+            }
+            .request(),
+            Err(RequestError::AddressRange)
+        );
+        let low_high = [0x12, 0x34, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x80, 0];
+        let high_low = [0x12, 0x34, 0, 0, 0, 7, 1, 3, 4, 0x80, 0, 0, 0];
+        assert_eq!(read.decode(&low_high), Ok(i32::MIN));
+        assert_eq!(
+            ReadHoldingI32 {
+                word_order: WordOrder::HighLow,
+                ..read
+            }
+            .decode(&high_low),
+            Ok(i32::MIN)
+        );
+        assert_eq!(read.decode(&high_low), Ok(0x0000_8000));
+        assert_eq!(
+            read.decode(&[0x12, 0x34, 0, 0, 0, 3, 1, 0x83, 2]),
+            Err(ReadError::Device(2))
+        );
+        assert_eq!(
+            read.decode(&[0x12, 0x35, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x80, 0]),
+            Err(ReadError::Protocol)
+        );
+        assert_eq!(
+            read.decode(&[0x12, 0x34, 0, 0, 0, 7, 1, 3, 2, 0, 0, 0x80, 0]),
+            Err(ReadError::Framing)
+        );
+    }
+
+    #[test]
+    fn numeric_widths_codec_and_nonfinite_bits() {
+        let mut read = ReadHoldingNumeric {
+            transaction_id: 0x1234,
+            unit_id: 1,
+            offset: 65_532,
+            kind: NumericKind::I64,
+            word_order: WordOrder::HighLow,
+        };
+        assert_eq!(
+            read.request(),
+            Ok([0x12, 0x34, 0, 0, 0, 6, 1, 3, 0xff, 0xfc, 0, 4])
+        );
+        assert_eq!(
+            ReadHoldingNumeric {
+                offset: 65_533,
+                ..read
+            }
+            .request(),
+            Err(RequestError::AddressRange)
+        );
+        let min_i64 = [0x12, 0x34, 0, 0, 0, 11, 1, 3, 8, 0x80, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(read.decode(&min_i64), Ok(NumericValue::Int(i64::MIN)));
+        read.word_order = WordOrder::LowHigh;
+        let reversed = [0x12, 0x34, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0x80, 0];
+        assert_eq!(read.decode(&reversed), Ok(NumericValue::Int(i64::MIN)));
+        read.kind = NumericKind::U64;
+        let precise = [0x12, 0x34, 0, 0, 0, 11, 1, 3, 8, 0, 1, 0, 0, 0, 0, 0, 0x20];
+        assert_eq!(
+            read.decode(&precise),
+            Ok(NumericValue::Uint(9_007_199_254_740_993))
+        );
+        read.kind = NumericKind::F64;
+        let finite = [
+            0x12, 0x34, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0x3f, 0xf8,
+        ];
+        assert_eq!(read.decode(&finite), Ok(NumericValue::Float(1.5)));
+        read.kind = NumericKind::F32;
+        read.offset = 65_534;
+        assert_eq!(
+            read.request(),
+            Ok([0x12, 0x34, 0, 0, 0, 6, 1, 3, 0xff, 0xfe, 0, 2])
+        );
+        let f32_words = [0x12, 0x34, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x3f, 0xc0];
+        assert_eq!(read.decode(&f32_words), Ok(NumericValue::Float(1.5)));
+        let nan_words = [0x12, 0x34, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0x7f, 0xc0];
+        assert!(matches!(read.decode(&nan_words), Ok(NumericValue::Float(n)) if n.is_nan()));
+        assert_eq!(
+            read.decode(&[0x12, 0x34, 0, 0, 0, 7, 1, 3, 2, 0, 0, 0x3f, 0xc0]),
+            Err(ReadError::Framing)
+        );
+        read.kind = NumericKind::U16;
+        read.offset = u16::MAX;
+        assert_eq!(
+            read.request(),
+            Ok([0x12, 0x34, 0, 0, 0, 6, 1, 3, 0xff, 0xff, 0, 1])
+        );
     }
 }
