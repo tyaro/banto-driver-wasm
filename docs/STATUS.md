@@ -1,5 +1,10 @@
 # STATUS
 
+## Local remaining Q/R SLMP read stage (2026-10-26)
+
+- Based on merged main `ee37212dad37fae7e8f0052c0cb8e6827229b1eb`, in a dedicated worktree. Added ordinary Q/R timer and counter contact/coil bit tags and one-word current tags, R long timer/retentive timer/long counter `i32` current tags and R-only `LCS/LCC` bit tags, R hexadecimal serial-number `ZR` numeric tags, and hexadecimal-suffix `Dn.h/bit` reads from one D word. R retentive names are `STS/STC/STN`; Q uses `SS/SC/SN`. Long timer current reads use four response words for one logical timer, with only the first two forming the current value. See [device table and restrictions](../drivers/slmp/README.md#remaining-qr-read-devices-local-controlled-stage).
+- The handshake still obtains only D/W counts. New timer/counter/ZR ranges are unknown, so only explicit single-tag requests are made; successful reads do not establish a configured endpoint. Q25PRH general timer/file mapping, conditional Q ZR, block-switched R, and long timer contact/coil flag handling remain unsupported. D word-bit checks the existing D whole-word range. WIT, Hub, D/u16-only write gate, and deferred read optimization #871 remain unchanged. Local Rust 1.98.1 checks passed: 35 core fixtures, 13 guest unit tests plus one doc test, 25 real Wasmtime controlled fixtures, Clippy/fmt for the three SLMP crates, wasm32 component validation and both unchanged WIT world target checks, scaffold guard and 17 CI classification cases. These are controlled tests, not PLC or Hub integration. No PLC or DB communication was performed for this stage.
+
 ## Local standard Q internal W read stage (2026-10-26)
 
 - On a recognized standard Q model, the guest reads SD302 and SD303 together on the same connection and retains separate internal D and W point counts. Hexadecimal W numeric tags are planned only when the complete tag fits within the SD303 guaranteed prefix. The old 32768 value is a lower bound, not an exact endpoint. Q25PRH keeps its SD302-only exception, while unknown W counts and Q extended W do not gain a read path. R W and existing Q D behavior remain separate.
