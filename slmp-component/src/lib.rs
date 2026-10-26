@@ -125,6 +125,21 @@ impl DKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadKind {
+    Bit,
+    Numeric(DKind),
+}
+
+impl ReadKind {
+    const fn points(self) -> u16 {
+        match self {
+            Self::Bit => 1,
+            Self::Numeric(kind) => kind.words(),
+        }
+    }
+}
+
 impl SlmpConnection {
     fn route(&self) -> Route {
         let serial = self.next_serial.get();
@@ -150,11 +165,16 @@ fn frame_step(send: Vec<u8>) -> session::Step {
     }
 }
 
-fn read_step(send: Vec<u8>, words: u16) -> session::Step {
+fn read_step(send: Vec<u8>, span: ReadSpan) -> session::Step {
     let mut step = frame_step(send);
-    // A successful binary 4E word response has 15 header bytes and 2 bytes
-    // per word. Keep the previous allowance for short PLC refusal frames.
-    step.max_len = (15 + u32::from(words) * 2).max(64);
+    // Binary 4E bit responses pack two points per byte; words use two bytes.
+    // Keep the previous allowance for short PLC refusal frames.
+    let body_len = if span.device.is_bit() {
+        u32::from(span.count).div_ceil(2)
+    } else {
+        u32::from(span.count) * 2
+    };
+    step.max_len = (15 + body_len).max(64);
     step
 }
 
@@ -286,29 +306,92 @@ fn parse_read_address(
     text: &str,
     data_type: &str,
     words: Option<u32>,
-) -> Result<(Device, u32, DKind), String> {
+) -> Result<(Device, u32, ReadKind), String> {
+    // Multi-letter prefixes precede their single-letter names.
+    let bit_prefixes = [
+        ("SB", Device::SB, 16),
+        ("SM", Device::SM, 10),
+        ("M", Device::M, 10),
+        ("X", Device::X, 16),
+        ("Y", Device::Y, 16),
+        ("B", Device::B, 16),
+        ("L", Device::L, 10),
+        ("F", Device::F, 10),
+        ("V", Device::V, 10),
+    ];
+    if let Some((device, radix, digits)) =
+        bit_prefixes.iter().find_map(|(prefix, device, radix)| {
+            text.strip_prefix(prefix)
+                .map(|digits| (*device, *radix, digits))
+        })
+    {
+        if data_type != "bit" || words.is_some() {
+            return Err("bit devices require bit type without string_words".into());
+        }
+        if digits.is_empty()
+            || !digits.bytes().all(|b| {
+                if radix == 10 {
+                    b.is_ascii_digit()
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err("invalid bit device address".into());
+        }
+        let number =
+            u32::from_str_radix(digits, radix).map_err(|_| "bit device address exceeds u32")?;
+        return Ok((device, number, ReadKind::Bit));
+    }
     let kind = DKind::parse(data_type, words)?;
     if text.starts_with('D') {
         let (number, kind) = parse_read_d(text, data_type, words)?;
-        return Ok((Device::D, number, kind));
+        return Ok((Device::D, number, ReadKind::Numeric(kind)));
     }
-    let digits = text.strip_prefix('W').ok_or("D or W address required")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid W hexadecimal address".into());
+    let (device, radix, digits) = if let Some(digits) = text.strip_prefix("SW") {
+        (Device::SW, 16, digits)
+    } else if let Some(digits) = text.strip_prefix("SD") {
+        (Device::SD, 10, digits)
+    } else if let Some(digits) = text.strip_prefix('W') {
+        (Device::W, 16, digits)
+    } else {
+        return Err("unsupported word device address".into());
+    };
+    if digits.is_empty()
+        || !digits.bytes().all(|b| {
+            if radix == 16 {
+                b.is_ascii_hexdigit()
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+    {
+        return Err("invalid word device address".into());
     }
-    let number = u32::from_str_radix(digits, 16).map_err(|_| "W address exceeds u32")?;
+    let number =
+        u32::from_str_radix(digits, radix).map_err(|_| "word device address exceeds u32")?;
     number
         .checked_add(u32::from(kind.words() - 1))
-        .ok_or("W tag address overflows u32")?;
-    Ok((Device::W, number, kind))
+        .ok_or("word tag address overflows u32")?;
+    Ok((device, number, ReadKind::Numeric(kind)))
 }
 
 fn canonical_read(device: Device, number: i64) -> Result<String, String> {
     let number = u32::try_from(number).map_err(|_| "read address exceeds u32")?;
     match device {
+        Device::M => Ok(format!("M{number}")),
+        Device::X => Ok(format!("X{number:X}")),
+        Device::Y => Ok(format!("Y{number:X}")),
+        Device::B => Ok(format!("B{number:X}")),
+        Device::L => Ok(format!("L{number}")),
+        Device::F => Ok(format!("F{number}")),
+        Device::V => Ok(format!("V{number}")),
+        Device::SB => Ok(format!("SB{number:X}")),
+        Device::SM => Ok(format!("SM{number}")),
         Device::D => Ok(format!("D{number}")),
         Device::W => Ok(format!("W{number:X}")),
-        _ => Err("unsupported read area".into()),
+        Device::SW => Ok(format!("SW{number:X}")),
+        Device::SD => Ok(format!("SD{number}")),
     }
 }
 
@@ -358,6 +441,26 @@ fn count_guarantees_span(count: PointCount, number: u32, words: u16) -> bool {
     matches!(count, PointCount::Exact(limit) | PointCount::AtLeast(limit) if end_exclusive <= limit)
 }
 
+fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> PointCount {
+    match device {
+        Device::D => d_count,
+        Device::W => w_count,
+        // This handshake obtains D/W counts only. Do not infer M/X/Y/B
+        // configuration from a CPU family, Q25PRH SD302, or the wire limit.
+        Device::M
+        | Device::X
+        | Device::Y
+        | Device::B
+        | Device::L
+        | Device::F
+        | Device::V
+        | Device::SB
+        | Device::SM
+        | Device::SW
+        | Device::SD => PointCount::Unknown,
+    }
+}
+
 fn checked_read_span(
     spec: &TagSpec,
     model: &TypeName,
@@ -372,12 +475,8 @@ fn checked_read_span(
             "W reads require a confirmed standard iQ-R CPU".into(),
         ));
     }
-    let count = if device == Device::W {
-        w_count
-    } else {
-        d_count
-    };
-    if assess_d_span(model, count, number, kind.words()) == RangeAssessment::VerifiedOutside {
+    let count = read_count(device, d_count, w_count);
+    if assess_d_span(model, count, number, kind.points()) == RangeAssessment::VerifiedOutside {
         return Err(FatalError::InvalidConfig(
             "address exceeds verified configured count".into(),
         ));
@@ -385,7 +484,7 @@ fn checked_read_span(
     Ok(ReadSpan {
         device,
         start: number,
-        count: kind.words(),
+        count: kind.points(),
     })
 }
 
@@ -578,11 +677,7 @@ impl read::Guest for Component {
                     span,
                     assess_d_span(
                         model,
-                        if span.device == Device::W {
-                            conn.w_count.get()
-                        } else {
-                            *count
-                        },
+                        read_count(span.device, *count, conn.w_count.get()),
                         span.start,
                         span.count,
                     ) == RangeAssessment::VerifiedInside,
@@ -598,11 +693,7 @@ impl read::Guest for Component {
                     if last.span.device != span.device
                         || assess_d_span(
                             model,
-                            if span.device == Device::W {
-                                conn.w_count.get()
-                            } else {
-                                *count
-                            },
+                            read_count(span.device, *count, conn.w_count.get()),
                             last.span.start,
                             last.span.count,
                         ) != RangeAssessment::VerifiedInside
@@ -662,7 +753,7 @@ impl read::Guest for Component {
             };
             let send = encode_read(route, series, group.span)
                 .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-            let step = read_step(send, group.span.count);
+            let step = read_step(send, group.span);
             plans.push(read::Planned {
                 step,
                 covers: group.covers.clone(),
@@ -727,11 +818,7 @@ impl read::Guest for Component {
                 || (p.covers.len() > 1
                     && assess_d_span(
                         model,
-                        if tag.device == Device::W {
-                            conn.w_count.get()
-                        } else {
-                            *count
-                        },
+                        read_count(tag.device, *count, conn.w_count.get()),
                         tag.start,
                         tag.count,
                     ) != RangeAssessment::VerifiedInside)
@@ -750,14 +837,12 @@ impl read::Guest for Component {
         let series = known_series(model).expect("ready model has series");
         let expected = encode_read(route, series, pending.span)
             .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-        if p.step.send != expected
-            || p.step.max_len != read_step(expected, pending.span.count).max_len
-        {
+        if p.step.send != expected || p.step.max_len != read_step(expected, pending.span).max_len {
             return Err(FatalError::Protocol("plan bytes do not match spec".into()));
         }
         conn.pending.borrow_mut().remove(&route.serial);
         match decode_read(route, pending.span, &response) {
-            Ok(Values::Words(words)) => {
+            Ok(Values::Words(words)) if !pending.span.device.is_bit() => {
                 let mut offset = 0usize;
                 let mut results = Vec::with_capacity(p.covers.len());
                 for cover in &p.covers {
@@ -776,7 +861,17 @@ impl read::Guest for Component {
                 }
                 Ok(results)
             }
-            Ok(Values::Bits(_)) => Err(FatalError::Protocol("D read returned bits".into())),
+            Ok(Values::Bits(bits)) if pending.span.device.is_bit() => {
+                if bits.len() != p.covers.len() {
+                    return Err(FatalError::Protocol(
+                        "bit response does not match covers".into(),
+                    ));
+                }
+                Ok(bits.into_iter().map(Value::Bool).map(Ok).collect())
+            }
+            Ok(_) => Err(FatalError::Protocol(
+                "read response has wrong device unit".into(),
+            )),
             Err(ResponseError::EndCode(code)) => Ok((0..pending.covers.len())
                 .map(|_| {
                     Err(ItemError::Device(banto::driver::types::DeviceError {
@@ -976,12 +1071,27 @@ impl address::Guest for Component {
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
         Ok(address::Parsed {
             canonical: canonical_read(device, i64::from(number))?,
-            area: if device == Device::W { "W" } else { "D" }.into(),
+            area: match device {
+                Device::M => "M",
+                Device::X => "X",
+                Device::Y => "Y",
+                Device::B => "B",
+                Device::L => "L",
+                Device::F => "F",
+                Device::V => "V",
+                Device::SB => "SB",
+                Device::SM => "SM",
+                Device::D => "D",
+                Device::W => "W",
+                Device::SW => "SW",
+                Device::SD => "SD",
+            }
+            .into(),
             // The existing write extension remains restricted to D/u16.
             // write-next also requires StandardR and a verified range.
-            writable_area: device == Device::D && kind == DKind::U16,
+            writable_area: device == Device::D && kind == ReadKind::Numeric(DKind::U16),
             bit: None,
-            word_count: u32::from(kind.words()),
+            word_count: u32::from(kind.points()),
             index: Some(u64::from(number)),
         })
     }
@@ -993,11 +1103,11 @@ impl address::Guest for Component {
         n: i64,
     ) -> Result<String, String> {
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
-        let word_offset = n
-            .checked_mul(i64::from(kind.words()))
+        let point_offset = n
+            .checked_mul(i64::from(kind.points()))
             .ok_or("offset overflow")?;
         let next = i64::from(number)
-            .checked_add(word_offset)
+            .checked_add(point_offset)
             .ok_or("offset overflow")?;
         let next = canonical_read(device, next)?;
         parse_read_address(&next, &data_type, string_words)?;
@@ -1005,14 +1115,25 @@ impl address::Guest for Component {
     }
 
     fn supported_kinds() -> Vec<String> {
-        ["u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        [
+            "bit", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     }
 
     fn offset_words(text: String, n: i64) -> Result<String, String> {
-        let (device, number, _) = parse_read_address(&text, "u16", None)?;
+        let kind = if ["M", "X", "Y", "B", "L", "F", "V", "SB", "SM"]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            && !text.starts_with("SW")
+        {
+            "bit"
+        } else {
+            "u16"
+        };
+        let (device, number, _) = parse_read_address(&text, kind, None)?;
         canonical_read(
             device,
             i64::from(number).checked_add(n).ok_or("offset overflow")?,
@@ -1020,7 +1141,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP D decimal and standard iQ-R W hexadecimal numeric reads (1/2/4 words); range may remain unknown after handshake"
+        "SLMP M/L/F/V/SM decimal and X/Y/B/SB hexadecimal bit reads; D/SD decimal and SW hexadecimal numeric reads; standard iQ-R also reads W hexadecimal. New area ranges are unknown and use one request per tag. Writes remain D/u16 only"
             .into()
     }
 
@@ -1147,6 +1268,163 @@ mod tests {
             code: 0,
             family,
         }
+    }
+
+    #[test]
+    fn bit_addresses_keep_device_radix_point_units_and_unknown_range() {
+        let r = model(ModelFamily::StandardR);
+        for (text, canonical, area, number) in [
+            ("M10", "M10", "M", 10),
+            ("X0f", "XF", "X", 15),
+            ("Y10", "Y10", "Y", 16),
+            ("B1a", "B1A", "B", 26),
+        ] {
+            let parsed = <Component as address::Guest>::parse(text.into(), "bit".into(), None)
+                .expect("bit address");
+            assert_eq!(parsed.canonical, canonical);
+            assert_eq!(parsed.area, area);
+            assert_eq!(parsed.index, Some(number));
+            assert_eq!(parsed.word_count, 1);
+            assert_eq!(parsed.bit, None);
+            assert!(!parsed.writable_area);
+            let spec = TagSpec {
+                address: text.into(),
+                data_type: "bit".into(),
+                string_words: None,
+            };
+            assert_eq!(
+                checked_read_span(&spec, &r, PointCount::Exact(0), PointCount::Exact(0))
+                    .unwrap()
+                    .count,
+                1
+            );
+        }
+        for (address, kind, words) in [
+            ("M1A", "bit", None),
+            ("X10.1", "bit", None),
+            ("x10", "bit", None),
+            ("Y10", "u16", None),
+            ("B10", "bit", Some(1)),
+            ("D10", "bit", None),
+            ("W10", "bit", None),
+        ] {
+            assert!(
+                parse_read_address(address, kind, words).is_err(),
+                "{address}/{kind}"
+            );
+        }
+        assert_eq!(
+            <Component as address::Guest>::offset("XF".into(), "bit".into(), None, 1).unwrap(),
+            "X10"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("B1F".into(), 1).unwrap(),
+            "B20"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset("M0".into(), "bit".into(), None, -1),
+            Err("read address exceeds u32".into())
+        );
+        assert!(<Component as address::Guest>::supported_kinds().contains(&"bit".into()));
+        let q25 = model(ModelFamily::Q25PrhWireOnly);
+        let spec = TagSpec {
+            address: "B1A".into(),
+            data_type: "bit".into(),
+            string_words: None,
+        };
+        assert!(
+            checked_read_span(&spec, &q25, PointCount::Exact(100), PointCount::Unknown).is_ok()
+        );
+        assert_eq!(
+            read_count(Device::B, PointCount::Exact(100), PointCount::Exact(100)),
+            PointCount::Unknown
+        );
+    }
+
+    #[test]
+    fn additional_device_syntax_keeps_units_unknown_and_write_disabled() {
+        let r = model(ModelFamily::StandardR);
+        for (text, canonical, area, index) in [
+            ("L12", "L12", "L", 12),
+            ("F13", "F13", "F", 13),
+            ("V14", "V14", "V", 14),
+            ("SB1a", "SB1A", "SB", 26),
+            ("SM15", "SM15", "SM", 15),
+        ] {
+            let parsed =
+                <Component as address::Guest>::parse(text.into(), "bit".into(), None).unwrap();
+            assert_eq!(
+                (
+                    parsed.canonical.as_str(),
+                    parsed.area.as_str(),
+                    parsed.index
+                ),
+                (canonical, area, Some(index))
+            );
+            assert!(!parsed.writable_area);
+            let spec = TagSpec {
+                address: text.into(),
+                data_type: "bit".into(),
+                string_words: None,
+            };
+            let span =
+                checked_read_span(&spec, &r, PointCount::Exact(0), PointCount::Exact(0)).unwrap();
+            assert_eq!(
+                read_count(span.device, PointCount::Exact(100), PointCount::Exact(100)),
+                PointCount::Unknown
+            );
+        }
+        for (text, canonical, area, index) in
+            [("SW1a", "SW1A", "SW", 26), ("SD290", "SD290", "SD", 290)]
+        {
+            let parsed =
+                <Component as address::Guest>::parse(text.into(), "u32".into(), None).unwrap();
+            assert_eq!(
+                (
+                    parsed.canonical.as_str(),
+                    parsed.area.as_str(),
+                    parsed.index,
+                    parsed.word_count
+                ),
+                (canonical, area, Some(index), 2)
+            );
+            assert!(!parsed.writable_area);
+            let spec = TagSpec {
+                address: text.into(),
+                data_type: "u32".into(),
+                string_words: None,
+            };
+            let span =
+                checked_read_span(&spec, &r, PointCount::Exact(0), PointCount::Exact(0)).unwrap();
+            assert_eq!(span.count, 2);
+        }
+        for (address, kind) in [
+            ("SB1G", "bit"),
+            ("SM1A", "bit"),
+            ("SD1A", "u16"),
+            ("SW1G", "u16"),
+            ("L1", "u16"),
+            ("SW1", "bit"),
+            ("D0.0", "bit"),
+            ("SWFFFFFFFF", "f64"),
+        ] {
+            assert!(
+                parse_read_address(address, kind, None).is_err(),
+                "{address}/{kind}"
+            );
+        }
+        assert_eq!(
+            <Component as address::Guest>::offset("SB1F".into(), "bit".into(), None, 1).unwrap(),
+            "SB20"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("SW1F".into(), 1).unwrap(),
+            "SW20"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("SD9".into(), 1).unwrap(),
+            "SD10"
+        );
     }
 
     #[test]
