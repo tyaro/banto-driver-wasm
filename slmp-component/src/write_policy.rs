@@ -8,6 +8,7 @@ pub(super) const ALLOWLIST_KEY: &str = "d_u16_write_allowlist";
 const MAX_TEXT_LEN: usize = 256;
 const MAX_INTERVALS: usize = 16;
 const MAX_WORDS: usize = 960;
+const MAX_BITS: usize = 7168;
 const MAX_DEVICE: u32 = 0x00ff_ffff;
 
 #[derive(Clone, Debug)]
@@ -44,10 +45,11 @@ impl WritePolicy {
                 if device != end_device {
                     return Err((ALLOWLIST_KEY, "write range must remain in one device area"));
                 }
-                if end < start || end - start >= MAX_WORDS as u32 {
+                let max_points = if device.is_bit() { MAX_BITS } else { MAX_WORDS };
+                if end < start || end - start >= max_points as u32 {
                     return Err((
                         ALLOWLIST_KEY,
-                        "write range is reversed or exceeds 960 words",
+                        "write range is reversed or exceeds device request limit",
                     ));
                 }
                 if device == Device::D && start <= 3001 && end >= 3000 {
@@ -79,10 +81,13 @@ impl WritePolicy {
     }
 
     pub(super) fn allows_device_span(&self, device: Device, start: u32, len: usize) -> bool {
-        if !matches!(device, Device::D | Device::W) {
+        if !matches!(
+            device,
+            Device::D | Device::W | Device::M | Device::Y | Device::L | Device::B
+        ) {
             return false;
         }
-        if !self.enabled || len == 0 || len > MAX_WORDS {
+        if !self.enabled || len == 0 || len > if device.is_bit() { MAX_BITS } else { MAX_WORDS } {
             return false;
         }
         let Some(end) = start.checked_add((len - 1) as u32) else {
@@ -97,15 +102,21 @@ impl WritePolicy {
                     area == device && start >= allowed_start && end <= allowed_end
                 })
     }
+
+    pub(super) fn has_bit_ranges(&self) -> bool {
+        self.enabled && self.ranges.iter().any(|(device, _, _)| device.is_bit())
+    }
 }
 
 fn parse_device(value: &str) -> Result<(Device, u32), (&'static str, &'static str)> {
-    let (device, digits, radix) = if let Some(digits) = value.strip_prefix('D') {
-        (Device::D, digits, 10)
-    } else if let Some(digits) = value.strip_prefix('W') {
-        (Device::W, digits, 16)
-    } else {
-        return Err((ALLOWLIST_KEY, "expected D or W address"));
+    let (device, digits, radix) = match value.as_bytes().first() {
+        Some(b'D') => (Device::D, &value[1..], 10),
+        Some(b'W') => (Device::W, &value[1..], 16),
+        Some(b'M') => (Device::M, &value[1..], 10),
+        Some(b'Y') => (Device::Y, &value[1..], 16),
+        Some(b'L') => (Device::L, &value[1..], 10),
+        Some(b'B') => (Device::B, &value[1..], 16),
+        _ => return Err((ALLOWLIST_KEY, "expected D/W/M/Y/L/B address")),
     };
     let digits = Some(digits)
         .filter(|digits| {
@@ -171,6 +182,28 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn bit_areas_share_enable_but_require_explicit_area_ranges() {
+        let old = WritePolicy::parse(Some("enabled"), Some("D3010-D3013")).unwrap();
+        assert!(!old.has_bit_ranges());
+        assert!(!old.allows_device_span(Device::M, 10, 1));
+        let policy = WritePolicy::parse(
+            Some("enabled"),
+            Some("D3010-D3013,M10-M17,Y1A-Y1F,L10-L10,B20-B21"),
+        )
+        .unwrap();
+        assert!(policy.has_bit_ranges());
+        assert!(policy.allows_device_span(Device::M, 10, 8));
+        assert!(policy.allows_device_span(Device::Y, 0x1a, 6));
+        assert!(policy.allows_device_span(Device::L, 10, 1));
+        assert!(policy.allows_device_span(Device::B, 0x20, 2));
+        assert!(!policy.allows_device_span(Device::X, 0, 1));
+        assert!(!policy.allows_device_span(Device::M, 17, 2));
+        let edge = WritePolicy::parse(Some("enabled"), Some("D2999-D2999")).unwrap();
+        assert!(edge.allows_device_span(Device::D, 2999, 1));
+        assert!(!edge.allows_device_span(Device::D, 2999, 2));
     }
 
     #[test]
