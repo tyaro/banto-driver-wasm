@@ -301,7 +301,7 @@ mod tests {
         undiscovered.resource_drop(&mut store)?;
 
         for (name, code, sd_count) in [
-            ("Q25PRHCPU", 0x004c, None),
+            ("Q25PRHCPU", 0x004c, Some(3014u16.to_le_bytes().to_vec())),
             ("Q02UCPU", 0x0263, Some(vec![32, 0])),
             ("R04CPU", 0x4800, Some(vec![])),
         ] {
@@ -555,6 +555,291 @@ mod tests {
             "uncertain ACK poisons session"
         );
         conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn q25prh_test_write_requires_opt_in_exact_pair_and_fixed_four_words() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let basic = vec![
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+        ];
+        let mut enabled = basic.clone();
+        enabled.push(Setting {
+            key: "q25prh_d3010_3013_test_write".into(),
+            value: "enabled".into(),
+        });
+        let items: Vec<WriteItem> = (0..4)
+            .map(|index| WriteItem {
+                spec: TagSpec {
+                    address: format!("D{}", 3010 + index),
+                    data_type: "u16".into(),
+                    string_words: None,
+                },
+                value: Value::Float(f64::from(index + 1)),
+            })
+            .collect();
+        for (settings, name, code, allowed) in [
+            (&basic, "Q25PRHCPU", 0x004c, false),
+            (&enabled, "Q25PRHCPU", 0x004d, false),
+            (&enabled, "Q25PRHCPX", 0x004c, false),
+            (&enabled, "Q25PRHCPU", 0x004c, true),
+        ] {
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, settings)?
+                .expect("settings");
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101")
+                .is_some());
+            let sd = driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+                .expect("0101 response");
+            if name == "Q25PRHCPU" && code == 0x004c {
+                let sd = sd.expect("Q25PRH SD302 request");
+                assert_eq!(&sd.send[2..4], &[2, 0]);
+                assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 1, 0]);
+                let before_sd = driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &items, None)?
+                    .expect("write requires SD evidence");
+                assert!(matches!(before_sd, WriteProgress::Done(results)
+                    if results.len() == 4 && results.iter().all(Result::is_err)));
+                assert!(driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(
+                        &mut store,
+                        conn,
+                        Some(&response(2, &3014u16.to_le_bytes()))
+                    )?
+                    .expect("SD302 count")
+                    .is_none());
+            } else {
+                assert!(sd.is_none());
+            }
+            if !allowed {
+                let outcome = driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &items, None)?
+                    .expect("fail-closed write gate");
+                assert!(matches!(outcome, WriteProgress::Done(results)
+                    if results.len() == 4 && results.iter().all(Result::is_err)));
+                conn.resource_drop(&mut store)?;
+                continue;
+            }
+            for invalid in [
+                items[..3].to_vec(),
+                (3011..=3014)
+                    .map(|number| WriteItem {
+                        spec: TagSpec {
+                            address: format!("D{number}"),
+                            ..items[0].spec.clone()
+                        },
+                        value: Value::Float(1.0),
+                    })
+                    .collect(),
+                (3000..=3003)
+                    .map(|number| WriteItem {
+                        spec: TagSpec {
+                            address: format!("D{number}"),
+                            ..items[0].spec.clone()
+                        },
+                        value: Value::Float(1.0),
+                    })
+                    .collect(),
+                vec![
+                    items[0].clone(),
+                    items[1].clone(),
+                    items[2].clone(),
+                    WriteItem {
+                        value: Value::Float(f64::NAN),
+                        ..items[3].clone()
+                    },
+                ],
+            ] {
+                let outcome = driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &invalid, None)?
+                    .expect("whole-run rejection");
+                assert!(matches!(outcome, WriteProgress::Done(results)
+                    if results.len() == invalid.len() && results.iter().all(Result::is_err)));
+            }
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("opt-in Q test");
+            let WriteProgress::Send(plan) = outcome else {
+                panic!("Q test must send one frame")
+            };
+            assert_eq!(plan.covers, [0, 1, 2, 3]);
+            assert_eq!(&plan.step.send[2..4], &[3, 0], "rejections used no serial");
+            assert_eq!(&plan.step.send[11..13], &[20, 0]);
+            assert_eq!(
+                &plan.step.send[15..],
+                &[1, 0x14, 0, 0, 0xc2, 0x0b, 0, 0xa8, 4, 0, 1, 0, 2, 0, 3, 0, 4, 0,]
+            );
+            let done = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, Some(&response(3, &[])))?
+                .expect("ACK");
+            assert!(matches!(done, WriteProgress::Done(results)
+                if results.len() == 4 && results.iter().all(Result::is_ok)));
+            let second = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("second plan");
+            assert!(matches!(second, WriteProgress::Send(_)));
+            assert!(
+                driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &items, None)?
+                    .is_err(),
+                "pending Q write cannot resend"
+            );
+            assert!(driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, Some(&response(99, &[])))?
+                .is_err());
+            assert!(
+                driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &items, None)?
+                    .is_err(),
+                "uncertain ACK poisons Q session"
+            );
+            conn.resource_drop(&mut store)?;
+        }
+
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &enabled)?
+            .expect("settings");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        let sd = driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("Q25PRHCPU", 0x004c)))?
+            .expect("type and SD302")
+            .expect("SD302 request");
+        assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 1, 0]);
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(2, &3014u16.to_le_bytes())))?
+            .expect("SD302 reply")
+            .is_none());
+        let specs: Vec<TagSpec> = items.iter().map(|item| item.spec.clone()).collect();
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("Q range remains unknown");
+        assert_eq!(plans.len(), 4, "opt-in write must not verify Q D range");
+        assert!(plans
+            .iter()
+            .enumerate()
+            .all(|(i, plan)| plan.covers == [i as u32]));
+        conn.resource_drop(&mut store)?;
+
+        for (count, allowed) in [(3013u16, false), (32768u16, true)] {
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &enabled)?
+                .expect("test settings");
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101");
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response("Q25PRHCPU", 0x004c)))?
+                .expect("SD302")
+                .is_some());
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&response(2, &count.to_le_bytes())))?
+                .expect("SD302 count");
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("whole-span check");
+            if allowed {
+                assert!(matches!(outcome, WriteProgress::Send(plan)
+                    if plan.covers == [0, 1, 2, 3] && plan.step.send[2..4] == [3, 0]));
+            } else {
+                assert!(matches!(outcome, WriteProgress::Done(results)
+                    if results.len() == 4 && results.iter().all(Result::is_err)));
+            }
+            conn.resource_drop(&mut store)?;
+        }
+
+        for bad_sd in [false, true] {
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &enabled)?
+                .expect("test settings");
+            driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101");
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response("Q25PRHCPU", 0x004c)))?
+                .expect("SD302")
+                .is_some());
+            let mut reply = response(2, &[]);
+            if !bad_sd {
+                reply[13] = 1; // PLC end-code refusal
+            }
+            let ready = driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&reply))?;
+            assert_eq!(
+                ready.is_err(),
+                bad_sd,
+                "short SD is fatal; refusal remains unknown"
+            );
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("unknown SD count rejects write");
+            assert!(matches!(outcome, WriteProgress::Done(results)
+                if results.len() == 4 && results.iter().all(Result::is_err)));
+            conn.resource_drop(&mut store)?;
+        }
         Ok(())
     }
 
@@ -866,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn q25prh_exact_pair_uses_q_wire_without_sd_or_verified_batch() -> wasmtime::Result<()> {
+    fn q25prh_exact_pair_reads_sd302_but_keeps_general_reads_unknown() -> wasmtime::Result<()> {
         use banto::driver::types::Value;
         let (mut store, driver) = load()?;
         let conn = driver
@@ -882,17 +1167,19 @@ mod tests {
             .expect("type request");
         assert_eq!(&type_step.send[2..4], &[1, 0]);
         assert_eq!(&type_step.send[15..19], &[1, 1, 0, 0]);
-        assert!(driver
+        let sd = driver
             .banto_driver_session()
             .connection()
             .call_handshake_next(&mut store, conn, Some(&model_response("Q25PRHCPU", 0x004c)))?
-            .expect("Q wire recognized without an applicable SD map")
-            .is_none());
+            .expect("Q wire and SD302 map")
+            .expect("SD302 request");
+        assert_eq!(&sd.send[2..4], &[2, 0]);
+        assert_eq!(&sd.send[17..25], &[0, 0, 0x2e, 1, 0, 0xa9, 1, 0]);
         assert!(driver
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, None)?
-            .expect("ready without SD")
+            .call_handshake_next(&mut store, conn, Some(&response(2, &3014u16.to_le_bytes())))?
+            .expect("ready after SD")
             .is_none());
         let specs = d_specs(&[5, 6]);
         let plans = driver
@@ -902,8 +1189,8 @@ mod tests {
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].covers, [0]);
         assert_eq!(plans[1].covers, [1]);
-        assert_eq!(&plans[0].step.send[2..4], &[2, 0]);
-        assert_eq!(&plans[1].step.send[2..4], &[3, 0]);
+        assert_eq!(&plans[0].step.send[2..4], &[3, 0]);
+        assert_eq!(&plans[1].step.send[2..4], &[4, 0]);
         assert_eq!(&plans[0].step.send[17..25], &[0, 0, 5, 0, 0, 0xa8, 1, 0]);
         let values = driver
             .banto_driver_read()
@@ -912,7 +1199,7 @@ mod tests {
                 conn,
                 &plans[0],
                 &specs,
-                &response(2, &[0x34, 0x12]),
+                &response(3, &[0x34, 0x12]),
             )?
             .expect("one explicit D word");
         assert!(matches!(values.as_slice(), [Ok(Value::Uint(0x1234))]));

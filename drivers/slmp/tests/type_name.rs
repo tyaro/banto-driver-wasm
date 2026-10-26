@@ -32,7 +32,7 @@ fn request_and_known_q_r_responses_match_wire_fixtures() {
 }
 
 #[test]
-fn q25prh_exact_0101_pair_proves_q_wire_but_not_any_basic_sd_map() {
+fn q25prh_exact_0101_pair_proves_q_wire_and_separate_sd302_map() {
     // SLMP Reference Manual, printed p.139, lists Q25PRHCPU / 004CH.
     let mut frame = Q02UCPU;
     frame[15..31].copy_from_slice(b"Q25PRHCPU       ");
@@ -42,7 +42,11 @@ fn q25prh_exact_0101_pair_proves_q_wire_but_not_any_basic_sd_map() {
     assert_eq!(model.raw_name, *b"Q25PRHCPU       ");
     assert_eq!(model.code, 0x004c);
     assert_eq!(model.family, ModelFamily::Q25PrhWireOnly);
-    assert_eq!(plan_basic_sd(&model, BasicArea::DInternal), None);
+    let sd = plan_basic_sd(&model, BasicArea::DInternal).expect("QnPRH SD302");
+    assert_eq!(
+        (sd.device, sd.start, sd.count),
+        (banto_slmp_read_core::Device::SD, 302, 1)
+    );
     assert_eq!(plan_basic_sd(&model, BasicArea::X), None);
     assert_eq!(
         basic_sd_count(
@@ -54,7 +58,7 @@ fn q25prh_exact_0101_pair_proves_q_wire_but_not_any_basic_sd_map() {
             },
             Some(&[1024]),
         ),
-        PointCount::Unknown
+        PointCount::Exact(1024)
     );
 
     frame[31..33].copy_from_slice(&[0x4b, 0x00]);

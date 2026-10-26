@@ -22,6 +22,32 @@ fn confirmed() -> BasicEvidence {
 }
 
 #[test]
+fn q25prh_only_sd302_has_a_basic_count_map() {
+    let q = model("Q25PRHCPU", 0x004c);
+    assert_eq!(q.family, ModelFamily::Q25PrhWireOnly);
+    let plan = plan_basic_sd(&q, A::DInternal).expect("QnPRH SD302");
+    assert_eq!(
+        (plan.device, plan.start, plan.count),
+        (banto_slmp_read_core::Device::SD, 302, 1)
+    );
+    assert_eq!(
+        basic_sd_count(&q, A::DInternal, confirmed(), Some(&[3014])),
+        PointCount::Exact(3014)
+    );
+    assert_eq!(
+        basic_sd_count(&q, A::DInternal, confirmed(), Some(&[32768])),
+        PointCount::AtLeast(32768)
+    );
+    assert_eq!(
+        basic_sd_count(&q, A::DInternal, confirmed(), None),
+        PointCount::Unknown
+    );
+    for area in [A::D, A::W, A::WInternal, A::M, A::ZR] {
+        assert_eq!(plan_basic_sd(&q, area), None);
+    }
+}
+
+#[test]
 fn q_basic_sd_map_and_wire_plans_match_the_official_single_word_table() {
     let q = model("Q02UCPU", 0x0263);
     assert_eq!(q.family, ModelFamily::StandardQ);
