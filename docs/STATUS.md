@@ -1,5 +1,10 @@
 # STATUS
 
+## SLMP V collection exclusion (2026-10-27)
+
+- Based on main `02a92645cc9a352e61c3f55ce58faab1fd7e8895` in a dedicated worktree. The SLMP guest rejects V edge-relay tag addresses with a reason at its shared parser, so address registration/offsets, read planning, and diagnostics agree. SLMP's global V read code remains in the low-level core; periodic collection cannot reliably capture a one-scan edge. Existing D/W and other bit read/write policy, WIT, and Hub are unchanged. No registered V tags were reported.
+- Local Rust 1.98.1 verification passed: 19 guest unit tests and one doc test, 37 SLMP core fixtures, 30 controlled Wasmtime read/write fixtures and five diagnostics fixtures, fmt and strict Clippy for core/guest/runtime, core wasm32 check, guest wasm32 build, component validation, and all four existing WIT world target checks. Mixed-tag plans preserve original `covers` after V rejection; diagnostics reports V as invalid with its reason. Native SLMP is being handled separately in banto-industrial PR 884. Live PLC behavior and Hub integration with this new guest remain unverified; hosted CI is checked on the PR. No merge is included in this stage.
+
 ## Modbus register-bit read follow-up (2026-10-27)
 
 - Based on merged main `9989fe5f4d833565b7a5360368d44b2bec7eb822` in an isolated MSI D: worktree. FC3/FC4 reads now accept decimal `.0` through `.15` on 3xxxx/4xxxx registers with WIT `bool`, returning one-word `Value::Bool`. Canonical forms and bit-preserving `offset_words` match native; tag `offset` refuses nonzero movement on a bit-suffixed address. Outer whitespace is trimmed while internal whitespace is rejected. `word_order` does not affect one-word bit extraction.

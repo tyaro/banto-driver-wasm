@@ -1844,12 +1844,23 @@ mod tests {
                 .banto_driver_read()
                 .call_plan(&mut store, conn, &specs)?
                 .expect("plans");
-            assert_eq!(plans.len(), specs.len(), "unknown counts remain individual");
-            for (index, plan) in plans.iter().enumerate() {
+            assert_eq!(plans.len(), specs.len() - 1, "V must remain uncovered");
+            assert_eq!(
+                plans
+                    .iter()
+                    .map(|plan| plan.covers.as_slice())
+                    .collect::<Vec<_>>(),
+                vec![&[0][..], &[1][..], &[3][..], &[4][..], &[5][..], &[6][..]]
+            );
+            assert!(driver
+                .banto_driver_address()
+                .call_parse(&mut store, "V12", "bit", None)?
+                .is_err());
+            for plan in &plans {
+                let index = plan.covers[0] as usize;
                 let (device_code, subcommand, body): (u8, [u8; 2], &[u8]) = match index {
                     0 => (0x92, bit_sub, &[0x10]),
                     1 => (0x93, bit_sub, &[0]),
-                    2 => (0x94, bit_sub, &[0x10]),
                     3 => (0xa1, bit_sub, &[0]),
                     4 => (0x91, bit_sub, &[0x10]),
                     5 => (0xb5, word_sub, &[0x34, 0x12, 0xcd, 0xab]),
@@ -1875,7 +1886,7 @@ mod tests {
                     .expect("values");
                 assert!(matches!(
                     (index, values.as_slice()),
-                    (0 | 2 | 4, [Ok(Value::Bool(true))])
+                    (0 | 4, [Ok(Value::Bool(true))])
                         | (1 | 3, [Ok(Value::Bool(false))])
                         | (5, [Ok(Value::Uint(0xabcd_1234))])
                         | (6, [Ok(Value::Uint(0x5678))])
@@ -3068,6 +3079,11 @@ mod tests {
                 string_words: None,
             },
             TagSpec {
+                address: "V14".into(),
+                data_type: "bit".into(),
+                string_words: None,
+            },
+            TagSpec {
                 address: "D0".into(),
                 data_type: "u16".into(),
                 string_words: None,
@@ -3079,7 +3095,7 @@ mod tests {
             .expect("invalid tags are omitted, not a connection fatal");
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].covers, [0]);
-        assert_eq!(plans[1].covers, [4]);
+        assert_eq!(plans[1].covers, [5]);
         assert_eq!(&plans[0].step.send[2..4], &[3, 0]);
         assert_eq!(&plans[1].step.send[2..4], &[4, 0]);
         let last = driver
