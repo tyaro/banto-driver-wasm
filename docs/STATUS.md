@@ -242,12 +242,12 @@ Initial local plan: keep WIT `driver` unchanged, use its connection handshake fo
 
 - SLMP 実装時に公式表の機種条件、経路、アドレス基数、bit/word 単位、複合タグの全範囲をフィクスチャで検証する。本番前の read-only 接続テストと Hub [Issue #845](https://github.com/tyaro/banto-industrial/issues/845) の境界を合わせ、実機 write は別途承認を受ける。
 
-- #881/#884 の Modbus 模擬検証と #885 の SLMP #34 模擬受入れと #887 の #35 模擬受入れを維持し、#35 診断の実機確認、未試験の型・範囲と本番での二重ゲート運用を別作業で照合する。#885 の #34 pin は今回変更しない。
+- tyaro/banto-industrial#881 / tyaro/banto-industrial#884 の Modbus 模擬検証と tyaro/banto-industrial#885 の SLMP #34 模擬受入れと tyaro/banto-industrial#887 の #35 模擬受入れを維持し、#35 診断の実機確認、未試験の型・範囲と本番での二重ゲート運用を別作業で照合する。Hub の CI が固定するのは #35 の `b3d944f5`（tyaro/banto-industrial#887 で #34 から置き換え。#34 の V の拒否は #35 に含まれる）。
 - 実装済み 0101 型式判別と SD 点数取得の適用条件を維持し、未確定の機種・経路・拡張範囲、指定タグ読取りテストの追加採否と WIT 互換性は別作業で判断する。#871 の gap 読取り最適化は後回し。V 周期収集除外と Modbus register-bit write `Unsupported` は現行契約として維持する。
 
 ## 次作業
 
-1. industrial #885（#34 固定）と #887（#35 固定）との契約差を追跡し、#35 診断の実機確認は別作業で検証する。guest の能力追加だけで本番許可にしない。
+1. tyaro/banto-industrial#885（#34 固定）と tyaro/banto-industrial#887（#35 固定）との契約差を追跡し、#35 診断の実機確認は別作業で検証する。guest の能力追加だけで本番許可にしない。
 2. 実機と Hub の未検証点を個別に確認する。文字列、条件付き機種・経路の範囲、指定タグ読取りテスト、配布 manifest は候補として保持し、採否と実装範囲は別途決める。
 
 過去のセッションで記録した必要環境: Rust 1.98.1 のみ、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0、テスト依存 Wasmtime 50.0.0、Node.js 24。新しいクラウド環境には前セッションの導入が継承されると仮定せず確認する。実通信の自動確認は制御したローカル TCP で行い、実機 PLC は使わない。MSRV 宣言と native descriptor の欠落時 `settings_version=1` は変更しない。
