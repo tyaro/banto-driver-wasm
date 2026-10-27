@@ -6,8 +6,8 @@ use std::cell::{Cell, RefCell};
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_modbus_read_core::{
     decode_write_ack, write_coil_request, write_registers_request, BitFunction, NumericKind,
-    NumericValue, ReadBit, ReadError, ReadHoldingNumeric, RegisterFunction, WordOrder,
-    MAX_RESPONSE_LEN,
+    NumericValue, ReadBit, ReadError, ReadHoldingNumeric, ReadRegisterBit, RegisterFunction,
+    WordOrder, MAX_RESPONSE_LEN,
 };
 use exports::banto::driver::{address, config, read, session, write_v1};
 
@@ -56,6 +56,7 @@ struct PendingWrite {
 enum TagKind {
     Numeric(Kind, RegisterFunction),
     Bit(BitFunction),
+    RegisterBit(RegisterFunction, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,10 +322,39 @@ fn parse_bit(
     ))
 }
 
+fn parse_register_bit(
+    text: &str,
+    data_type: &str,
+    words: Option<u32>,
+) -> Result<(u16, TagKind), String> {
+    if data_type != "bool" || words.is_some() {
+        return Err("register-bit requires bool without string_words".into());
+    }
+    let (base, suffix) = text
+        .trim()
+        .split_once('.')
+        .ok_or("register-bit suffix required")?;
+    if !matches!(base.len(), 5 | 6) || !base.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("invalid register-bit reference".into());
+    }
+    if !(1..=2).contains(&suffix.len()) || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("register-bit suffix must be decimal 0..15".into());
+    }
+    let bit = suffix.parse::<u8>().map_err(|_| "invalid register bit")?;
+    if bit > 15 {
+        return Err("register-bit suffix must be decimal 0..15".into());
+    }
+    let (offset, _) = parse_holding(base, "u16", None)?;
+    Ok((offset, TagKind::RegisterBit(register_function(base), bit)))
+}
+
 fn parse_tag(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16, TagKind), String> {
     match text.trim().as_bytes().first() {
         Some(b'0' | b'1') => parse_bit(text, data_type, words)
             .map(|(offset, function)| (offset, TagKind::Bit(function))),
+        Some(b'3' | b'4') if text.trim().contains('.') => {
+            parse_register_bit(text, data_type, words)
+        }
         _ => parse_holding(text, data_type, words)
             .map(|(offset, kind)| (offset, TagKind::Numeric(kind, register_function(text)))),
     }
@@ -334,6 +364,8 @@ fn area(kind: TagKind) -> Area {
     match kind {
         TagKind::Bit(BitFunction::Coil) => Area::Coil,
         TagKind::Bit(BitFunction::DiscreteInput) => Area::Discrete,
+        TagKind::RegisterBit(RegisterFunction::Input, _) => Area::Input,
+        TagKind::RegisterBit(RegisterFunction::Holding, _) => Area::Holding,
         TagKind::Numeric(_, RegisterFunction::Input) => Area::Input,
         TagKind::Numeric(_, RegisterFunction::Holding) => Area::Holding,
     }
@@ -343,6 +375,7 @@ fn tag_width(kind: TagKind) -> u32 {
     match kind {
         TagKind::Numeric(kind, _) => kind.word_count(),
         TagKind::Bit(_) => 1,
+        TagKind::RegisterBit(_, _) => 1,
     }
 }
 
@@ -350,6 +383,9 @@ fn canonical_tag(offset: u16, kind: TagKind) -> String {
     match kind {
         TagKind::Bit(BitFunction::Coil) => format!("0{:05}", u32::from(offset) + 1),
         TagKind::Bit(BitFunction::DiscreteInput) => format!("1{:05}", u32::from(offset) + 1),
+        TagKind::RegisterBit(function, bit) => {
+            format!("{}.{bit}", canonical_register(offset, function))
+        }
         TagKind::Numeric(_, function) => canonical_register(offset, function),
     }
 }
@@ -492,6 +528,7 @@ fn preflight_write(
             TagKind::Numeric(kind, RegisterFunction::Holding) => {
                 words.extend(numeric_words(kind, &item.value, conn.word_order)?)
             }
+            TagKind::RegisterBit(_, _) => return Err("register-bit writes are unsupported".into()),
             _ => return Err("input-only area is not writable".into()),
         }
     }
@@ -538,6 +575,14 @@ fn rejected_write(count: usize, message: &str) -> write_v1::WriteProgress {
     )
 }
 
+fn unsupported_write(count: usize, message: &str) -> write_v1::WriteProgress {
+    write_v1::WriteProgress::Done(
+        (0..count)
+            .map(|_| Err(ItemError::Unsupported(message.into())))
+            .collect(),
+    )
+}
+
 fn planned_read(conn: &ModbusConnection, specs: &[TagSpec]) -> Vec<read::Planned> {
     specs
         .iter()
@@ -555,6 +600,14 @@ fn planned_read(conn: &ModbusConnection, specs: &[TagSpec]) -> Vec<read::Planned
                     transaction_id,
                     unit_id: conn.unit_id,
                     offset,
+                    function,
+                }
+                .request(),
+                TagKind::RegisterBit(function, bit) => ReadRegisterBit {
+                    transaction_id,
+                    unit_id: conn.unit_id,
+                    offset,
+                    bit,
                     function,
                 }
                 .request(),
@@ -599,6 +652,14 @@ fn decode_planned(
             function,
         }
         .request(),
+        TagKind::RegisterBit(function, bit) => ReadRegisterBit {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            bit,
+            function,
+        }
+        .request(),
     };
     if send != expected {
         return Err(FatalError::Protocol(
@@ -627,6 +688,15 @@ fn decode_planned(
         }
         .decode(response)
         .map(Value::Bool),
+        TagKind::RegisterBit(function, bit) => ReadRegisterBit {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            bit,
+            function,
+        }
+        .decode(response)
+        .map(Value::Bool),
     };
     let value = match decoded {
         Ok(value) => Ok(value),
@@ -639,6 +709,8 @@ fn decode_planned(
                     TagKind::Bit(BitFunction::DiscreteInput) => 2,
                     TagKind::Numeric(_, RegisterFunction::Holding) => 3,
                     TagKind::Numeric(_, RegisterFunction::Input) => 4,
+                    TagKind::RegisterBit(RegisterFunction::Holding, _) => 3,
+                    TagKind::RegisterBit(RegisterFunction::Input, _) => 4,
                 }
             ),
         })),
@@ -872,6 +944,21 @@ fn write_next_impl(
             "write requires at least one item".into(),
         ));
     }
+    if items.iter().any(|item| {
+        matches!(
+            parse_tag(
+                &item.spec.address,
+                &item.spec.data_type,
+                item.spec.string_words
+            ),
+            Ok((_, TagKind::RegisterBit(_, _)))
+        )
+    }) {
+        return Ok(unsupported_write(
+            items.len(),
+            "register-bit writes are unsupported",
+        ));
+    }
     if !conn.write_enabled {
         return Ok(rejected_write(items.len(), "writes are disabled"));
     }
@@ -911,7 +998,10 @@ impl address::Guest for Component {
             }
             .into(),
             writable_area: matches!(area(kind), Area::Coil | Area::Holding),
-            bit: None,
+            bit: match kind {
+                TagKind::RegisterBit(_, bit) => Some(bit),
+                _ => None,
+            },
             word_count: tag_width(kind),
             index: Some(u64::from(offset)),
         })
@@ -924,6 +1014,9 @@ impl address::Guest for Component {
         n: i64,
     ) -> Result<String, String> {
         let (offset, kind) = parse_tag(&canonical, &data_type, string_words)?;
+        if matches!(kind, TagKind::RegisterBit(_, _)) && n != 0 {
+            return Err("register-bit addresses cannot be offset by tags".into());
+        }
         let words = i64::from(tag_width(kind))
             .checked_mul(n)
             .ok_or("オフセットが範囲外です")?;
@@ -943,7 +1036,9 @@ impl address::Guest for Component {
     }
 
     fn offset_words(canonical: String, n: i64) -> Result<String, String> {
-        let data_type = if matches!(canonical.trim().as_bytes().first(), Some(b'0' | b'1')) {
+        let data_type = if matches!(canonical.trim().as_bytes().first(), Some(b'0' | b'1'))
+            || canonical.contains('.')
+        {
             "bool"
         } else {
             "u16"
@@ -956,7 +1051,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
+        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). Register-bit writes are unsupported. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
             .into()
     }
 
@@ -1081,6 +1176,178 @@ export!(Component);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_bit_parse_offsets_and_refusal_match_native() {
+        for (raw, canonical, bit, area_name, writable) in [
+            ("40001.03", "400001.3", 3, "holding_register", true),
+            (" 40001.03 ", "400001.3", 3, "holding_register", true),
+            ("30001.15", "300001.15", 15, "input_register", false),
+            ("465536.0", "465536.0", 0, "holding_register", true),
+        ] {
+            let parsed =
+                <Component as address::Guest>::parse(raw.into(), "bool".into(), None).unwrap();
+            assert_eq!(parsed.canonical, canonical);
+            assert_eq!(parsed.bit, Some(bit));
+            assert_eq!(parsed.word_count, 1);
+            assert_eq!(
+                parsed.index,
+                Some(if raw.starts_with("465536") { 65535 } else { 0 })
+            );
+            assert_eq!(parsed.area, area_name);
+            assert_eq!(parsed.writable_area, writable);
+            assert_eq!(
+                <Component as address::Guest>::offset(raw.into(), "bool".into(), None, 0).unwrap(),
+                canonical
+            );
+        }
+        assert_eq!(
+            <Component as address::Guest>::offset_words("400001.3".into(), 1).unwrap(),
+            "400002.3"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("300002.15".into(), -1).unwrap(),
+            "300001.15"
+        );
+        assert!(
+            <Component as address::Guest>::offset("400001.3".into(), "bool".into(), None, 1)
+                .is_err()
+        );
+        assert!(
+            <Component as address::Guest>::offset("400001.3".into(), "bool".into(), None, -1)
+                .is_err()
+        );
+        assert!(<Component as address::Guest>::offset_words("465536.0".into(), 1).is_err());
+        assert!(<Component as address::Guest>::offset_words("300001.15".into(), -1).is_err());
+        for raw in [
+            "40001.",
+            "40001.3.4",
+            "40001.F",
+            "40001.16",
+            "40001.003",
+            "40001 .3",
+            " 40001 .3 ",
+            "40001\t.3",
+            "00001.3",
+            "10001.3",
+            "40000.3",
+            "465537.3",
+            "4001.3",
+        ] {
+            assert!(
+                <Component as address::Guest>::parse(raw.into(), "bool".into(), None).is_err(),
+                "{raw}"
+            );
+        }
+        for (raw, kind, words) in [
+            ("40001.3", "u16", None),
+            ("30001.15", "i32", None),
+            ("40001.3", "bool", Some(1)),
+            ("40001", "bool", None),
+        ] {
+            assert!(
+                <Component as address::Guest>::parse(raw.into(), kind.into(), words).is_err(),
+                "{raw} {kind}"
+            );
+        }
+        assert!(<Component as address::Guest>::probe().is_none());
+    }
+
+    #[test]
+    fn register_bit_fc3_fc4_read_and_mixed_plan_ignore_word_order() {
+        for order in [WordOrder::LowHigh, WordOrder::HighLow] {
+            let mut conn = conn();
+            conn.word_order = order;
+            let specs = vec![
+                TagSpec {
+                    address: "40001.0".into(),
+                    data_type: "bool".into(),
+                    string_words: None,
+                },
+                spec("40002"),
+                TagSpec {
+                    address: "30001.15".into(),
+                    data_type: "bool".into(),
+                    string_words: None,
+                },
+                TagSpec {
+                    address: "40002.15".into(),
+                    data_type: "bool".into(),
+                    string_words: None,
+                },
+            ];
+            let plans = planned_read(&conn, &specs);
+            assert_eq!(plans.len(), 4);
+            for (index, function, offset, value) in [
+                (0, 3, 0, 0x0001u16),
+                (1, 3, 1, 0x8000),
+                (2, 4, 0, 0x8000),
+                (3, 3, 1, 0x8000),
+            ] {
+                let plan = &plans[index];
+                assert_eq!(plan.covers, vec![index as u32]);
+                assert_eq!(plan.step.send[7], function);
+                assert_eq!(&plan.step.send[8..12], &[0, offset, 0, 1]);
+                let [hi, lo] = value.to_be_bytes();
+                let response = [
+                    plan.step.send[0],
+                    plan.step.send[1],
+                    0,
+                    0,
+                    0,
+                    5,
+                    1,
+                    function,
+                    2,
+                    hi,
+                    lo,
+                ];
+                let decoded = decode_planned(&conn, plan, &specs, &response).unwrap();
+                assert!(matches!(
+                    decoded.as_slice(),
+                    [Ok(Value::Bool(true))] | [Ok(Value::Uint(32768))]
+                ));
+            }
+            assert!(planned_read(
+                &conn,
+                &[TagSpec {
+                    address: "40001.16".into(),
+                    data_type: "bool".into(),
+                    string_words: None
+                }]
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn register_bit_writes_are_unsupported_before_any_send() {
+        for enabled in [false, true] {
+            let mut conn = conn();
+            conn.write_enabled = enabled;
+            conn.write_allowlist = parse_write_allowlist("400001-400010,000001-000010").unwrap();
+            for items in [
+                vec![write_item("40001.0", "bool", Value::Bool(true))],
+                vec![
+                    write_item("40001", "u16", Value::Uint(1)),
+                    write_item("40002.15", "bool", Value::Bool(true)),
+                ],
+                vec![
+                    write_item("40001.0", "bool", Value::Bool(false)),
+                    write_item("40002", "u16", Value::Uint(2)),
+                ],
+                vec![write_item("30001.15", "bool", Value::Bool(true))],
+            ] {
+                assert!(preflight_write(&conn, &items, 0).is_err());
+                let progress = write_next_impl(&conn, items.clone(), None).unwrap();
+                assert!(
+                    matches!(progress, write_v1::WriteProgress::Done(results) if results.len() == items.len() && results.iter().all(|result| matches!(result, Err(ItemError::Unsupported(_)))))
+                );
+                assert_eq!(conn.next_transaction_id.get(), 0);
+                assert!(conn.pending_write.borrow().is_none());
+            }
+        }
+    }
 
     fn conn() -> ModbusConnection {
         ModbusConnection {
@@ -1685,6 +1952,7 @@ mod tests {
         ));
         for (key, value) in [
             ("probe_address", "10001"),
+            ("probe_address", "40001.3"),
             ("write_mode", "yes"),
             ("write_allowlist", "300001-300002"),
             ("write_allowlist", "000001-400001"),

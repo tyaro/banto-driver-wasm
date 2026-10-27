@@ -13,6 +13,7 @@
 | Discrete input `1xxxx` | Bool | Rejected before send | FC2 |
 | Input register `3xxxx` | Eight numeric types | Rejected before send | FC4 |
 | Holding register `4xxxx` | Eight numeric types | Complete contiguous values inside one explicit allowlist interval | FC3 / FC16 |
+| Register bit `3xxxx.N` / `4xxxx.N` (`N=0..15` decimal) | Bool from one FC4 / FC3 word | Unsupported before send | FC4 / FC3 only |
 
 The numeric types are `i16/u16/i32/u32/i64/u64/f32/f64`. Each tag occupies one, two or four registers. `low_high` and `high_low` are supported. An FC16 run is capped at 123 words. `write_mode` defaults to `disabled`, and an enabled mode requires `write_allowlist`. All items must pass type, width, value, area and span checks before a frame is sent. An uncertain response poisons that connection. No automatic address scan, live write or Hub integration was performed.
 

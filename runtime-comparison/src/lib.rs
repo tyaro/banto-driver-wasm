@@ -8,6 +8,85 @@ mod tests {
     };
     use serde_json::{json, Value as JsonValue};
 
+    #[test]
+    fn real_component_register_bit_read_world() -> wasmtime::Result<()> {
+        use banto::driver::types::{Setting, TagSpec, Value};
+        let path = std::env::var("BANTO_COMPONENT_WASM")?;
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+        let mut store = wasmtime::Store::new(&engine, ());
+        let driver = Driver::instantiate(&mut store, &component, &linker)?;
+        for order in ["low_high", "high_low"] {
+            let settings = [
+                Setting {
+                    key: "host".into(),
+                    value: "fixture.invalid".into(),
+                },
+                Setting {
+                    key: "port".into(),
+                    value: "502".into(),
+                },
+                Setting {
+                    key: "word_order".into(),
+                    value: order.into(),
+                },
+            ];
+            assert!(driver
+                .banto_driver_config()
+                .call_validate(&mut store, &settings)?
+                .is_empty());
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings)?
+                .unwrap();
+            let specs = [
+                TagSpec {
+                    address: "40001.0".into(),
+                    data_type: "bool".into(),
+                    string_words: None,
+                },
+                TagSpec {
+                    address: "30001.15".into(),
+                    data_type: "bool".into(),
+                    string_words: None,
+                },
+            ];
+            for (index, canonical, function, word) in
+                [(0, "400001.0", 3, 0x0001u16), (1, "300001.15", 4, 0x8000)]
+            {
+                let parsed = driver
+                    .banto_driver_address()
+                    .call_parse(&mut store, &specs[index].address, "bool", None)?
+                    .unwrap();
+                assert_eq!(parsed.canonical, canonical);
+                assert_eq!(parsed.bit, Some(if index == 0 { 0 } else { 15 }));
+                assert_eq!(parsed.word_count, 1);
+                let plan = driver
+                    .banto_driver_read()
+                    .call_plan(&mut store, conn, &specs[index..index + 1])?
+                    .unwrap();
+                assert_eq!(plan.len(), 1);
+                assert_eq!(&plan[0].step.send[7..12], &[function, 0, 0, 0, 1]);
+                let tid = &plan[0].step.send[0..2];
+                let [hi, lo] = word.to_be_bytes();
+                let response = [tid[0], tid[1], 0, 0, 0, 5, 1, function, 2, hi, lo];
+                assert!(
+                    matches!(driver.banto_driver_read().call_decode(&mut store, conn, &plan[0], &specs[index..index + 1], &response)?, Ok(values) if matches!(values.as_slice(), [Ok(Value::Bool(true))]))
+                );
+            }
+            for invalid in ["40001.16", "40001.F", "00001.3", "40001 .3"] {
+                assert!(driver
+                    .banto_driver_address()
+                    .call_parse(&mut store, invalid, "bool", None)?
+                    .is_err());
+            }
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
+    }
+
     wasmtime::component::bindgen!({ path: "../wit", world: "driver" });
 
     // Contract checks for the artifact. These do not register a driver in Hub.
@@ -973,6 +1052,123 @@ mod tests {
 #[cfg(test)]
 mod write_runtime {
     wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-write-v1" });
+
+    #[test]
+    fn real_component_register_bit_write_world_rejects_before_send() -> wasmtime::Result<()> {
+        use banto::driver::types::{ItemError, Setting, TagSpec, Value};
+        use exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_COMPONENT_WASM")?;
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+        let mut store = wasmtime::Store::new(&engine, ());
+        let driver = DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let settings = [
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "502".into(),
+            },
+            Setting {
+                key: "write_mode".into(),
+                value: "enabled".into(),
+            },
+            Setting {
+                key: "write_allowlist".into(),
+                value: "400001-400010".into(),
+            },
+        ];
+        assert!(driver
+            .banto_driver_config()
+            .call_validate(&mut store, &settings)?
+            .is_empty());
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .unwrap();
+        let parsed = driver
+            .banto_driver_address()
+            .call_parse(&mut store, "40001.3", "bool", None)?
+            .unwrap();
+        assert_eq!(parsed.canonical, "400001.3");
+        assert_eq!(parsed.bit, Some(3));
+        assert_eq!(parsed.word_count, 1);
+        assert!(driver
+            .banto_driver_address()
+            .call_parse(&mut store, "40001.16", "bool", None)?
+            .is_err());
+        assert!(driver
+            .banto_driver_address()
+            .call_parse(&mut store, "40001 .3", "bool", None)?
+            .is_err());
+        let read_spec = [TagSpec {
+            address: "40001.3".into(),
+            data_type: "bool".into(),
+            string_words: None,
+        }];
+        let plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &read_spec)?
+            .unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(&plan[0].step.send[7..12], &[3, 0, 0, 0, 1]);
+        let tid = &plan[0].step.send[0..2];
+        let response = [tid[0], tid[1], 0, 0, 0, 5, 1, 3, 2, 0, 8];
+        assert!(
+            matches!(driver.banto_driver_read().call_decode(&mut store, conn, &plan[0], &read_spec, &response)?, Ok(values) if matches!(values.as_slice(), [Ok(Value::Bool(true))]))
+        );
+        let input_spec = [TagSpec {
+            address: "30001.15".into(),
+            data_type: "bool".into(),
+            string_words: None,
+        }];
+        let input_plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &input_spec)?
+            .unwrap();
+        assert_eq!(input_plan.len(), 1);
+        assert_eq!(&input_plan[0].step.send[7..12], &[4, 0, 0, 0, 1]);
+        let tid = &input_plan[0].step.send[0..2];
+        let response = [tid[0], tid[1], 0, 0, 0, 5, 1, 4, 2, 0x80, 0];
+        assert!(
+            matches!(driver.banto_driver_read().call_decode(&mut store, conn, &input_plan[0], &input_spec, &response)?, Ok(values) if matches!(values.as_slice(), [Ok(Value::Bool(true))]))
+        );
+        let bit = WriteItem {
+            spec: TagSpec {
+                address: "40001.3".into(),
+                data_type: "bool".into(),
+                string_words: None,
+            },
+            value: Value::Bool(true),
+        };
+        let word = WriteItem {
+            spec: TagSpec {
+                address: "40002".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Uint(7),
+        };
+        for items in [
+            vec![bit.clone()],
+            vec![word.clone(), bit.clone()],
+            vec![bit.clone(), word.clone()],
+        ] {
+            let progress = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .unwrap();
+            assert!(
+                matches!(progress, WriteProgress::Done(results) if results.len() == items.len() && results.iter().all(|result| matches!(result, Err(ItemError::Unsupported(_)))))
+            );
+        }
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
 
     #[test]
     fn real_component_write_world_preflights_and_checks_ack() -> wasmtime::Result<()> {
