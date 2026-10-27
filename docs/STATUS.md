@@ -17,6 +17,7 @@
 
 ## 検証
 
+- Hub 固定 #35 `b3d944f` と main `e4db7a9` の契約差（2026-10-27、ローカル Rust 1.98.1・wasm-tools 1.262.0）: `component`・`drivers`・`wit`・`slmp-component`・比較 crate・ワークスペース設定の差分は `drivers/slmp/README.md` のみ。同一ディレクトリで両版の SLMP guest を debug ビルドし `wasm-tools component new` した成果物は SHA-256 が一致し、別ディレクトリのビルドでも `component wit` の出力は一致した。main の `slmp-runtime` 試験（#37 追加分を含む Wasmtime 31 件・診断 11 件）を #35 の成果物に対して実行し全件成功。よって #37〜#40 は Hub 固定 guest の挙動・WIT を変えず、Hub の固定更新は不要。
 - #38 の CI（[run 40534797331](https://github.com/tyaro/banto-driver-wasm/actions/runs/40534797331)）は `changes` / `scaffold` / `slmp-test` / `ci-gate` が成功、他は文書のみの変更のため skipped。ローカルでは `check-scaffold.mjs`、`ci-changes.test.mjs` 17/17、`git diff --check` が成功。
 - #37 時点のローカル Rust 1.98.1 で `slmp-runtime` の Wasmtime 試験 31 件と診断試験 11 件、同 crate の fmt・Clippy が成功。
 
@@ -34,7 +35,7 @@
 
 ## 次作業
 
-1. Hub の CI が固定する #35 `b3d944f5`（tyaro/banto-industrial#887）との契約差を追跡し、#35 診断の実機確認は別作業で検証する。guest の能力追加だけで本番許可にしない。
+1. guest ソースか WIT を変える PR では、Hub の CI が固定する #35 `b3d944f5`（tyaro/banto-industrial#887）との契約差を上記と同じ手順で再確認する。#35 診断の実機確認は別作業で検証する。guest の能力追加だけで本番許可にしない。
 2. 実機と Hub の未検証点を個別に確認する。文字列、条件付き機種・経路の範囲、指定タグ読取りテスト、配布 manifest は候補として保持し、採否と実装範囲は別途決める。
 
 必要環境: Rust 1.98.1（Modbus コアの CI は 1.85.1）、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0、テスト依存 Wasmtime 50.0.0、Node.js 24。新しいクラウド環境には前セッションの導入が継承されると仮定せず確認する。実通信の自動確認は制御したローカル TCP で行い、実機 PLC は使わない。
