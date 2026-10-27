@@ -1,5 +1,14 @@
 # STATUS
 
+## Local Modbus WASM basic completion (2026-10-27)
+
+Initial local plan: keep WIT `driver` unchanged, use its connection handshake for a configured FC3/FC4 probe, and use the existing optional `write-v1` world with a disabled default and full preflight. Verify numeric and Bool wire formats, boundary addresses, order, malformed responses, exception handling and input-only refusal with core, component and controlled Wasmtime fixtures.
+
+- Dedicated D: worktree at main `efcab6b457bc3e4c8b89114fb5706939bd273192`. FC4-only connection verification uses an explicit `probe_address` via the existing connection handshake. Default remains `40001/u16` FC3. Static `address.probe()` is now `none` so a host does not repeat the fixed FC3 read after an FC4 handshake.
+- FC1/FC2 Bool reads and disabled-by-default FC5 coil / FC16 holding-register writes are local guest/core work. FC2/FC4 writes reject before send. The old read-only world and optional write-v1 world both bind; the capability matrix is in [CONTRACT.md](CONTRACT.md#modbus-wasm-local-contract-update-2026-10-27).
+- Hub must update its pinned guest, honor handshake steps, negotiate write-v1, and apply independent operational write policy and type checks before this can be used in production. No Hub repo or PLC was changed.
+- Local verification: Rust 1.85.1 Modbus core 16 tests, wasm32 check and strict Clippy; Rust 1.98.1 component 14 unit plus one doc test and strict Clippy; real Wasmtime 14 controlled fixtures and strict Clippy; wasm32 component build and validation; both existing `driver` and optional `driver-with-write-v1` WIT target checks; scaffold guard, 17 CI classification tests and `git diff --check` passed. No hosted CI or physical device test was run.
+
 ## Local optional SLMP diagnostics-v1 stage (2026-10-26, unmerged)
 
 - Built from merged main `94f65e4a534a864fdd5f56af68ef2dc7a562a8bd`. Added a separately versioned diagnostics interface and read-only/combined worlds without changing the existing `driver` or `driver-with-write-v1` definitions. The guest borrows the same connection resource and reports raw/display CPU identity, D/W and M/Y/L/B count evidence, exact/at-least/unknown scope, and one reasoned verdict per input tag. Invalid syntax and unsupported guest paths remain distinct from a range-unknown result.

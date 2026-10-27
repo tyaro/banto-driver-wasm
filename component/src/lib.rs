@@ -1,16 +1,17 @@
-//! Read-only Modbus TCP FC3/FC4 component for the full `banto:driver/driver` world.
+//! Modbus TCP component with optional write-v1 support.
 //! The host owns sockets, timeouts, retries, and connection policy.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_modbus_read_core::{
-    NumericKind, NumericValue, ReadError, ReadHoldingNumeric, RegisterFunction, WordOrder,
+    decode_write_ack, write_coil_request, write_registers_request, BitFunction, NumericKind,
+    NumericValue, ReadBit, ReadError, ReadHoldingNumeric, RegisterFunction, WordOrder,
     MAX_RESPONSE_LEN,
 };
-use exports::banto::driver::{address, config, read, session};
+use exports::banto::driver::{address, config, read, session, write_v1};
 
-wit_bindgen::generate!({ path: "../wit", world: "driver" });
+wit_bindgen::generate!({ path: "../wit", world: "driver-with-write-v1" });
 
 struct Component;
 
@@ -18,6 +19,43 @@ struct ModbusConnection {
     unit_id: u8,
     word_order: WordOrder,
     next_transaction_id: Cell<u16>,
+    probe_address: String,
+    handshake_pending: Cell<bool>,
+    handshake_done: Cell<bool>,
+    probe_poisoned: Cell<bool>,
+    write_enabled: bool,
+    write_allowlist: Vec<WriteRange>,
+    pending_write: RefCell<Option<PendingWrite>>,
+    write_poisoned: Cell<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Area {
+    Coil,
+    Discrete,
+    Input,
+    Holding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WriteRange {
+    area: Area,
+    first: u16,
+    last: u16,
+}
+
+struct PendingWrite {
+    signature: Vec<u8>,
+    count: usize,
+    transaction_id: u16,
+    function: u8,
+    echo: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagKind {
+    Numeric(Kind, RegisterFunction),
+    Bit(BitFunction),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +153,90 @@ fn check_settings(settings: &[banto::driver::types::Setting]) -> Vec<config::Fie
             });
         }
     }
+    if let Some(probe) = setting(settings, "probe_address") {
+        if parse_holding(probe, "u16", None).is_err() {
+            errors.push(config::FieldError {
+                key: "probe_address".into(),
+                message: "probe_address requires one FC3/FC4 register".into(),
+            });
+        }
+    }
+    if let Some(mode) = setting(settings, "write_mode") {
+        if !matches!(mode, "disabled" | "enabled") {
+            errors.push(config::FieldError {
+                key: "write_mode".into(),
+                message: "write_mode must be disabled or enabled".into(),
+            });
+        }
+    }
+    if let Some(list) = setting(settings, "write_allowlist") {
+        if let Err(message) = parse_write_allowlist(list) {
+            errors.push(config::FieldError {
+                key: "write_allowlist".into(),
+                message,
+            });
+        }
+    }
+    if setting(settings, "write_mode") == Some("enabled")
+        && setting(settings, "write_allowlist").is_none_or(str::is_empty)
+    {
+        errors.push(config::FieldError {
+            key: "write_allowlist".into(),
+            message: "enabled writes require an explicit allowlist".into(),
+        });
+    }
     errors
+}
+
+fn parse_write_allowlist(text: &str) -> Result<Vec<WriteRange>, String> {
+    if text.len() > 512 {
+        return Err("write_allowlist is too long".into());
+    }
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ranges = Vec::new();
+    for part in text.split(',') {
+        if ranges.len() == 16 {
+            return Err("write_allowlist supports at most 16 ranges".into());
+        }
+        let (first, last) = part
+            .split_once('-')
+            .ok_or("each write range requires start-end")?;
+        let (start, start_kind) = parse_tag(
+            first,
+            if first.starts_with('0') {
+                "bool"
+            } else {
+                "u16"
+            },
+            None,
+        )?;
+        let (end, end_kind) = parse_tag(
+            last,
+            if last.starts_with('0') { "bool" } else { "u16" },
+            None,
+        )?;
+        let range_area = area(start_kind);
+        if !matches!(range_area, Area::Coil | Area::Holding)
+            || range_area != area(end_kind)
+            || start > end
+        {
+            return Err("write range must be ascending in one writable area".into());
+        }
+        if ranges
+            .iter()
+            .any(|r: &WriteRange| r.area == range_area && start <= r.last && end >= r.first)
+        {
+            return Err("write ranges overlap".into());
+        }
+        ranges.push(WriteRange {
+            area: range_area,
+            first: start,
+            last: end,
+        });
+    }
+    Ok(ranges)
 }
 
 fn check_number(
@@ -169,6 +290,70 @@ fn parse_holding(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16
     Ok((offset, kind))
 }
 
+fn parse_bit(
+    text: &str,
+    data_type: &str,
+    words: Option<u32>,
+) -> Result<(u16, BitFunction), String> {
+    if data_type != "bool" || words.is_some() {
+        return Err("bit tables require bool without string_words".into());
+    }
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if !matches!(bytes.len(), 5 | 6)
+        || !matches!(bytes[0], b'0' | b'1')
+        || !bytes.iter().all(u8::is_ascii_digit)
+    {
+        return Err("invalid bit reference".into());
+    }
+    let number = text[1..]
+        .parse::<u32>()
+        .map_err(|_| "invalid bit reference")?;
+    let offset = u16::try_from(number.checked_sub(1).ok_or("bit reference starts at 1")?)
+        .map_err(|_| "bit reference exceeds 65536 points")?;
+    Ok((
+        offset,
+        if bytes[0] == b'0' {
+            BitFunction::Coil
+        } else {
+            BitFunction::DiscreteInput
+        },
+    ))
+}
+
+fn parse_tag(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16, TagKind), String> {
+    match text.trim().as_bytes().first() {
+        Some(b'0' | b'1') => parse_bit(text, data_type, words)
+            .map(|(offset, function)| (offset, TagKind::Bit(function))),
+        _ => parse_holding(text, data_type, words)
+            .map(|(offset, kind)| (offset, TagKind::Numeric(kind, register_function(text)))),
+    }
+}
+
+fn area(kind: TagKind) -> Area {
+    match kind {
+        TagKind::Bit(BitFunction::Coil) => Area::Coil,
+        TagKind::Bit(BitFunction::DiscreteInput) => Area::Discrete,
+        TagKind::Numeric(_, RegisterFunction::Input) => Area::Input,
+        TagKind::Numeric(_, RegisterFunction::Holding) => Area::Holding,
+    }
+}
+
+fn tag_width(kind: TagKind) -> u32 {
+    match kind {
+        TagKind::Numeric(kind, _) => kind.word_count(),
+        TagKind::Bit(_) => 1,
+    }
+}
+
+fn canonical_tag(offset: u16, kind: TagKind) -> String {
+    match kind {
+        TagKind::Bit(BitFunction::Coil) => format!("0{:05}", u32::from(offset) + 1),
+        TagKind::Bit(BitFunction::DiscreteInput) => format!("1{:05}", u32::from(offset) + 1),
+        TagKind::Numeric(_, function) => canonical_register(offset, function),
+    }
+}
+
 #[cfg(test)]
 fn canonical(offset: u16) -> String {
     canonical_register(offset, RegisterFunction::Holding)
@@ -209,8 +394,12 @@ fn request_bytes(
 }
 
 fn step(send: [u8; 12]) -> session::Step {
+    frame_step(send.to_vec())
+}
+
+fn frame_step(send: Vec<u8>) -> session::Step {
     session::Step {
-        send: send.to_vec(),
+        send,
         expect: session::FrameRule::LengthPrefixed(session::PrefixSpec {
             offset: 4,
             width: 2,
@@ -222,23 +411,156 @@ fn step(send: [u8; 12]) -> session::Step {
     }
 }
 
+fn numeric_words(kind: Kind, value: &Value, order: WordOrder) -> Result<Vec<u16>, String> {
+    let bytes: Vec<u8> = match (kind, value) {
+        (Kind::I16, Value::Int(n)) => i16::try_from(*n)
+            .map_err(|_| "i16 value out of range")?
+            .to_be_bytes()
+            .to_vec(),
+        (Kind::U16, Value::Uint(n)) => u16::try_from(*n)
+            .map_err(|_| "u16 value out of range")?
+            .to_be_bytes()
+            .to_vec(),
+        (Kind::I32, Value::Int(n)) => i32::try_from(*n)
+            .map_err(|_| "i32 value out of range")?
+            .to_be_bytes()
+            .to_vec(),
+        (Kind::U32, Value::Uint(n)) => u32::try_from(*n)
+            .map_err(|_| "u32 value out of range")?
+            .to_be_bytes()
+            .to_vec(),
+        (Kind::I64, Value::Int(n)) => n.to_be_bytes().to_vec(),
+        (Kind::U64, Value::Uint(n)) => n.to_be_bytes().to_vec(),
+        (Kind::F32, Value::Float(n)) if n.is_finite() && n.abs() <= f32::MAX as f64 => {
+            (*n as f32).to_bits().to_be_bytes().to_vec()
+        }
+        (Kind::F64, Value::Float(n)) if n.is_finite() => n.to_bits().to_be_bytes().to_vec(),
+        _ => return Err("write value has the wrong type or exceeds its width".into()),
+    };
+    let mut words: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .collect();
+    if order == WordOrder::LowHigh && words.len() > 1 {
+        words.reverse();
+    }
+    Ok(words)
+}
+
+fn preflight_write(
+    conn: &ModbusConnection,
+    items: &[write_v1::WriteItem],
+    transaction_id: u16,
+) -> Result<(u8, Vec<u8>, [u8; 4]), String> {
+    if items.is_empty() || items.len() > 123 {
+        return Err("write requires 1..123 items".into());
+    }
+    let mut first = None;
+    let mut area_kind = None;
+    let mut words = Vec::new();
+    let mut end = 0u32;
+    let mut coil = None;
+    for item in items {
+        let (offset, kind) = parse_tag(
+            &item.spec.address,
+            &item.spec.data_type,
+            item.spec.string_words,
+        )?;
+        let current_area = area(kind);
+        if !matches!(current_area, Area::Coil | Area::Holding) {
+            return Err("input-only area is not writable".into());
+        }
+        if area_kind.is_some_and(|area| area != current_area) {
+            return Err("write items must share one area".into());
+        }
+        if first.is_some() && u32::from(offset) != end {
+            return Err("write items must form a contiguous span".into());
+        }
+        area_kind = Some(current_area);
+        first.get_or_insert(offset);
+        end = u32::from(offset) + tag_width(kind);
+        if end > 65_536 {
+            return Err("write span exceeds Modbus address space".into());
+        }
+        match kind {
+            TagKind::Bit(BitFunction::Coil) => match item.value {
+                Value::Bool(value) => coil = Some(value),
+                _ => return Err("coil write requires a Bool value".into()),
+            },
+            TagKind::Numeric(kind, RegisterFunction::Holding) => {
+                words.extend(numeric_words(kind, &item.value, conn.word_order)?)
+            }
+            _ => return Err("input-only area is not writable".into()),
+        }
+    }
+    let start = first.expect("checked nonempty");
+    let last = u16::try_from(end - 1).map_err(|_| "write span exceeds Modbus address space")?;
+    let area = area_kind.expect("checked nonempty");
+    if !conn
+        .write_allowlist
+        .iter()
+        .any(|range| range.area == area && range.first <= start && last <= range.last)
+    {
+        return Err("write span is outside the enabled allowlist".into());
+    }
+    if area == Area::Coil {
+        if items.len() != 1 {
+            return Err("coil writes require one point per request".into());
+        }
+        let frame = write_coil_request(
+            transaction_id,
+            conn.unit_id,
+            start,
+            coil.expect("checked coil value"),
+        );
+        Ok((
+            5,
+            frame.to_vec(),
+            frame[8..12].try_into().expect("four echo bytes"),
+        ))
+    } else {
+        let frame = write_registers_request(transaction_id, conn.unit_id, start, &words)
+            .map_err(|_| "register write exceeds the FC16 count or address limit")?;
+        let mut echo = [0; 4];
+        echo[..2].copy_from_slice(&start.to_be_bytes());
+        echo[2..].copy_from_slice(&(words.len() as u16).to_be_bytes());
+        Ok((16, frame, echo))
+    }
+}
+
+fn rejected_write(count: usize, message: &str) -> write_v1::WriteProgress {
+    write_v1::WriteProgress::Done(
+        (0..count)
+            .map(|_| Err(ItemError::Rejected(message.into())))
+            .collect(),
+    )
+}
+
 fn planned_read(conn: &ModbusConnection, specs: &[TagSpec]) -> Vec<read::Planned> {
     specs
         .iter()
         .enumerate()
         .filter_map(|(index, spec)| {
             let (offset, kind) =
-                parse_holding(&spec.address, &spec.data_type, spec.string_words).ok()?;
+                parse_tag(&spec.address, &spec.data_type, spec.string_words).ok()?;
             let transaction_id = conn.next_transaction_id.get();
             conn.next_transaction_id.set(transaction_id.wrapping_add(1));
-            Some(read::Planned {
-                step: step(request_bytes(
-                    conn,
+            let send = match kind {
+                TagKind::Numeric(kind, function) => {
+                    request_bytes(conn, transaction_id, offset, kind, function)
+                }
+                TagKind::Bit(function) => ReadBit {
                     transaction_id,
+                    unit_id: conn.unit_id,
                     offset,
-                    kind,
-                    register_function(&spec.address),
-                )),
+                    function,
+                }
+                .request(),
+            };
+            Some(read::Planned {
+                step: step(send),
                 covers: vec![index as u32],
             })
         })
@@ -257,7 +579,7 @@ fn decode_planned(
     let spec = specs
         .get(*cover as usize)
         .ok_or_else(|| FatalError::Protocol("covers が specs の範囲外です".into()))?;
-    let (offset, kind) = parse_holding(&spec.address, &spec.data_type, spec.string_words)
+    let (offset, kind) = parse_tag(&spec.address, &spec.data_type, spec.string_words)
         .map_err(FatalError::Protocol)?;
     let send: [u8; 12] = p
         .step
@@ -266,39 +588,57 @@ fn decode_planned(
         .try_into()
         .map_err(|_| FatalError::Protocol("FC3 要求長が不正です".into()))?;
     let transaction_id = u16::from_be_bytes([send[0], send[1]]);
-    if send
-        != request_bytes(
-            conn,
+    let expected = match kind {
+        TagKind::Numeric(kind, function) => {
+            request_bytes(conn, transaction_id, offset, kind, function)
+        }
+        TagKind::Bit(function) => ReadBit {
             transaction_id,
+            unit_id: conn.unit_id,
             offset,
-            kind,
-            register_function(&spec.address),
-        )
-    {
+            function,
+        }
+        .request(),
+    };
+    if send != expected {
         return Err(FatalError::Protocol(
             "計画と要求バイトが一致しません".into(),
         ));
     }
-    let decoded = ReadHoldingNumeric {
-        transaction_id,
-        unit_id: conn.unit_id,
-        offset,
-        kind: kind.core_kind(),
-        word_order: conn.word_order,
-    }
-    .decode_with_function(response, register_function(&spec.address));
+    let decoded = match kind {
+        TagKind::Numeric(kind, function) => ReadHoldingNumeric {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            kind: kind.core_kind(),
+            word_order: conn.word_order,
+        }
+        .decode_with_function(response, function)
+        .map(|value| match value {
+            NumericValue::Int(value) => Value::Int(value),
+            NumericValue::Uint(value) => Value::Uint(value),
+            NumericValue::Float(value) => Value::Float(value),
+        }),
+        TagKind::Bit(function) => ReadBit {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            function,
+        }
+        .decode(response)
+        .map(Value::Bool),
+    };
     let value = match decoded {
-        Ok(NumericValue::Int(value)) => Ok(Value::Int(value)),
-        Ok(NumericValue::Uint(value)) => Ok(Value::Uint(value)),
-        Ok(NumericValue::Float(value)) => Ok(Value::Float(value)),
+        Ok(value) => Ok(value),
         Err(ReadError::Device(code)) => Err(ItemError::Device(banto::driver::types::DeviceError {
             code: u32::from(code),
             message: format!(
                 "FC=0x{:02X} Modbus exception 0x{code:02X}",
-                if register_function(&spec.address) == RegisterFunction::Input {
-                    4
-                } else {
-                    3
+                match kind {
+                    TagKind::Bit(BitFunction::Coil) => 1,
+                    TagKind::Bit(BitFunction::DiscreteInput) => 2,
+                    TagKind::Numeric(_, RegisterFunction::Holding) => 3,
+                    TagKind::Numeric(_, RegisterFunction::Input) => 4,
                 }
             ),
         })),
@@ -331,14 +671,82 @@ impl session::GuestConnection for ModbusConnection {
                 .and_then(WordOrder::parse)
                 .unwrap_or_default(),
             next_transaction_id: Cell::new(0),
+            probe_address: setting(&settings, "probe_address")
+                .unwrap_or("40001")
+                .to_owned(),
+            handshake_pending: Cell::new(false),
+            handshake_done: Cell::new(false),
+            probe_poisoned: Cell::new(false),
+            write_enabled: setting(&settings, "write_mode") == Some("enabled"),
+            write_allowlist: parse_write_allowlist(
+                setting(&settings, "write_allowlist").unwrap_or(""),
+            )
+            .map_err(FatalError::InvalidConfig)?,
+            pending_write: RefCell::new(None),
+            write_poisoned: Cell::new(false),
         }))
     }
 
     fn handshake_next(
         &self,
-        _prev_response: Option<Vec<u8>>,
+        prev_response: Option<Vec<u8>>,
     ) -> Result<Option<session::Step>, FatalError> {
-        Ok(None)
+        if self.probe_poisoned.get() {
+            return Err(FatalError::Protocol(
+                "probe outcome is uncertain; reconnect".into(),
+            ));
+        }
+        if let Some(response) = prev_response {
+            if !self.handshake_pending.replace(false) {
+                return Err(FatalError::Protocol("unsolicited probe response".into()));
+            }
+            self.probe_poisoned.set(true);
+            let (offset, kind) = parse_holding(&self.probe_address, "u16", None)
+                .map_err(FatalError::InvalidConfig)?;
+            let function = register_function(&self.probe_address);
+            let transaction_id = self.next_transaction_id.get().wrapping_sub(1);
+            let result = ReadHoldingNumeric {
+                transaction_id,
+                unit_id: self.unit_id,
+                offset,
+                kind: kind.core_kind(),
+                word_order: self.word_order,
+            }
+            .decode_with_function(&response, function);
+            match result {
+                Ok(_) => {
+                    self.probe_poisoned.set(false);
+                    self.handshake_done.set(true);
+                    Ok(None)
+                }
+                Err(ReadError::Device(code)) => Err(FatalError::Protocol(format!(
+                    "probe returned Modbus exception 0x{code:02X}"
+                ))),
+                Err(ReadError::Framing) => {
+                    Err(FatalError::Framing("invalid probe response".into()))
+                }
+                Err(ReadError::Protocol) => Err(FatalError::Protocol(
+                    "probe transaction or unit mismatch".into(),
+                )),
+            }
+        } else if self.handshake_done.get() {
+            Ok(None)
+        } else if self.handshake_pending.get() {
+            Err(FatalError::Protocol("probe response is pending".into()))
+        } else {
+            let (offset, kind) = parse_holding(&self.probe_address, "u16", None)
+                .map_err(FatalError::InvalidConfig)?;
+            let transaction_id = self.next_transaction_id.get();
+            self.next_transaction_id.set(transaction_id.wrapping_add(1));
+            self.handshake_pending.set(true);
+            Ok(Some(step(request_bytes(
+                self,
+                transaction_id,
+                offset,
+                kind,
+                register_function(&self.probe_address),
+            ))))
+        }
     }
 
     fn farewell(&self) -> Option<session::Step> {
@@ -363,7 +771,17 @@ impl read::Guest for Component {
         conn: read::ConnectionBorrow<'_>,
         specs: Vec<TagSpec>,
     ) -> Result<Vec<read::Planned>, FatalError> {
-        Ok(planned_read(conn.get::<ModbusConnection>(), &specs))
+        let conn = conn.get::<ModbusConnection>();
+        if conn.probe_poisoned.get()
+            || conn.pending_write.borrow().is_some()
+            || conn.write_poisoned.get()
+            || conn.handshake_pending.get()
+        {
+            return Err(FatalError::Protocol(
+                "a response is pending or the connection is uncertain".into(),
+            ));
+        }
+        Ok(planned_read(conn, &specs))
     }
 
     fn decode(
@@ -376,24 +794,125 @@ impl read::Guest for Component {
     }
 }
 
+impl write_v1::Guest for Component {
+    fn write_next(
+        conn: write_v1::ConnectionBorrow<'_>,
+        items: Vec<write_v1::WriteItem>,
+        prev_response: Option<Vec<u8>>,
+    ) -> Result<write_v1::WriteProgress, FatalError> {
+        write_next_impl(conn.get::<ModbusConnection>(), items, prev_response)
+    }
+}
+
+fn write_next_impl(
+    conn: &ModbusConnection,
+    items: Vec<write_v1::WriteItem>,
+    prev_response: Option<Vec<u8>>,
+) -> Result<write_v1::WriteProgress, FatalError> {
+    if let Some(response) = prev_response {
+        // Consume the pending operation before decoding. An invalid ACK
+        // leaves the connection poisoned; no automatic replay is safe.
+        conn.write_poisoned.set(true);
+        let pending = conn
+            .pending_write
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| FatalError::Protocol("unsolicited write response".into()))?;
+        let (_, signature, _) = preflight_write(conn, &items, pending.transaction_id)
+            .map_err(|_| FatalError::Protocol("write items changed after send".into()))?;
+        if signature != pending.signature || items.len() != pending.count {
+            return Err(FatalError::Protocol(
+                "write items changed after send".into(),
+            ));
+        }
+        return match decode_write_ack(
+            &response,
+            pending.transaction_id,
+            conn.unit_id,
+            pending.function,
+            pending.echo,
+        ) {
+            Ok(()) => {
+                conn.write_poisoned.set(false);
+                Ok(write_v1::WriteProgress::Done(
+                    (0..items.len()).map(|_| Ok(())).collect(),
+                ))
+            }
+            Err(ReadError::Device(code)) => {
+                conn.write_poisoned.set(false);
+                Ok(write_v1::WriteProgress::Done(
+                    (0..items.len())
+                        .map(|_| {
+                            Err(ItemError::Device(banto::driver::types::DeviceError {
+                                code: u32::from(code),
+                                message: format!("Modbus exception 0x{code:02X}"),
+                            }))
+                        })
+                        .collect(),
+                ))
+            }
+            Err(ReadError::Framing) => {
+                Err(FatalError::Framing("invalid write acknowledgement".into()))
+            }
+            Err(ReadError::Protocol) => Err(FatalError::Protocol(
+                "write acknowledgement mismatch".into(),
+            )),
+        };
+    }
+    if conn.write_poisoned.get() || conn.probe_poisoned.get() {
+        return Err(FatalError::Protocol(
+            "write outcome is uncertain; reconnect".into(),
+        ));
+    }
+    if conn.pending_write.borrow().is_some() || conn.handshake_pending.get() {
+        return Err(FatalError::Protocol("a response is pending".into()));
+    }
+    if items.is_empty() {
+        return Err(FatalError::InvalidConfig(
+            "write requires at least one item".into(),
+        ));
+    }
+    if !conn.write_enabled {
+        return Ok(rejected_write(items.len(), "writes are disabled"));
+    }
+    let transaction_id = conn.next_transaction_id.get();
+    let (function, frame, echo) = match preflight_write(conn, &items, transaction_id) {
+        Ok(request) => request,
+        Err(message) => return Ok(rejected_write(items.len(), &message)),
+    };
+    conn.next_transaction_id.set(transaction_id.wrapping_add(1));
+    *conn.pending_write.borrow_mut() = Some(PendingWrite {
+        signature: frame.clone(),
+        count: items.len(),
+        transaction_id,
+        function,
+        echo,
+    });
+    Ok(write_v1::WriteProgress::Send(read::Planned {
+        step: frame_step(frame),
+        covers: (0..items.len() as u32).collect(),
+    }))
+}
+
 impl address::Guest for Component {
     fn parse(
         text: String,
         data_type: String,
         string_words: Option<u32>,
     ) -> Result<address::Parsed, String> {
-        let (offset, kind) = parse_holding(&text, &data_type, string_words)?;
+        let (offset, kind) = parse_tag(&text, &data_type, string_words)?;
         Ok(address::Parsed {
-            canonical: canonical_register(offset, register_function(&text)),
-            area: if register_function(&text) == RegisterFunction::Input {
-                "input_register"
-            } else {
-                "holding_register"
+            canonical: canonical_tag(offset, kind),
+            area: match area(kind) {
+                Area::Coil => "coil",
+                Area::Discrete => "discrete_input",
+                Area::Input => "input_register",
+                Area::Holding => "holding_register",
             }
             .into(),
-            writable_area: register_function(&text) == RegisterFunction::Holding,
+            writable_area: matches!(area(kind), Area::Coil | Area::Holding),
             bit: None,
-            word_count: kind.word_count(),
+            word_count: tag_width(kind),
             index: Some(u64::from(offset)),
         })
     }
@@ -404,42 +923,47 @@ impl address::Guest for Component {
         string_words: Option<u32>,
         n: i64,
     ) -> Result<String, String> {
-        let (offset, kind) = parse_holding(&canonical, &data_type, string_words)?;
-        let words = i64::from(kind.word_count())
+        let (offset, kind) = parse_tag(&canonical, &data_type, string_words)?;
+        let words = i64::from(tag_width(kind))
             .checked_mul(n)
             .ok_or("オフセットが範囲外です")?;
         let next = i64::from(offset)
             .checked_add(words)
             .ok_or("オフセットが範囲外です")?;
-        canonical_for(next, kind, register_function(&canonical))
+        canonical_for_tag(next, kind)
     }
 
     fn supported_kinds() -> Vec<String> {
-        ["u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        [
+            "bool", "u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     }
 
     fn offset_words(canonical: String, n: i64) -> Result<String, String> {
-        let (offset, _) = parse_holding(&canonical, "u16", None)?;
+        let data_type = if matches!(canonical.trim().as_bytes().first(), Some(b'0' | b'1')) {
+            "bool"
+        } else {
+            "u16"
+        };
+        let (offset, kind) = parse_tag(&canonical, data_type, None)?;
         let next = i64::from(offset)
             .checked_add(n)
             .ok_or("オフセットが範囲外です")?;
-        canonical_for(next, Kind::U16, register_function(&canonical))
+        canonical_for_tag(next, kind)
     }
 
     fn help() -> String {
-        "FC3 holding (4) and FC4 input (3) numeric registers: 1/2/4 words; FC3 probe remains 40001"
+        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
             .into()
     }
 
     fn probe() -> Option<TagSpec> {
-        Some(TagSpec {
-            address: "40001".into(),
-            data_type: "u16".into(),
-            string_words: None,
-        })
+        // A connection-bound probe runs during handshake so FC4-only devices
+        // can select an input register without changing this WIT interface.
+        None
     }
 }
 
@@ -449,6 +973,17 @@ fn canonical_for(offset: i64, kind: Kind, function: RegisterFunction) -> Result<
         return Err("numeric tag exceeds holding-register address space".into());
     }
     Ok(canonical_register(offset, function))
+}
+
+fn canonical_for_tag(offset: i64, kind: TagKind) -> Result<String, String> {
+    if let TagKind::Numeric(numeric, function) = kind {
+        return canonical_for(offset, numeric, function);
+    }
+    let offset = u16::try_from(offset).map_err(|_| "tag exceeds Modbus address space")?;
+    if u32::from(offset) + tag_width(kind) > 65_536 {
+        return Err("tag exceeds Modbus address space".into());
+    }
+    Ok(canonical_tag(offset, kind))
 }
 
 impl config::Guest for Component {
@@ -515,6 +1050,27 @@ impl config::Guest for Component {
                 default: Some(SettingValue::Text("low_high".into())),
                 group: FieldGroup::Advanced,
             },
+            SettingField {
+                key: "probe_address".into(), label: "Probe register".into(),
+                help: Some("One accessible 4xxxx holding or 3xxxx input register for connection verification".into()),
+                kind: FieldKind::Text(config::TextSpec { max_len: Some(6), placeholder: Some("40001".into()) }),
+                required: false, default: Some(SettingValue::Text("40001".into())), group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "write_mode".into(), label: "Write mode".into(),
+                help: Some("Disabled by default; host policy must also permit writes".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption { value: "disabled".into(), label: "disabled".into() },
+                    ChoiceOption { value: "enabled".into(), label: "enabled".into() },
+                ]),
+                required: false, default: Some(SettingValue::Text("disabled".into())), group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "write_allowlist".into(), label: "Write address ranges".into(),
+                help: Some("Explicit coil or holding ranges, e.g. 000001-000016,400001-400010".into()),
+                kind: FieldKind::Text(config::TextSpec { max_len: Some(512), placeholder: None }),
+                required: false, default: Some(SettingValue::Text(String::new())), group: FieldGroup::Advanced,
+            },
         ]
     }
 }
@@ -531,6 +1087,14 @@ mod tests {
             unit_id: 1,
             word_order: WordOrder::default(),
             next_transaction_id: Cell::new(0),
+            probe_address: "40001".into(),
+            handshake_pending: Cell::new(false),
+            handshake_done: Cell::new(false),
+            probe_poisoned: Cell::new(false),
+            write_enabled: false,
+            write_allowlist: Vec::new(),
+            pending_write: RefCell::new(None),
+            write_poisoned: Cell::new(false),
         }
     }
 
@@ -558,10 +1122,7 @@ mod tests {
             "300002"
         );
         assert!(parse_holding("365536", "u32", None).is_err());
-        assert_eq!(
-            <Component as address::Guest>::probe().unwrap().address,
-            "40001"
-        );
+        assert!(<Component as address::Guest>::probe().is_none());
         let conn = conn();
         let specs = [TagSpec {
             address: "30001".into(),
@@ -585,6 +1146,14 @@ mod tests {
             unit_id: conn.unit_id,
             word_order: WordOrder::HighLow,
             next_transaction_id: Cell::new(0),
+            probe_address: "40001".into(),
+            handshake_pending: Cell::new(false),
+            handshake_done: Cell::new(false),
+            probe_poisoned: Cell::new(false),
+            write_enabled: false,
+            write_allowlist: Vec::new(),
+            pending_write: RefCell::new(None),
+            write_poisoned: Cell::new(false),
         };
         assert!(matches!(
             decode_planned(
@@ -643,10 +1212,7 @@ mod tests {
         assert!(parse_holding("465535", "f32", None).is_ok());
         assert!(parse_holding("465536", "f32", None).is_err());
         assert!(parse_holding("40001", "u32", Some(2)).is_err());
-        assert_eq!(
-            <Component as address::Guest>::probe().unwrap().address,
-            "40001"
-        );
+        assert!(<Component as address::Guest>::probe().is_none());
     }
 
     #[test]
@@ -909,5 +1475,293 @@ mod tests {
         let errors = check_settings(&settings);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].key, "host");
+    }
+
+    fn write_item(address: &str, data_type: &str, value: Value) -> write_v1::WriteItem {
+        write_v1::WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: data_type.into(),
+                string_words: None,
+            },
+            value,
+        }
+    }
+
+    #[test]
+    fn fc4_connection_probe_uses_configured_input_register() {
+        let mut probe_conn = conn();
+        probe_conn.probe_address = "30001".into();
+        let first =
+            <ModbusConnection as session::GuestConnection>::handshake_next(&probe_conn, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first.send, [0, 0, 0, 0, 0, 6, 1, 4, 0, 0, 0, 1]);
+        assert!(
+            <ModbusConnection as session::GuestConnection>::handshake_next(&probe_conn, None)
+                .is_err()
+        );
+        assert!(
+            <ModbusConnection as session::GuestConnection>::handshake_next(
+                &probe_conn,
+                Some(vec![0, 0, 0, 0, 0, 5, 1, 4, 2, 0, 7])
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            <ModbusConnection as session::GuestConnection>::handshake_next(&probe_conn, None)
+                .unwrap()
+                .is_none()
+        );
+        let default = conn();
+        assert_eq!(
+            <ModbusConnection as session::GuestConnection>::handshake_next(&default, None)
+                .unwrap()
+                .unwrap()
+                .send[7],
+            3
+        );
+        assert!(
+            <ModbusConnection as session::GuestConnection>::handshake_next(
+                &default,
+                Some(vec![0, 0, 0, 0, 0, 3, 1, 0x83, 2])
+            )
+            .is_err()
+        );
+        assert!(
+            <ModbusConnection as session::GuestConnection>::handshake_next(&default, None).is_err()
+        );
+    }
+
+    #[test]
+    fn fc1_fc2_bool_address_plan_decode_and_input_write_rejection() {
+        let conn = conn();
+        for (address, function, area_name, writable) in [
+            ("00001", 1, "coil", true),
+            ("10001", 2, "discrete_input", false),
+        ] {
+            let parsed =
+                <Component as address::Guest>::parse(address.into(), "bool".into(), None).unwrap();
+            assert_eq!(parsed.area, area_name);
+            assert_eq!(parsed.writable_area, writable);
+            assert_eq!(parsed.word_count, 1);
+            assert_eq!(
+                parsed.canonical,
+                format!("{}00001", if function == 1 { 0 } else { 1 })
+            );
+            let spec = TagSpec {
+                address: address.into(),
+                data_type: "bool".into(),
+                string_words: None,
+            };
+            let planned = planned_read(&conn, std::slice::from_ref(&spec));
+            assert_eq!(planned[0].step.send[7], function);
+            let response = [
+                planned[0].step.send[0],
+                planned[0].step.send[1],
+                0,
+                0,
+                0,
+                4,
+                1,
+                function,
+                1,
+                1,
+            ];
+            assert!(matches!(
+                decode_planned(&conn, &planned[0], &[spec], &response).as_deref(),
+                Ok([Ok(Value::Bool(true))])
+            ));
+        }
+        assert!(
+            <Component as address::Guest>::parse("165537".into(), "bool".into(), None).is_err()
+        );
+        assert!(<Component as address::Guest>::parse("00001".into(), "u16".into(), None).is_err());
+        assert_eq!(
+            <Component as address::Guest>::offset("000001".into(), "bool".into(), None, 1)
+                .as_deref(),
+            Ok("000002")
+        );
+    }
+
+    #[test]
+    fn write_preflight_checks_every_item_and_pending_ack() {
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.write_allowlist = parse_write_allowlist("000001-000016,400001-400010").unwrap();
+        let items = vec![
+            write_item("40001", "u16", Value::Uint(7)),
+            write_item("40002", "i32", Value::Int(-1)),
+        ];
+        let (function, frame, echo) = preflight_write(&conn, &items, 0).unwrap();
+        assert_eq!(function, 16);
+        assert_eq!(echo, [0, 0, 0, 3]);
+        assert_eq!(&frame[13..], &[0, 7, 255, 255, 255, 255]);
+        let invalid = vec![items[0].clone(), write_item("30002", "u16", Value::Uint(1))];
+        assert!(preflight_write(&conn, &invalid, 0).is_err());
+        assert!(
+            preflight_write(&conn, &[write_item("40001", "u16", Value::Uint(65536))], 0).is_err()
+        );
+        assert!(
+            preflight_write(&conn, &[write_item("40001", "i16", Value::Int(-32769))], 0).is_err()
+        );
+        assert!(preflight_write(
+            &conn,
+            &[write_item("40001", "f32", Value::Float(f64::INFINITY))],
+            0
+        )
+        .is_err());
+        assert!(
+            preflight_write(&conn, &[write_item("10001", "bool", Value::Bool(true))], 0).is_err()
+        );
+        assert!(preflight_write(&conn, &[write_item("00001", "bool", Value::Uint(1))], 0).is_err());
+        assert!(preflight_write(
+            &conn,
+            &[
+                write_item("40001", "u16", Value::Uint(1)),
+                write_item("40003", "u16", Value::Uint(2))
+            ],
+            0
+        )
+        .is_err());
+        assert!(matches!(
+            write_next_impl(&conn, invalid, None),
+            Ok(write_v1::WriteProgress::Done(_))
+        ));
+        assert_eq!(conn.next_transaction_id.get(), 0);
+        let sent = write_next_impl(&conn, items.clone(), None).unwrap();
+        assert!(matches!(sent, write_v1::WriteProgress::Send(_)));
+        assert_eq!(conn.next_transaction_id.get(), 1);
+        assert!(matches!(
+            write_next_impl(
+                &conn,
+                items.clone(),
+                Some(vec![0, 0, 0, 0, 0, 6, 1, 16, 0, 0, 0, 3])
+            ),
+            Ok(write_v1::WriteProgress::Done(_))
+        ));
+        let coil = write_item("00001", "bool", Value::Bool(true));
+        assert!(matches!(
+            write_next_impl(&conn, vec![coil.clone()], None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        assert!(matches!(
+            write_next_impl(
+                &conn,
+                vec![coil],
+                Some(vec![0, 1, 0, 0, 0, 6, 1, 5, 0, 0, 0, 0])
+            ),
+            Err(FatalError::Protocol(_))
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, items, None),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn probe_and_write_settings_fail_closed() {
+        use banto::driver::types::Setting;
+        let base = [
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "502".into(),
+            },
+        ];
+        let mut conn = conn();
+        conn.write_allowlist = parse_write_allowlist("400001-400010").unwrap();
+        assert!(matches!(
+            write_next_impl(
+                &conn,
+                vec![write_item("40001", "u16", Value::Uint(1))],
+                None
+            ),
+            Ok(write_v1::WriteProgress::Done(_))
+        ));
+        for (key, value) in [
+            ("probe_address", "10001"),
+            ("write_mode", "yes"),
+            ("write_allowlist", "300001-300002"),
+            ("write_allowlist", "000001-400001"),
+            ("write_allowlist", "400001-400004,400004-400005"),
+        ] {
+            let mut settings = base.to_vec();
+            settings.push(Setting {
+                key: key.into(),
+                value: value.into(),
+            });
+            assert!(
+                check_settings(&settings)
+                    .iter()
+                    .any(|error| error.key == key),
+                "{key}={value}"
+            );
+        }
+        let mut settings = base.to_vec();
+        settings.push(Setting {
+            key: "write_mode".into(),
+            value: "enabled".into(),
+        });
+        assert!(check_settings(&settings)
+            .iter()
+            .any(|error| error.key == "write_allowlist"));
+    }
+
+    #[test]
+    fn all_numeric_write_widths_roundtrip_both_word_orders() {
+        let cases = [
+            ("i16", Value::Int(i16::MIN as i64)),
+            ("u16", Value::Uint(u16::MAX as u64)),
+            ("i32", Value::Int(i32::MIN as i64)),
+            ("u32", Value::Uint(u32::MAX as u64)),
+            ("i64", Value::Int(i64::MIN)),
+            ("u64", Value::Uint(u64::MAX)),
+            ("f32", Value::Float(1.5)),
+            ("f64", Value::Float(-1.5)),
+        ];
+        for order in [WordOrder::LowHigh, WordOrder::HighLow] {
+            let mut conn = conn();
+            conn.word_order = order;
+            conn.write_allowlist = parse_write_allowlist("400001-400010").unwrap();
+            for (name, value) in &cases {
+                let item = write_item("400001", name, value.clone());
+                let (_, frame, _) = preflight_write(&conn, &[item], 42).unwrap();
+                let (_, kind) = parse_holding("400001", name, None).unwrap();
+                assert_eq!(frame.len(), 13 + kind.word_count() as usize * 2);
+                let data = &frame[13..];
+                let mut response = vec![
+                    0,
+                    42,
+                    0,
+                    0,
+                    0,
+                    (3 + data.len()) as u8,
+                    1,
+                    3,
+                    data.len() as u8,
+                ];
+                response.extend_from_slice(data);
+                let decoded = ReadHoldingNumeric {
+                    transaction_id: 42,
+                    unit_id: 1,
+                    offset: 0,
+                    kind: kind.core_kind(),
+                    word_order: order,
+                }
+                .decode(&response)
+                .unwrap();
+                assert!(match (decoded, value) {
+                    (NumericValue::Int(a), Value::Int(b)) => a == *b,
+                    (NumericValue::Uint(a), Value::Uint(b)) => a == *b,
+                    (NumericValue::Float(a), Value::Float(b)) => a == *b,
+                    _ => false,
+                });
+            }
+        }
     }
 }
