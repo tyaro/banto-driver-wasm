@@ -6,5 +6,6 @@
   "settingsVersion": 1,
   "displayName": "Modbus TCP FC1-FC4 reads and optional writes (WASM)",
   "transports": ["tcp"],
-  "capabilities": ["read", "write"]
+  "capabilities": ["read", "write"],
+  "writeApi": "1"
 }

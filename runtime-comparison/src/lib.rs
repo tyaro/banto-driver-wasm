@@ -117,6 +117,28 @@ mod tests {
     }
 
     #[test]
+    fn packaged_manifest_matches_hub_write_negotiation_shape() {
+        // Hub Manifest::parse requires this exact ordered capability pair and
+        // string writeApi version before it attempts the optional world bind.
+        let manifest: JsonValue =
+            serde_json::from_str(include_str!("../../component/manifest.json")).unwrap();
+        let accepted_write_request = |m: &JsonValue| {
+            m.get("capabilities") == Some(&json!(["read", "write"]))
+                && m.get("writeApi") == Some(&json!("1"))
+        };
+        assert!(accepted_write_request(&manifest));
+        let mut missing = manifest.clone();
+        missing.as_object_mut().unwrap().remove("writeApi");
+        assert!(!accepted_write_request(&missing));
+        let mut wrong_type = manifest.clone();
+        wrong_type["writeApi"] = json!(1);
+        assert!(!accepted_write_request(&wrong_type));
+        let mut wrong_capabilities = manifest;
+        wrong_capabilities["capabilities"] = json!(["write", "read"]);
+        assert!(!accepted_write_request(&wrong_capabilities));
+    }
+
+    #[test]
     fn fc3_u16_boundary_refuses_other_variants_and_overflow() {
         use banto::driver::types::Value;
 

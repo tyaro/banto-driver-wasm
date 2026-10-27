@@ -130,7 +130,7 @@ jobs:
           wasm-tools validate "$RUNNER_TEMP/driver-wit.wasm"
       - name: Check prototype manifest
         run: |
-          node -e 'const m=require("./component/manifest.json"); if (!Number.isInteger(m.settingsVersion) || m.settingsVersion < 1 || m.hubApi !== "1" || m.transports.join() !== "tcp" || m.capabilities.join() !== "read,write") process.exit(1)'
+          node -e 'const m=require("./component/manifest.json"); if (!Number.isInteger(m.settingsVersion) || m.settingsVersion < 1 || m.hubApi !== "1" || m.transports.join() !== "tcp" || m.capabilities.join() !== "read,write" || m.writeApi !== "1") process.exit(1)'
       - run: cargo +1.98.1 fmt --manifest-path component/Cargo.toml --check
       - run: cargo +1.98.1 clippy --manifest-path component/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo +1.98.1 test --manifest-path component/Cargo.toml --locked

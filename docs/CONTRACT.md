@@ -5,7 +5,7 @@
 | `connection.handshake-next`, `address.probe` | Configured FC3 or FC4 one-register probe runs in handshake; `address.probe` returns `none` | Execute handshake frame/response loop and avoid an additional fixed FC3 probe |
 | `read.plan` / `read.decode` | FC1/FC2 Bool and FC3/FC4 eight numeric types with strict response checks | Register the new component and validate WIT value variants and widths |
 | `write-v1.write-next` | Optional world; disabled unless `write_mode=enabled` and one explicit allowlist span covers the whole request. FC5 single coil or FC16 contiguous holding words only | Negotiate write-v1 and enforce a separate saved write policy, audit and operational gate |
-| `config.schema` / manifest | `probe_address`, `write_mode`, `write_allowlist`; capabilities `read,write`, version `0.4.0` | Treat metadata as capability discovery, not write authorization |
+| `config.schema` / manifest | `probe_address`, `write_mode`, `write_allowlist`; capabilities `read,write`, `writeApi: "1"`, version `0.4.0` | Treat metadata as capability discovery, not write authorization |
 
 | Modbus area | Read | Optional write | Function codes |
 | --- | --- | --- | --- |
