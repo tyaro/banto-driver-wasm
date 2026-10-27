@@ -21,7 +21,7 @@ industrial [#881](https://github.com/tyaro/banto-industrial/pull/881) は #32 �
 
 ## 作業の入口
 
-- [docs/STATUS.md](docs/STATUS.md): 現行スナップショット、過去の検証記録、未検証点。新しいセッションはここから開始します。
+- [docs/STATUS.md](docs/STATUS.md): 現行スナップショット、未検証点、残件。段階ごとの経緯は git 履歴と各 PR を参照。新しいセッションはここから開始します。
 - [docs/PLAN.md](docs/PLAN.md): 段階計画、完了条件、CI の拡張順。
 - [docs/CONTRACT.md](docs/CONTRACT.md): 現行 API と承認済み初版 WIT 境界の照合。
 - [drivers/slmp/README.md](drivers/slmp/README.md): SLMP の実装済み能力、制限、範囲判定と今後の設計候補。
