@@ -1154,6 +1154,9 @@ impl read::Guest for Component {
             .enumerate()
             .filter_map(|(index, spec)| {
                 let span = checked_read_span(spec, model, *count, conn.w_count.get()).ok()?;
+                if diagnostics::bit_span_outside(conn, model, span) {
+                    return None;
+                }
                 encode_read(conn.base_route, series, span).ok()?;
                 Some((
                     u32::try_from(index).ok()?,

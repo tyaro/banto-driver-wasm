@@ -55,6 +55,7 @@ const allowed = new Set([
   'slmp-runtime/Cargo.lock',
   'slmp-runtime/src/lib.rs',
   'slmp-runtime/tests/diagnostics.rs',
+  'slmp-runtime/tests/range_matrix.rs',
   'comparison/Cargo.toml',
   'comparison/Cargo.lock',
   'comparison/src/lib.rs',

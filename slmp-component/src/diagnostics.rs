@@ -239,6 +239,32 @@ fn assess_tag_span(
     assess_d_span(model, count, number, points)
 }
 
+/// Same-connection count for a bit area whose SD evidence this guest can hold.
+/// `None` means the area has no such evidence path for this family.
+fn bit_area_count(
+    conn: &SlmpConnection,
+    family: ModelFamily,
+    device: Device,
+) -> Option<PointCount> {
+    match device {
+        Device::X if family == ModelFamily::StandardQ => Some(conn.diagnostic_bit_counts.get()[0]),
+        Device::SB if family == ModelFamily::StandardR => Some(conn.diagnostic_bit_counts.get()[1]),
+        Device::F if family == ModelFamily::StandardR => Some(conn.diagnostic_bit_counts.get()[2]),
+        Device::M | Device::Y | Device::L | Device::B => Some(write_bit_count(conn, device)),
+        _ => None,
+    }
+}
+
+/// Read planning skips a bit tag that same-connection SD evidence proves is
+/// beyond an exact configured count. Missing or prefix-only evidence still
+/// permits the explicit one-tag read.
+pub(super) fn bit_span_outside(conn: &SlmpConnection, model: &TypeName, span: ReadSpan) -> bool {
+    bit_area_count(conn, model.family, span.device).is_some_and(|count| {
+        assess_tag_span(model, span.device, count, span.start, span.count)
+            == RangeAssessment::VerifiedOutside
+    })
+}
+
 fn tag_diagnostic(
     conn: &SlmpConnection,
     model: Option<&TypeName>,
@@ -257,19 +283,8 @@ fn tag_diagnostic(
                 TagVerdict::Unknown("unsupported-model-name-code-pair".into())
             }
             Some(model) => {
-                let count = match device {
-                    Device::X if model.family == ModelFamily::StandardQ => {
-                        conn.diagnostic_bit_counts.get()[0]
-                    }
-                    Device::SB if model.family == ModelFamily::StandardR => {
-                        conn.diagnostic_bit_counts.get()[1]
-                    }
-                    Device::F if model.family == ModelFamily::StandardR => {
-                        conn.diagnostic_bit_counts.get()[2]
-                    }
-                    Device::M | Device::Y | Device::L | Device::B => write_bit_count(conn, device),
-                    _ => read_count(device, d_count, conn.w_count.get()),
-                };
+                let count = bit_area_count(conn, model.family, device)
+                    .unwrap_or_else(|| read_count(device, d_count, conn.w_count.get()));
                 let range = if model.family == ModelFamily::Q25PrhWireOnly && device == Device::W {
                     if count_guarantees_span(count, number, kind.points()) {
                         RangeAssessment::VerifiedInside
