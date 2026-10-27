@@ -127,6 +127,44 @@ pub struct ReadBit {
     pub function: BitFunction,
 }
 
+/// One bit of a holding or input register. Bit zero is the least significant
+/// bit of the single wire word; multi-word `word_order` does not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadRegisterBit {
+    pub transaction_id: u16,
+    pub unit_id: u8,
+    pub offset: u16,
+    pub bit: u8,
+    pub function: RegisterFunction,
+}
+
+impl ReadRegisterBit {
+    pub fn request(self) -> [u8; 12] {
+        request_function(
+            self.transaction_id,
+            self.unit_id,
+            self.offset,
+            1,
+            self.function.code(),
+        )
+    }
+
+    pub fn decode(self, response: &[u8]) -> Result<bool, ReadError> {
+        if self.bit > 15 {
+            return Err(ReadError::Protocol);
+        }
+        let data = decode_function(
+            response,
+            self.transaction_id,
+            self.unit_id,
+            2,
+            self.function.code(),
+        )?;
+        let word = u16::from_be_bytes([data[0], data[1]]);
+        Ok((word >> self.bit) & 1 != 0)
+    }
+}
+
 impl ReadBit {
     pub fn request(self) -> [u8; 12] {
         request_function(
@@ -472,6 +510,63 @@ fn decode_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_bits_use_one_fc3_or_fc4_word_and_ignore_word_order() {
+        for (function, code) in [(RegisterFunction::Holding, 3), (RegisterFunction::Input, 4)] {
+            for (word, bit, expected) in [
+                (0x0000u16, 0, false),
+                (0xffff, 0, true),
+                (0x0001, 0, true),
+                (0x0001, 15, false),
+                (0x8000, 0, false),
+                (0x8000, 15, true),
+                (0x1234, 2, true),
+                (0x1234, 15, false),
+            ] {
+                let read = ReadRegisterBit {
+                    transaction_id: 0x1234,
+                    unit_id: 1,
+                    offset: 65535,
+                    bit,
+                    function,
+                };
+                assert_eq!(
+                    read.request(),
+                    [0x12, 0x34, 0, 0, 0, 6, 1, code, 0xff, 0xff, 0, 1]
+                );
+                let [hi, lo] = word.to_be_bytes();
+                assert_eq!(
+                    read.decode(&[0x12, 0x34, 0, 0, 0, 5, 1, code, 2, hi, lo]),
+                    Ok(expected)
+                );
+            }
+            let bad = ReadRegisterBit {
+                transaction_id: 0x1234,
+                unit_id: 1,
+                offset: 0,
+                bit: 16,
+                function,
+            };
+            assert_eq!(
+                bad.decode(&[0x12, 0x34, 0, 0, 0, 5, 1, code, 2, 0, 0]),
+                Err(ReadError::Protocol)
+            );
+            let read = ReadRegisterBit { bit: 0, ..bad };
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 3, 1, code | 0x80, 2]),
+                Err(ReadError::Device(2))
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 4, 1, code, 1, 1]),
+                Err(ReadError::Framing)
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x35, 0, 0, 0, 5, 1, code, 2, 0, 1]),
+                Err(ReadError::Protocol)
+            );
+        }
+    }
 
     #[test]
     fn fc1_fc2_bool_read_and_strict_bit_response() {

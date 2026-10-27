@@ -1,5 +1,11 @@
 # STATUS
 
+## Modbus register-bit read follow-up (2026-10-27)
+
+- Based on merged main `9989fe5f4d833565b7a5360368d44b2bec7eb822` in an isolated MSI D: worktree. FC3/FC4 reads now accept decimal `.0` through `.15` on 3xxxx/4xxxx registers with WIT `bool`, returning one-word `Value::Bool`. Canonical forms and bit-preserving `offset_words` match native; tag `offset` refuses nonzero movement on a bit-suffixed address. Outer whitespace is trimmed while internal whitespace is rejected. `word_order` does not affect one-word bit extraction.
+- Register-bit writes remain `Unsupported` for the whole write batch before a send, including when holding-register writes are enabled. FC5/FC16 paths retain their existing limits. WIT and Hub are unchanged. This is controlled local work without a physical device or Hub integration.
+- Local verification: Rust 1.85.1 core 17 tests, wasm32 check, fmt and strict Clippy; Rust 1.98.1 component 17 unit and one doc test, strict Clippy; native comparison five tests; 17 controlled Wasmtime cases across both existing WIT worlds; component build/validation and both world target checks; `git diff --check`. Hosted CI and review are tracked on the PR. No merge, Hub integration, or live PLC test is included.
+
 ## Local Modbus WASM basic completion (2026-10-27)
 
 Initial local plan: keep WIT `driver` unchanged, use its connection handshake for a configured FC3/FC4 probe, and use the existing optional `write-v1` world with a disabled default and full preflight. Verify numeric and Bool wire formats, boundary addresses, order, malformed responses, exception handling and input-only refusal with core, component and controlled Wasmtime fixtures.
