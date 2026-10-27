@@ -1,5 +1,16 @@
 # STATUS
 
+## 現行スナップショット（2026-10-27）
+
+- `origin/main` は `b3d944f58a8dad86e2a5c8db5f76be6a471bdac0`。#32 `9989fe5`（Modbus 基本）、#33 `02a9264`（register-bit read）、#34 `c9cf3b8`（V 周期収集除外）、#35 `b3d944f`（Q X / R SB・F 診断）はマージ済み。以下の「local」「unmerged」「PR verification」は当時の検証記録であり、現在のマージ状態を表さない。
+- Modbus guest: FC1/FC2 Bool、FC3/FC4 `i16/u16/i32/u32/i64/u64/f32/f64` と 3xxxx/4xxxx `.0`–`.15` Bool を読取る。FC3/FC4 probe は接続 handshake。任意の FC5 単一 coil / FC16 contiguous holding write は `write_mode=enabled` と要求全体を覆う明示 `write_allowlist` を要し、初期値は無効。register-bit write は意図的に送信前 `Unsupported`。Hub の保存済み運用ポリシー、権限・監査は独立した第二ゲート。
+- SLMP guest: 既知 Q/R wire 系列の明示タグ、D/W などの数値 8 型と対応 bit Bool、機種別に確認した読取り経路、既定無効の D/W 数値・M/Y/L/B Bool 書込み試作を持つ。`Unknown` 範囲は成功読取り後も確定しない。型式・wire が不明なら読取りを送らず、書込みは SD 根拠が不明なら拒否する。V edge relay は一走査限りの信号を周期収集で見逃すため登録から除外する。
+- diagnostics-v1 の #35 は正確な標準 Q X（SD290）と標準 R SB・F（SD268–271）点数を報告するだけで、読書き権限を拡張しない。industrial #885 は #34 `c9cf3b8` に固定され、#35 の Hub 受入れ・実機確認は未了。読取り最適化 #871 は後回し。文字列、条件付き範囲拡張、配布 manifest の製品受入れは未完了で採否未決。
+- industrial [#881](https://github.com/tyaro/banto-industrial/pull/881) は #32 固定 guest で FC4 handshake、数値・Bool の代表型読取り、FC5/FC16 と独立した Hub mode/allowlist・認可・監査を模擬確認した（adapter 3件、Hub 1件）。[#884](https://github.com/tyaro/banto-industrial/pull/884) は #33 固定 guest で FC3/FC4 register-bit Bool の保存・broker・REST read-now と送信前 write 拒否を模擬確認した（adapter 4件、Hub 2件）。[#885](https://github.com/tyaro/banto-industrial/pull/885) は #34 固定 SLMP guest と既存 write policy を模擬受入れした（新 guest の Hub suite 16件）。いずれも実 PLC、GUI、本番配置や全型・全設定の網羅は証明しない。#35 診断は #885 に含まれない。
+- 新しい文書整理ではコード・WIT・manifest・Hub 設定を変更しない。次節以降の検証件数は当時の対象と環境を保持し、現行の全範囲を追加認定しない。
+
+## 時点別の実装・検証記録
+
 ## Q X / R SB,F diagnostic counts (2026-10-27, PR verification)
 
 - Based on main `c9cf3b8e1406c9a5bd4cdd0baa3f27e4744226ad` (#34 merge) in a new dedicated MSI D: worktree. The optional diagnostics-v1 report now uses Q SD290 for X (one unsigned 16-bit point count) and R SD268-269 / SD270-271 for SB / F (unsigned 32-bit Low/High point counts). Only the existing exact StandardQ and StandardR name/code pairs qualify. Q25PRH, R X, Q SB/F, V, and other areas do not gain diagnostic bounds. X/SB tag numbers are hexadecimal; F is decimal. An exact count N admits 0 through N-1; zero admits no points. Q X=32768 is exact and does not inherit the legacy M/B saturation rule.
@@ -212,29 +223,31 @@ Initial local plan: keep WIT `driver` unchanged, use its connection handshake fo
 - 新規セッションの環境では公式 rustup から Rust 1.98.1 のみを導入し、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0（コンポーネント依存）、Wasmtime 50.0.0（テスト依存）を確認した。Rust 1.85.1 は導入していない。正本 WIT の検証、実コンポーネントのビルド・検証・world 対応、コンポーネント単体4/4・doc1/1、独立 Wasmtime 比較6/6、runtime-comparison の整形・Clippy、Node 変更判定15/15・構成ガード・`git diff --check` が成功。6件には manifest・U16 拒否とローカル TCP 制御通信を含む。
 - PR #4 の [対象 CI](https://github.com/tyaro/banto-driver-wasm/actions/runs/40152706179) は完了・成功。`modbus-test` / `native-compare` / `component-build` / `component-compare` / `ci-gate` を含む7ジョブ成功、変更対象外の SDK・SLMP ガード2ジョブは skipped。未解決レビューはなく、[統合レビュー](https://github.com/tyaro/banto-driver-wasm/pull/4#issuecomment-6392262134) も独立テストホスト準備の範囲で修正必須なしと確認した。レビューは Hub 製品境界の実装・実行を認定していない。
 
-## 未検証
+## 未検証（現行の製品境界と過去の検証条件）
 
-- SLMP の全機種・経路別 SD 取得、拡張 D/W の ZR 変換、全タグ種の範囲判定、実機 read と write、Hub 表示・品質・監査は未検証。既知 Q/R の D/u16 範囲 unknown は利用者責任で明示タグを 1 件ずつ読取り可と決定したが、型式不明・0101 拒否時は本ゲストで Q/R wire を確定できず読まない。WIT 拡張とバッチ書込み単位は未決。
+- SLMP の全機種・経路別 SD 取得、拡張 D/W の ZR 変換、全タグ種の範囲判定、実機 read と write、#35 診断の Hub 表示・品質、実機運用時の監査は未検証。既知 Q/R の D/u16 範囲 unknown は利用者責任で明示タグを 1 件ずつ読取り可と決定したが、型式不明・0101 拒否時は本ゲストで Q/R wire を確定できず読まない。初期段階では WIT 拡張とバッチ書込み単位を未決としていたが、後続で任意の `write-v1` world と 1–960 word / 最大 7168 bit の制限付きバッチ書込みを実装し、制御フィクスチャと #885 の既存ポリシー回帰で確認した。追加の WIT 変更や未確定エリアの採否は別判断。
 
-- Hub の loader / runtime、manifest 検証、`FrameConnection` アダプター、U16 接続テストは PR #843 で実装された。この新しい U32 版ゲストの固定 SHA 更新、Hub 側 U32 型・範囲検査と読取り経路は未実施。
-- 実機への Modbus TCP 通信、SLMP、FC3 以外、複数タグ、文字列、書き込みは未実装または未検証。U32 は独立 Wasmtime 比較の対象で、Hub 境界では未対応。ローカル TCP の制御通信は U16 の独立テストホスト経由のみで、ホストの受信処理は MBAP 長を直接読み、`plan.step.expect` の `PrefixSpec` は解釈していない。
-- ローカルでは Rust 1.85.1 を導入・実行していない。CI では既存の 1.85.1 コア検証と WASM artifact のジョブ間再利用が成功した。実コンポーネントの試験は Wasmtime テストホスト経由であり、Hub runtime 経由ではない。
+- Hub の loader / runtime、manifest 検証、`FrameConnection` アダプター、U16 接続テストは PR #843 で実装された。Modbus #881/#884 は固定 guest による代表的な型・read/write 経路と独立ゲートを模擬 Hub で検証済み。全型・全設定の網羅は主張しない。SLMP #885 は #34 固定で、#35 診断の Hub 受入れは未実施。
+- 実機への Modbus TCP / SLMP 読書き、模擬試験で網羅していない型・設定・経路、#35 診断の Hub 受入れ、文字列と条件付き範囲の追加適合は未検証。FC1/FC2/FC4、複数タグ、書込みはゲスト側に実装済みであり未実装とは扱わない。U32 の独立 Wasmtime 比較は実施済みだが、#843 の固定 U16 Hub 境界の検証とは区別する。初期のローカル TCP 制御通信は U16 の独立テストホスト経由のみで、当時のホストは MBAP 長を直接読み `plan.step.expect` の `PrefixSpec` を解釈していなかった。
+- 過去のクラウド環境では Rust 1.85.1 を導入・実行せず、当時の CI で 1.85.1 コア検証と WASM artifact のジョブ間再利用を確認した。初期の比較試験は独立 Wasmtime テストホスト経由。後続の industrial #881/#884/#885 には模擬 Hub 結合試験があるが、#35 診断の Hub runtime 実行や実機通信を証明しない。
 
 ## 残件
 
 - SLMP 実装時に公式表の機種条件、経路、アドレス基数、bit/word 単位、複合タグの全範囲をフィクスチャで検証する。本番前の read-only 接続テストと Hub [Issue #845](https://github.com/tyaro/banto-industrial/issues/845) の境界を合わせ、実機 write は別途承認を受ける。
 
-- Hub 側 U32 登録と型・範囲検査は固定ゲスト SHA の更新を含む別作業で照合する。Hub の固定 U16 ゲストや adapter / CI は今回変更しない。
-- SLMP の 0101 型式判別、実設定範囲取得、指定タグ読取りテストの段階分割を準備する。現行 WIT で範囲取得手順を表現できるか確認し、互換性に影響する変更は別途判断する。
+- #881/#884 の Modbus 模擬検証と #885 の SLMP #34 模擬受入れを維持し、#35 診断の Hub 受入れ、未試験の型・範囲と本番での二重ゲート運用を別作業で照合する。#885 の #34 pin は今回変更しない。
+- 実装済み 0101 型式判別と SD 点数取得の適用条件を維持し、未確定の機種・経路・拡張範囲、指定タグ読取りテストの追加採否と WIT 互換性は別作業で判断する。#871 の gap 読取り最適化は後回し。V 周期収集除外と Modbus register-bit write `Unsupported` は現行契約として維持する。
 
 ## 次作業
 
-1. この U32 版を独立 Wasmtime ホストで照合し、Hub U32 対応は別作業として境界を確認する。
-2. Q / iQ-R SLMP の読み取りコア、0101 型式判別、実設定範囲取得、タグ読取りテストの段階を設計する。native 参照、公式仕様、独立フィクスチャを照合し、native の既存不具合は模倣しない。
+1. industrial #885 の #34 固定版との契約差を追跡し、#35 診断の Hub 受入れ・運用表示は別作業で検証する。guest の能力追加だけで本番許可にしない。
+2. 実機と Hub の未検証点を個別に確認する。文字列、条件付き機種・経路の範囲、指定タグ読取りテスト、配布 manifest は候補として保持し、採否と実装範囲は別途決める。
 
-次セッションの必要環境: Rust 1.98.1 のみ、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0、テスト依存 Wasmtime 50.0.0、Node.js 24。新しいクラウド環境には前セッションの導入が継承されると仮定せず確認する。実通信の自動確認は制御したローカル TCP で行い、実機 PLC は使わない。MSRV 宣言と native descriptor の欠落時 `settings_version=1` は変更しない。
+過去のセッションで記録した必要環境: Rust 1.98.1 のみ、`wasm32-unknown-unknown`、wasm-tools 1.262.0、wit-bindgen 0.63.0、テスト依存 Wasmtime 50.0.0、Node.js 24。新しいクラウド環境には前セッションの導入が継承されると仮定せず確認する。実通信の自動確認は制御したローカル TCP で行い、実機 PLC は使わない。MSRV 宣言と native descriptor の欠落時 `settings_version=1` は変更しない。
 
 ## 判断
+
+以下は当時の確定方針です。将来候補の採否を今回決めたものではありません。
 
 - SLMP の実設定点数と機種別範囲判定は WASM 側の設計対象とし、Hub は I/O・接続テストの表示・品質・監査を担う。PLC 設定待ちの保存を許し、形式/型不正と実機未確認、範囲外と unknown を区別する。
 

@@ -1,31 +1,30 @@
-Current local Modbus WASM stage: FC1/FC2 Bool reads, FC3/FC4 eight-type numeric reads, configurable FC3/FC4 handshake probe, and optional disabled-by-default FC5/FC16 writes. See [capability matrix and limitations](docs/CONTRACT.md#modbus-wasm-local-contract-update-2026-10-27). The existing Hub registration remains pinned to an older read-only guest; this local stage has only controlled tests.
-
 # banto-driver-wasm
 
-Historical FC4/iQ-R W read stage: the Modbus guest first accepted eight numeric types on FC3 holding (4xxxx) and FC4 input (3xxxx) registers, while retaining a fixed `40001/u16` FC3 probe. The current Modbus stage above adds connection-bound FC4 probing, Bool reads and gated writes. The SLMP guest accepts the same numeric types on decimal D and confirmed standard iQ-R hexadecimal W; its R handshake decodes SD280-283 as separate complete D/W counts. These changes have only controlled local tests so far; no PLC I/O was performed.
+## 現在の実装と適用範囲
 
-A separate [SLMP WASM guest](slmp-component/src/lib.rs) exercises the existing WIT connection handshake and accepts multiple D/u16 tags. It batches input-order adjacent D addresses only within a verified configured range, preserving one `covers` index and one result per tag. Unknown-range tags use individual 0401 requests; gaps and duplicate addresses are not filled or deduplicated. [Wasmtime fixtures](slmp-runtime/src/lib.rs) use controlled responses. With a recognized Q/R wire series, an explicit tag may be read when its configured range remains unknown, at the operator's responsibility; a successful read is not range proof. Unknown name/code pairs and 0101 refusals do not establish the Q/R read format in this guest. [Discovery metadata and Hub display](docs/SLMP_DISCOVERY_CONTRACT.md) remain a design-only contract. No physical PLC I/O was used.
+2026-10-27 の main `b3d944f` には [PR #32–#35](docs/STATUS.md#現行スナップショット2026-10-27) がマージ済みです。以下はゲストと I/O を持たないコアの能力です。ゲストの制御フィクスチャと独立 Wasmtime 検証に加え、後述の範囲は模擬 Hub 結合試験を通過しています。実機 PLC と本番配置は未検証です。
 
-The SLMP I/O-free core also plans conditional QnU complete M/B counts (SD286-289) and recognized QnUDV internal-only D/W counts (SD282-285). These are field counts; D/W totals and complete tag ranges are not inferred; see [`drivers/slmp`](drivers/slmp/README.md) for evidence requirements.
+| 対象 | 現在のゲスト能力 | 制限 |
+| --- | --- | --- |
+| Modbus TCP | FC1/FC2 の Bool、FC3/FC4 の `i16/u16/i32/u32/i64/u64/f32/f64`、3xxxx/4xxxx の `.0`–`.15` register-bit Bool を読取る。FC3/FC4 の設定済み 1 レジスタ probe を接続 handshake で実行する | register-bit write は、holding register でも送信前にバッチ全体を `Unsupported` とする |
+| Modbus TCP 書込み | 任意の `write-v1` world で FC5 単一 coil または FC16 連続 holding words | 初期値 `write_mode=disabled`。`enabled` と要求全体を含む明示 `write_allowlist` の両方が必要。Hub の保存済み運用ポリシー・権限・監査は独立した第二ゲート。#881 の模擬結合試験で FC5/FC16 と拒否経路を確認済み |
+| SLMP | 既知 Q/R 系列の明示タグについて、D/W 等の数値 8 型、対応 bit エリアの Bool、機種別に実装した timer/counter・ZR・D word-bit を読取る。任意の diagnostics-v1 は標準 Q X、標準 R SB/F の点数を報告する | `Unknown` は範囲の保証ではない。既知 wire 系列の範囲不明タグは明示的な単独読取りに限り、未知の型式・経路や確定範囲外を推測して読まない。診断点数は読書き許可を広げない |
+| SLMP 書込み | ゲスト内の既定無効ポリシーで D/W 数値・M/Y/L/B Bool を検証する制御試作 | 明示 allowlist、同一接続の SD 根拠、Hub の独立運用ゲートが必要。#885 は #34 固定の模擬受入れで既存ポリシーを回帰確認。V edge relay は周期収集タグから意図的に除外する |
 
-The exact `Q25PRHCPU / 004CH` 0101 pair establishes Q word-read framing only. Its SD302 applicability is unverified, so the guest skips SD, keeps the D range unknown, and reads explicit D/u16 tags individually. Other special or mismatched CPU pairs remain unsupported.
+数値 8 型は `i16/u16/i32/u32/i64/u64/f32/f64`、bit は Bool です。`low_high` / `high_low` は複数ワード値に適用します。文字列、条件付きの機種・経路別範囲拡張、配布 manifest の製品受入れは未完了で、今後の採否は未決です。読取り最適化 [#871](https://github.com/tyaro/banto-industrial/issues/871) は後回しです。範囲の `Unknown` と構文・wire 未対応の `Unsupported` は区別します。詳細は [Modbus 契約](docs/CONTRACT.md#modbus-wasm-local-contract-update-2026-10-27) と [SLMP 契約](drivers/slmp/README.md) を参照してください。
 
-SLMP contains an I/O-free binary 4E 0401 read-frame core, 0101 model classification, basic SD point counts, conditional QnU ZR counts, and the conditional Q SD282-289 fields described below. Hub integration, PLC communication, and remaining device-range decisions are later stages.
+industrial [#881](https://github.com/tyaro/banto-industrial/pull/881) は #32 固定ゲストで FC2/FC4、数値・Bool（代表型）、FC5/FC16 と独立運用ゲート・監査を模擬 Hub で検証しました。[#884](https://github.com/tyaro/banto-industrial/pull/884) は #33 固定ゲストで register-bit Bool の保存・broker 読取り・REST read-now と送信前 write 拒否を検証しました。[#885](https://github.com/tyaro/banto-industrial/pull/885) は SLMP #34 merge `c9cf3b8` を固定して模擬受入れし、#35 の Q X / R SB・F 診断はまだ Hub 受入れ前です。これらは代表的な模擬経路の検証であり、全型・全設定の網羅、実機 PLC、GUI、本番配置を認定しません。Hub の公開 API・ソケット I/O・再接続・品質・書込みの安全判断と監査は Hub 側が所有します。このリポジトリの manifest は能力メタデータであり、配布形式の完成や書込み許可を証明しません。
 
-Banto Hub 向け WASM ドライバ SDK と Modbus TCP・SLMP ドライバの開発場所です。現在は Modbus TCP の FC3・単一タグ U16/U32 読み取りコアと、同じ範囲を扱う WASM コンポーネントがあります。Hub は [PR #843](https://github.com/tyaro/banto-industrial/pull/843) で FC3・単一 U16 の WASM ゲストを固定 SHA で登録しました。このリポジトリの U32 版コンポーネントは Hub に登録されておらず、Hub 経由の U32 は未対応です。
+## 歴史的な初回目標
 
-## 境界と初回目標
-
-Hub にある公開 `banto-driver-api`（`FrameDriver`）、`banto-driver-engine`、`banto-driver-conformance`、`DriverRegistry` を再利用する方針です。Hub はソケット、broker の 1 接続 1 セッション、品質判定、書き込みの関門、監査を持ち、WASM はフレームの生成・応答解析・アドレスと設定の検証を担当する想定です。既存 native ドライバは内部依存があるため、クレート一式をこのリポジトリへコピーしません。
-
-最初の製品目標は Modbus TCP の **WASM 読み取り**を Hub の既存 native 実装と同じ入力・応答で比較することです。FC3・単一 U16 はコア、native、実 WASM の共有フィクスチャ12件、単一タグ U32（2レジスタ）の両 `word_order` は15件で比較します。U32 は既存 WIT の `uint(u64)` と `word-count=2` で表現します。文字列、SLMP の実設定範囲・WIT 接続、書き込み、プラグイン UI、配布管理は後続段階です。初版 WIT 境界は [CONTRACT.md](docs/CONTRACT.md) に記録しています。
+初回の製品目標は Modbus TCP の FC3・単一 U16 読取りを native と比較することでした。U16 の共有12件、U32 の15件について、独立 Wasmtime 実行まで拡張しました。各2件の余剰 PDU は native が受理しゲストが厳密拒否する意図的な差です。Hub [PR #843](https://github.com/tyaro/banto-industrial/pull/843) の固定 U16 接続試験は、このリポジトリの現在の全能力の Hub 受入れを示すものではありません。
 
 ## 作業の入口
 
-- [docs/STATUS.md](docs/STATUS.md): 確認済みの進捗、残件、次作業。新しいセッションはここから開始します。
+- [docs/STATUS.md](docs/STATUS.md): 現行スナップショット、過去の検証記録、未検証点。新しいセッションはここから開始します。
 - [docs/PLAN.md](docs/PLAN.md): 段階計画、完了条件、CI の拡張順。
 - [docs/CONTRACT.md](docs/CONTRACT.md): 現行 API と承認済み初版 WIT 境界の照合。
-- [drivers/slmp/README.md](drivers/slmp/README.md): 標準 Q / iQ-R・ENCPU の SLMP 型式・設定点数・タグ範囲判定の設計案。
+- [drivers/slmp/README.md](drivers/slmp/README.md): SLMP の実装済み能力、制限、範囲判定と今後の設計候補。
 - [AGENTS.md](AGENTS.md): 作業・引継ぎの規約。
 
 ## 現在の CI

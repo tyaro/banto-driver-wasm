@@ -1,11 +1,13 @@
 # Modbus WASM local contract update (2026-10-27)
 
-| Guest operation | Current local behavior | Hub follow-up |
+Current main `b3d944f` includes merged #32 basic Modbus and #33 register-bit reads. The tables below describe the guest contract and the verified simulated Hub boundary, not production deployment. Industrial #881 merged with Modbus numeric/Bool read, FC3/FC4 handshake and independently gated FC5/FC16 loopback tests; #884 merged with register-bit Bool adapter/Hub join tests and pre-send write refusal. These tests used pinned guest components and their actual manifest. Physical PLC, GUI and deployed runtime remain unverified. In addition to numeric FC3/FC4 reads, `3xxxx.N` / `4xxxx.N` Bool reads use decimal `N=0..15`; register-bit writes intentionally return `Unsupported` before send. The optional guest write world requires both `write_mode=enabled` and one allowlist span covering the whole request. The independent Hub saved policy, operational gate and audit were exercised in #881 loopback tests; physical and production use remain unverified. Historical U16/U32-only comparison and initial Hub pin notes farther below describe their original stages.
+
+| Guest operation | Current guest behavior | Verified Hub simulation / remaining limit |
 | --- | --- | --- |
-| `connection.handshake-next`, `address.probe` | Configured FC3 or FC4 one-register probe runs in handshake; `address.probe` returns `none` | Execute handshake frame/response loop and avoid an additional fixed FC3 probe |
-| `read.plan` / `read.decode` | FC1/FC2 Bool and FC3/FC4 eight numeric types with strict response checks | Register the new component and validate WIT value variants and widths |
-| `write-v1.write-next` | Optional world; disabled unless `write_mode=enabled` and one explicit allowlist span covers the whole request. FC5 single coil or FC16 contiguous holding words only | Negotiate write-v1 and enforce a separate saved write policy, audit and operational gate |
-| `config.schema` / manifest | `probe_address`, `write_mode`, `write_allowlist`; capabilities `read,write`, `writeApi: "1"`, version `0.4.0` | Treat metadata as capability discovery, not write authorization |
+| `connection.handshake-next`, `address.probe` | Configured FC3 or FC4 one-register probe runs in handshake; `address.probe` returns `none` | #881 verified FC4-only handshake and the connection loop in a Hub fixture; real device and deployment remain unverified |
+| `read.plan` / `read.decode` | FC1/FC2 Bool, FC3/FC4 eight numeric types and register-bit Bool with strict response checks | #881 verified representative Bool/numeric adapter and Hub reads; #884 verified FC3/FC4 register-bit Bool through saved tags, broker and REST read-now. All values/configurations and physical PLC are not covered |
+| `write-v1.write-next` | Optional world; disabled unless `write_mode=enabled` and one explicit allowlist span covers the whole request. FC5 single coil or FC16 contiguous holding words only | #881 verified write-v1 negotiation, saved Hub mode/allowlist, permission and audit gates, FC5/FC16 success and pre-send refusal in loopback; #884 verified register-bit write refusal. Production enablement and physical writes remain unverified |
+| `config.schema` / manifest | `probe_address`, `write_mode`, `write_allowlist`; capabilities `read,write`, `writeApi: "1"`, version `0.4.0` | #881/#884 CI built the pinned guest with its actual manifest; metadata remains discovery, not authorization or proof of signed production packaging |
 
 | Modbus area | Read | Optional write | Function codes |
 | --- | --- | --- | --- |
@@ -15,9 +17,9 @@
 | Holding register `4xxxx` | Eight numeric types | Complete contiguous values inside one explicit allowlist interval | FC3 / FC16 |
 | Register bit `3xxxx.N` / `4xxxx.N` (`N=0..15` decimal) | Bool from one FC4 / FC3 word | Unsupported before send | FC4 / FC3 only |
 
-The numeric types are `i16/u16/i32/u32/i64/u64/f32/f64`. Each tag occupies one, two or four registers. `low_high` and `high_low` are supported. An FC16 run is capped at 123 words. `write_mode` defaults to `disabled`, and an enabled mode requires `write_allowlist`. All items must pass type, width, value, area and span checks before a frame is sent. An uncertain response poisons that connection. No automatic address scan, live write or Hub integration was performed.
+The numeric types are `i16/u16/i32/u32/i64/u64/f32/f64`. Each tag occupies one, two or four registers. `low_high` and `high_low` are supported. An FC16 run is capped at 123 words. `write_mode` defaults to `disabled`, and an enabled mode requires `write_allowlist`. All items must pass type, width, value, area and span checks before a frame is sent. An uncertain response poisons that connection. No automatic address scan or physical PLC write was performed. Hub integration was verified only in the pinned #881/#884 simulated adapter and loopback paths described above.
 
-The table below is historical comparison context for the originally pinned FC3/U16 Hub adapter. The local component changes do not imply a Hub deployment or live PLC validation.
+The table below is historical comparison context for the originally pinned FC3/U16 Hub adapter, before #881/#884. It does not describe current simulated Hub coverage or imply a deployment or live PLC validation.
 
 # API と WIT の照合
 

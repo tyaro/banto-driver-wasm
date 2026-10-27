@@ -1,24 +1,19 @@
 # 段階計画
 
-P3 guest follow-up: the separate SLMP component uses the existing WIT world for controlled 0101 -> model-specific basic D SD -> D/u16 0401 reads in Wasmtime. A tag list batches only verified, adjacent D/u16 addresses in input order (up to 960 words per request), preserving original `covers` order and one result per tag. Unknown-range tags retain individual requests; gaps are never read for optimization. A recognized Q/R wire series permits an explicit unknown-range read at the operator's responsibility; a successful value never proves the range. Unknown model/name-code and 0101 refusal still lack a confirmed Q/R 0401 format in this guest. A structured Hub discovery snapshot is design only. Further WIT/Hub implementation, full device coverage, physical PLC I/O, and writes are later decisions.
+## 現行段階と完了条件
 
-P3 follow-up: SD286-289 QnU complete M/B and SD282-285 classified QnUDV internal-only D/W counts are a separate I/O-free stage. Version, serial, and route evidence must be independently confirmed. M/B pairs are complete configured counts, while fast D/W pairs are internal-only; Q SD308-311 totals and tag validation remain later work.
+main `b3d944f` では #32 Modbus 基本、#33 register-bit read、#34 SLMP V 周期収集除外、#35 標準 Q X / 標準 R SB・F 診断がマージ済みです。Modbus は FC1/FC2 Bool、FC3/FC4 数値 8 型と register-bit Bool を読取り、任意の FC5/FC16 write-v1 を既定無効のゲスト設定で制限します。SLMP は既知 Q/R の明示読取り、D/W 数値 8 型と対応 bit Bool、既定無効のゲスト書込み試作、任意の diagnostics-v1 を持ちます。数値 8 型は `i16/u16/i32/u32/i64/u64/f32/f64`。個々の履歴と検証範囲は [STATUS](STATUS.md) に残します。
 
-P3 has I/O-free binary 4E 0401 read frames, 0101 model classification, basic SD count handling, conditional QnU ZR SD306-307, and conditional SD282-289 field handling. The current guest uses the existing WIT for its narrow D/u16 read path. Q D/W totals, other tag kinds, structured discovery metadata, Hub integration, PLC I/O, and writes remain later decisions.
+ゲスト実装と段階の製品完了は別です。Hub industrial #885 は #34 `c9cf3b8` 固定で #35 診断は未受入れ。Modbus の保存済み書込みポリシー・運用ゲート・監査は industrial #881 の模擬結合試験で確認済みで、#884 は register-bit 経路を確認済みです。SLMP #34 は #885 の模擬受入れを通過しています。未検証なのは全型・全設定の網羅、実機 I/O、本番配置・資格情報、GUI、#35 診断の Hub 受入れ、条件付き範囲の追加証拠、文字列と配布 manifest の製品受入れです。manifest の `capabilities` は認可ではありません。SLMP `Unknown` は確定範囲と混同せず、未確定の機種・wire では安全側に送信を見送ります。V の周期収集除外と Modbus register-bit write の `Unsupported` は意図した現行制限で、修正必須項目ではありません。#35 は診断のみで読書き許可を増やしません。読取り最適化 #871 は後回しです。将来候補の採否はこの計画更新では決めません。
 
-状態: 計画。各段階の完了条件を満たすまでは製品機能を実装済みと扱わない。
-
-| 段階 | 作業 | 完了条件 |
+| 段階 | 既存の実装・検証 | 製品段階の未完了条件 |
 | --- | --- | --- |
-| P0 初期構成 | README、AGENTS、STATUS、変更判定とガードの CI | ローカルで判定テストと構成ガードが通る。GitHub Actions は公開後に確認する |
-| P1 契約確認 | Hub の `FrameDriver` / registry / engine / conformance と WIT 案を照合し、SDK の最小境界を設計 | 公開 API の版・型・所有する I/O・エラー分類が文書とテストで明確。WIT v1 を Hub と同時に更新する手順がある |
-| P2 Modbus 読み取り | 最小 WASM SDK と Modbus TCP 読み取りを作る。Hub 側 loader / runtime の受け口と接続する | 同じ要求・応答で native と WASM の値、ワード順、文字列、項目エラー、接続致命エラーが一致。シミュレータで自動検証し、必要な実機確認を記録 |
-| P3 SLMP 読み取り | P2 の境界を再利用して SLMP を実装 | native との結果・エラー一致とアドレス表の適合を自動検証 |
-| P4 拡張 | 書き込み、UI、配布・更新を Hub の各設計と調整して段階的に追加 | Hub の書き込み関門と監査を維持し、各能力の適合・運用テストを通す |
+| P0–P1 基盤・契約 | README、AGENTS、STATUS、CI 判定・ガード、WIT と Hub API の照合 | 後続の互換性判断は変更時に実施 |
+| P2 Modbus | コア・WIT ゲスト・独立 Wasmtime 比較、FC1–FC4 read と gated FC5/FC16 write、register-bit read。industrial #881/#884 で固定 guest の代表的な adapter・Hub 経路と独立書込みゲートを模擬検証 | 未試験の型・設定・経路、実機、本番配置、文字列など採用する製品範囲の検証 |
+| P3 SLMP | コア・guest の Q/R 読取りと制御フィクスチャ、条件付き点数、diagnostics-v1。#885 で #34 固定 guest と既存 write policy を模擬 Hub 受入れ | #35 診断の Hub 受入れ、未試験の機種・経路・型、実機と本番配置 |
+| P4 運用拡張 | 任意 write-v1 とバッチ書込みを実装。#881/#884 の Modbus と #885 の SLMP で既存 Hub ゲート・監査を模擬確認 | 未試験の書込み対象、実 PLC、本番鍵・配置、UI・配布形式の製品確認 |
 
-P2 の段階的追加として FC3・単一タグ U32（2レジスタ）の両 word order を依存なしコア、固定版 native、実 WASM コンポーネントで比較する。U16 の共有12件は維持する。Hub は固定版ゲストで U16 を扱い、U32 の Hub 境界拡張は別工程とする。
-
-P3 では、機種と設定によって異なるデバイスアクセス範囲を確認するため、指定タグの読取りテスト命令を SLMP WASM ドライバに設ける要件を検討する。固定 probe の接続確認とは区別し、静的な形式・範囲検査、実読取りでの機器拒否、通信失敗を分けて扱う。[SLMP Reference Manual](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engm.pdf) の 0101/0000 は機種名の読出し、0401 は連続デバイス読出し、0403 はランダム読出しであり、0101 の成功だけで指定タグのアクセス範囲を保証しない。I/O は Hub エンジンが所有する。具体的な WIT 拡張と機種対応範囲は P3 着手時に提案・確認する。
+指定タグの SLMP 読取り試験命令、文字列、機種・経路別範囲拡張、配布管理は将来候補です。0101 型式取得と実際の 0401 読取りは異なる証拠であり、成功値は設定範囲全体の証明になりません。Hub が I/O と接続の世代を管理します。これらを採用する場合は別途契約と検証を定めます。
 
 ## CI の拡張順
 
