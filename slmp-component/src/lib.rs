@@ -584,8 +584,12 @@ fn parse_read_address(
         ("B", Device::B, 16),
         ("L", Device::L, 10),
         ("F", Device::F, 10),
-        ("V", Device::V, 10),
     ];
+    if text.starts_with('V') {
+        return Err(
+            "V edge relay cannot be collected reliably: a one-scan edge may be missed".into(),
+        );
+    }
     if let Some((device, radix, digits)) =
         bit_prefixes.iter().find_map(|(prefix, device, radix)| {
             text.strip_prefix(prefix)
@@ -1775,7 +1779,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -2014,6 +2018,7 @@ mod tests {
         );
         for (addr, kind, value) in [
             ("X10", "bit", Value::Bool(true)),
+            ("V14", "bit", Value::Bool(true)),
             ("M10", "bit", Value::Uint(1)),
             ("D3010.1", "bit", Value::Bool(true)),
         ] {
@@ -2292,7 +2297,6 @@ mod tests {
         for (text, canonical, area, index) in [
             ("L12", "L12", "L", 12),
             ("F13", "F13", "F", 13),
-            ("V14", "V14", "V", 14),
             ("SB1a", "SB1A", "SB", 26),
             ("SM15", "SM15", "SM", 15),
         ] {
@@ -2369,6 +2373,33 @@ mod tests {
             <Component as address::Guest>::offset_words("SD9".into(), 1).unwrap(),
             "SD10"
         );
+    }
+
+    #[test]
+    fn v_edge_relay_is_rejected_at_address_and_read_boundaries() {
+        let reason = "V edge relay cannot be collected reliably: a one-scan edge may be missed";
+        let spec = TagSpec {
+            address: "V14".into(),
+            data_type: "bit".into(),
+            string_words: None,
+        };
+        assert_eq!(parse_read_address("V14", "bit", None), Err(reason.into()));
+        assert!(matches!(
+            <Component as address::Guest>::parse("V14".into(), "bit".into(), None),
+            Err(message) if message == reason
+        ));
+        assert_eq!(
+            <Component as address::Guest>::offset("V14".into(), "bit".into(), None, 1),
+            Err(reason.into())
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("V14".into(), 1),
+            Err(reason.into())
+        );
+        assert!(matches!(
+            checked_read_span(&spec, &model(ModelFamily::StandardR), PointCount::Unknown, PointCount::Unknown),
+            Err(FatalError::InvalidConfig(message)) if message == reason
+        ));
     }
 
     #[test]

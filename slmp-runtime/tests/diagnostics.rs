@@ -120,6 +120,7 @@ fn same_connection_diagnosis_reads_one_bounded_bit_sd_and_preserves_ranges() -> 
         spec("M10", "bit"),
         spec("M32", "bit"),
         spec("F0", "bit"),
+        spec("V14", "bit"),
         spec("bad", "u16"),
         spec("LTN4294967295", "i32"),
     ];
@@ -161,9 +162,12 @@ fn same_connection_diagnosis_reads_one_bounded_bit_sd_and_preserves_ranges() -> 
     assert!(matches!(report.tags[3].verdict, TagVerdict::Inside(_)));
     assert!(matches!(report.tags[4].verdict, TagVerdict::Outside(_)));
     assert!(matches!(report.tags[5].verdict, TagVerdict::Unknown(_)));
-    assert!(matches!(report.tags[6].verdict, TagVerdict::Invalid(_)));
     assert!(
-        matches!(&report.tags[7].verdict, TagVerdict::Invalid(reason) if reason == "address-span-overflow")
+        matches!(&report.tags[6].verdict, TagVerdict::Invalid(reason) if reason.contains("one-scan edge"))
+    );
+    assert!(matches!(report.tags[7].verdict, TagVerdict::Invalid(_)));
+    assert!(
+        matches!(&report.tags[8].verdict, TagVerdict::Invalid(reason) if reason == "address-span-overflow")
     );
     assert_eq!(report.counts.len(), 6);
     let repeat = guest
