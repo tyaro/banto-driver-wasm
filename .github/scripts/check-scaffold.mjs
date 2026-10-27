@@ -2,9 +2,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const required = {
-  'README.md': ['# banto-driver-wasm', 'docs/STATUS.md'],
+  'README.md': ['# banto-driver-wasm'],
   'AGENTS.md': ['docs/STATUS.md'],
-  'docs/STATUS.md': ['## 完了', '## 検証', '## 未検証', '## 残件', '## 次作業', '## 判断'],
   'docs/PLAN.md': ['# 段階計画'],
   'docs/CONTRACT.md': ['# API と WIT の照合'],
 };
@@ -21,6 +20,8 @@ for (const [path, markers] of Object.entries(required)) {
 // tracked project file has an explicit place; future source/config must update CI.
 const allowed = new Set([
   ...Object.keys(required),
+  // Local, untracked hand-off note (.gitignore); allowed when present.
+  'docs/STATUS.md',
   'docs/SLMP_DISCOVERY_CONTRACT.md',
   '.github/scripts/ci-changes.mjs',
   '.github/scripts/ci-changes.test.mjs',
