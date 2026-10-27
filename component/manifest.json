@@ -1,10 +1,11 @@
 {
   "manifestVersion": 1,
   "id": "modbus-fc3-wasm",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "hubApi": "1",
   "settingsVersion": 1,
-  "displayName": "Modbus TCP FC3/FC4 numeric reads (WASM)",
+  "displayName": "Modbus TCP FC1-FC4 reads and optional writes (WASM)",
   "transports": ["tcp"],
-  "capabilities": ["read"]
+  "capabilities": ["read", "write"],
+  "writeApi": "1"
 }

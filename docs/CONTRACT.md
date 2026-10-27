@@ -1,3 +1,23 @@
+# Modbus WASM local contract update (2026-10-27)
+
+| Guest operation | Current local behavior | Hub follow-up |
+| --- | --- | --- |
+| `connection.handshake-next`, `address.probe` | Configured FC3 or FC4 one-register probe runs in handshake; `address.probe` returns `none` | Execute handshake frame/response loop and avoid an additional fixed FC3 probe |
+| `read.plan` / `read.decode` | FC1/FC2 Bool and FC3/FC4 eight numeric types with strict response checks | Register the new component and validate WIT value variants and widths |
+| `write-v1.write-next` | Optional world; disabled unless `write_mode=enabled` and one explicit allowlist span covers the whole request. FC5 single coil or FC16 contiguous holding words only | Negotiate write-v1 and enforce a separate saved write policy, audit and operational gate |
+| `config.schema` / manifest | `probe_address`, `write_mode`, `write_allowlist`; capabilities `read,write`, `writeApi: "1"`, version `0.4.0` | Treat metadata as capability discovery, not write authorization |
+
+| Modbus area | Read | Optional write | Function codes |
+| --- | --- | --- | --- |
+| Coil `0xxxx` | Bool | One point with an explicit allowlist | FC1 / FC5 |
+| Discrete input `1xxxx` | Bool | Rejected before send | FC2 |
+| Input register `3xxxx` | Eight numeric types | Rejected before send | FC4 |
+| Holding register `4xxxx` | Eight numeric types | Complete contiguous values inside one explicit allowlist interval | FC3 / FC16 |
+
+The numeric types are `i16/u16/i32/u32/i64/u64/f32/f64`. Each tag occupies one, two or four registers. `low_high` and `high_low` are supported. An FC16 run is capped at 123 words. `write_mode` defaults to `disabled`, and an enabled mode requires `write_allowlist`. All items must pass type, width, value, area and span checks before a frame is sent. An uncertain response poisons that connection. No automatic address scan, live write or Hub integration was performed.
+
+The table below is historical comparison context for the originally pinned FC3/U16 Hub adapter. The local component changes do not imply a Hub deployment or live PLC validation.
+
 # API と WIT の照合
 
 SLMP follow-up: the separate guest uses the current session.connection and read interfaces for a controlled 0101 -> SD -> D/u16 path. `read.plan` may return several steps; a verified contiguous D run has ordered original tag indices in `covers`, one per response word, up to the core's 960-word 0401 limit. Unknown-range tags remain individual steps; gaps are not read. `read.decode` returns one result per cover. Unsupported or verified out-of-range tags remain uncovered for the host's item-level `Unsupported` result. A whole-batch PLC refusal gives each cover an item-level `Device` error; malformed or mismatched responses remain fatal, after which the host closes the connection. A recognized Q/R wire series allows explicit reads when the configured range is unknown, at the operator's responsibility; success does not verify range. An unknown name/code or 0101 refusal does not establish Q/R 0401 framing in this guest. [The discovery snapshot proposal](SLMP_DISCOVERY_CONTRACT.md) defines CPU identity, count scope, unknown reasons, and generation invalidation without changing WIT or Hub in this stage. Compatibility of a future structured WIT interface remains to be tested.

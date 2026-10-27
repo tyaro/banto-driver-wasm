@@ -1,13 +1,17 @@
-//! A small, transport-free Modbus TCP read core.
+//! A small, transport-free Modbus TCP core.
 //!
-//! This is an FC3/FC4 single-tag numeric read core, not a `FrameDriver` or a WIT
-//! component. The Hub still owns I/O and the production Modbus driver.
+//! This core frames FC1-FC4 reads and FC5/FC16 writes. It is not a
+//! `FrameDriver` or a WIT component. The Hub still owns I/O and the
+//! production Modbus driver.
 //! The shape is checked against the native implementation at
 //! `banto-plc/src/modbus/frame.rs` and `banto-driver-modbus/src/frame_conn.rs`
 //! at banto-industrial a0d01aa2. The separate `comparison` crate exercises
 //! the native FrameDriver on shared FC3 fixtures; it does not run WASM.
 
 #![no_std]
+
+extern crate alloc;
+use alloc::vec::Vec;
 
 use banto_register_codec::{
     decode_f32, decode_f64, decode_i16, decode_i32, decode_i64, decode_u32, decode_u64,
@@ -85,6 +89,7 @@ pub struct ReadHoldingI32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestError {
     AddressRange,
+    Count,
 }
 
 /// The read result is either a value, a non-fatal device exception, or a
@@ -96,6 +101,134 @@ pub enum ReadError {
     Device(u8),
     Framing,
     Protocol,
+}
+
+/// FC1/FC2 bit table. One point is read per tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitFunction {
+    Coil,
+    DiscreteInput,
+}
+
+impl BitFunction {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Coil => 1,
+            Self::DiscreteInput => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadBit {
+    pub transaction_id: u16,
+    pub unit_id: u8,
+    pub offset: u16,
+    pub function: BitFunction,
+}
+
+impl ReadBit {
+    pub fn request(self) -> [u8; 12] {
+        request_function(
+            self.transaction_id,
+            self.unit_id,
+            self.offset,
+            1,
+            self.function.code(),
+        )
+    }
+
+    pub fn decode(self, response: &[u8]) -> Result<bool, ReadError> {
+        let data = decode_function(
+            response,
+            self.transaction_id,
+            self.unit_id,
+            1,
+            self.function.code(),
+        )?;
+        // A one-point reply must not set unused bits.
+        if data[0] > 1 {
+            return Err(ReadError::Framing);
+        }
+        Ok(data[0] == 1)
+    }
+}
+
+/// FC5 writes one coil. The returned frame is valid only after its exact echo.
+pub fn write_coil_request(transaction_id: u16, unit_id: u8, offset: u16, value: bool) -> [u8; 12] {
+    let [hi, lo] = offset.to_be_bytes();
+    [
+        transaction_id.to_be_bytes()[0],
+        transaction_id.to_be_bytes()[1],
+        0,
+        0,
+        0,
+        6,
+        unit_id,
+        5,
+        hi,
+        lo,
+        if value { 0xff } else { 0 },
+        0,
+    ]
+}
+
+/// FC16 writes a complete contiguous register span, capped by the Modbus PDU.
+pub fn write_registers_request(
+    transaction_id: u16,
+    unit_id: u8,
+    offset: u16,
+    words: &[u16],
+) -> Result<Vec<u8>, RequestError> {
+    if words.is_empty() || words.len() > 123 {
+        return Err(RequestError::Count);
+    }
+    let count = u16::try_from(words.len()).map_err(|_| RequestError::Count)?;
+    offset
+        .checked_add(count - 1)
+        .ok_or(RequestError::AddressRange)?;
+    let mbap_len = 7 + words.len() * 2;
+    let mut frame = Vec::with_capacity(6 + mbap_len);
+    frame.extend_from_slice(&transaction_id.to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&(mbap_len as u16).to_be_bytes());
+    frame.extend_from_slice(&[unit_id, 16]);
+    frame.extend_from_slice(&offset.to_be_bytes());
+    frame.extend_from_slice(&count.to_be_bytes());
+    frame.push((words.len() * 2) as u8);
+    for word in words {
+        frame.extend_from_slice(&word.to_be_bytes());
+    }
+    Ok(frame)
+}
+
+/// Strict ACK validation for FC5 and FC16; exceptions remain item-level.
+pub fn decode_write_ack(
+    response: &[u8],
+    transaction_id: u16,
+    unit_id: u8,
+    function: u8,
+    echo: [u8; 4],
+) -> Result<(), ReadError> {
+    if !matches!(function, 5 | 16) {
+        return Err(ReadError::Protocol);
+    }
+    if response.len() < 7 || response.len() > MAX_RESPONSE_LEN || response[2..4] != [0, 0] {
+        return Err(ReadError::Framing);
+    }
+    let length = usize::from(u16::from_be_bytes([response[4], response[5]]));
+    if length == 0 || response.len() != 6 + length {
+        return Err(ReadError::Framing);
+    }
+    if u16::from_be_bytes([response[0], response[1]]) != transaction_id || response[6] != unit_id {
+        return Err(ReadError::Protocol);
+    }
+    match &response[7..] {
+        [code, exception] if *code == (function | 0x80) => Err(ReadError::Device(*exception)),
+        [code, a, b, c, d] if *code == function && [*a, *b, *c, *d] == echo => Ok(()),
+        [code, ..] if *code == function && response.len() == 12 => Err(ReadError::Protocol),
+        _ => Err(ReadError::Framing),
+    }
 }
 
 impl ReadHoldingU16 {
@@ -339,6 +472,105 @@ fn decode_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fc1_fc2_bool_read_and_strict_bit_response() {
+        for (function, code) in [(BitFunction::Coil, 1), (BitFunction::DiscreteInput, 2)] {
+            let read = ReadBit {
+                transaction_id: 0x1234,
+                unit_id: 1,
+                offset: 65535,
+                function,
+            };
+            assert_eq!(
+                read.request(),
+                [0x12, 0x34, 0, 0, 0, 6, 1, code, 255, 255, 0, 1]
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 4, 1, code, 1, 1]),
+                Ok(true)
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 4, 1, code, 1, 0]),
+                Ok(false)
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 3, 1, code | 0x80, 2]),
+                Err(ReadError::Device(2))
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 4, 1, code, 1, 2]),
+                Err(ReadError::Framing)
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 4, 1, 3, 1, 1]),
+                Err(ReadError::Framing)
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x35, 0, 0, 0, 4, 1, code, 1, 1]),
+                Err(ReadError::Protocol)
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 4, 2, code, 1, 1]),
+                Err(ReadError::Protocol)
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 5, 1, code, 1, 1]),
+                Err(ReadError::Framing)
+            );
+        }
+    }
+
+    #[test]
+    fn fc5_fc16_write_ack_checks_identity_echo_length_and_exception() {
+        let coil = write_coil_request(0x1234, 1, 65535, true);
+        assert_eq!(coil, [0x12, 0x34, 0, 0, 0, 6, 1, 5, 255, 255, 255, 0]);
+        assert_eq!(
+            decode_write_ack(&coil, 0x1234, 1, 5, [255, 255, 255, 0]),
+            Ok(())
+        );
+        let words = write_registers_request(0x1234, 1, 65534, &[0x1234, 0xabcd]).unwrap();
+        assert_eq!(
+            words,
+            [0x12, 0x34, 0, 0, 0, 11, 1, 16, 255, 254, 0, 2, 4, 0x12, 0x34, 0xab, 0xcd]
+        );
+        let ack = [0x12, 0x34, 0, 0, 0, 6, 1, 16, 255, 254, 0, 2];
+        assert_eq!(
+            decode_write_ack(&ack, 0x1234, 1, 16, [255, 254, 0, 2]),
+            Ok(())
+        );
+        assert_eq!(
+            decode_write_ack(
+                &[0x12, 0x34, 0, 0, 0, 3, 1, 0x90, 2],
+                0x1234,
+                1,
+                16,
+                [255, 254, 0, 2]
+            ),
+            Err(ReadError::Device(2))
+        );
+        for bad in [
+            [0x12, 0x35, 0, 0, 0, 6, 1, 16, 255, 254, 0, 2],
+            [0x12, 0x34, 0, 0, 0, 6, 2, 16, 255, 254, 0, 2],
+            [0x12, 0x34, 0, 0, 0, 6, 1, 16, 255, 254, 0, 3],
+            [0x12, 0x34, 0, 0, 0, 7, 1, 16, 255, 254, 0, 2],
+            [0x12, 0x34, 0, 0, 0, 6, 1, 5, 255, 254, 0, 2],
+        ] {
+            assert!(decode_write_ack(&bad, 0x1234, 1, 16, [255, 254, 0, 2]).is_err());
+        }
+        assert_eq!(
+            write_registers_request(1, 1, 65535, &[1, 2]),
+            Err(RequestError::AddressRange)
+        );
+        assert_eq!(
+            write_registers_request(1, 1, 0, &[]),
+            Err(RequestError::Count)
+        );
+        assert_eq!(
+            write_registers_request(1, 1, 0, &[0; 124]),
+            Err(RequestError::Count)
+        );
+    }
 
     const READ: ReadHoldingU16 = ReadHoldingU16 {
         transaction_id: 0x1234,
