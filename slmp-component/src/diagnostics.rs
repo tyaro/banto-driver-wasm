@@ -18,12 +18,18 @@ fn same_specs(left: &[TagSpec], right: &[TagSpec]) -> bool {
         })
 }
 
-fn requested_bit_count(specs: &[TagSpec]) -> bool {
+fn requested_bit_count(specs: &[TagSpec], family: ModelFamily) -> bool {
     specs.iter().any(|spec| {
-        parse_read_address(&spec.address, &spec.data_type, spec.string_words).is_ok_and(
-            |(device, _, _)| matches!(device, Device::M | Device::Y | Device::L | Device::B),
-        )
+        parse_read_address(&spec.address, &spec.data_type, spec.string_words)
+            .is_ok_and(|(device, _, _)| uses_bit_sd(family, device))
     })
+}
+
+fn uses_bit_sd(family: ModelFamily, device: Device) -> bool {
+    (matches!(family, ModelFamily::StandardQ | ModelFamily::StandardR)
+        && matches!(device, Device::M | Device::Y | Device::L | Device::B))
+        || (family == ModelFamily::StandardQ && device == Device::X)
+        || (family == ModelFamily::StandardR && matches!(device, Device::SB | Device::F))
 }
 
 fn bit_count_span(model: &TypeName) -> Option<ReadSpan> {
@@ -42,7 +48,7 @@ fn bit_count_span(model: &TypeName) -> Option<ReadSpan> {
     }
 }
 
-fn update_bit_counts(conn: &SlmpConnection, model: &TypeName, words: &[u16]) {
+pub(super) fn update_bit_counts(conn: &SlmpConnection, model: &TypeName, words: &[u16]) {
     let evidence = BasicEvidence {
         route_confirmed: true,
         r_firmware: None,
@@ -63,6 +69,20 @@ fn update_bit_counts(conn: &SlmpConnection, model: &TypeName, words: &[u16]) {
         ]
     };
     conn.bit_counts.set(counts);
+    let diagnostic_counts = if model.family == ModelFamily::StandardQ {
+        [
+            basic_sd_count(model, BasicArea::X, evidence, words.get(0..1)),
+            PointCount::Unknown,
+            PointCount::Unknown,
+        ]
+    } else {
+        [
+            PointCount::Unknown,
+            basic_sd_count(model, BasicArea::SB, evidence, words.get(6..8)),
+            basic_sd_count(model, BasicArea::F, evidence, words.get(8..10)),
+        ]
+    };
+    conn.diagnostic_bit_counts.set(diagnostic_counts);
 }
 
 fn family_name(family: ModelFamily) -> &'static str {
@@ -162,6 +182,31 @@ fn area_counts(
             bit_reason,
         ));
     }
+    let extra = conn.diagnostic_bit_counts.get();
+    match family {
+        ModelFamily::StandardQ => result.push(area_count(
+            "X", "bit", "total", "SD290", extra[0], bit_reason,
+        )),
+        ModelFamily::StandardR => {
+            result.push(area_count(
+                "SB",
+                "bit",
+                "total",
+                "SD268-269",
+                extra[1],
+                bit_reason,
+            ));
+            result.push(area_count(
+                "F",
+                "bit",
+                "total",
+                "SD270-271",
+                extra[2],
+                bit_reason,
+            ));
+        }
+        _ => {}
+    }
     result
 }
 
@@ -176,7 +221,10 @@ fn assess_tag_span(
     points: u16,
 ) -> RangeAssessment {
     if model.family == ModelFamily::StandardQ
-        && matches!(device, Device::M | Device::Y | Device::L | Device::B)
+        && matches!(
+            device,
+            Device::M | Device::X | Device::Y | Device::L | Device::B
+        )
     {
         let Some(last) = number.checked_add(u32::from(points - 1)) else {
             return RangeAssessment::Unknown;
@@ -210,6 +258,15 @@ fn tag_diagnostic(
             }
             Some(model) => {
                 let count = match device {
+                    Device::X if model.family == ModelFamily::StandardQ => {
+                        conn.diagnostic_bit_counts.get()[0]
+                    }
+                    Device::SB if model.family == ModelFamily::StandardR => {
+                        conn.diagnostic_bit_counts.get()[1]
+                    }
+                    Device::F if model.family == ModelFamily::StandardR => {
+                        conn.diagnostic_bit_counts.get()[2]
+                    }
                     Device::M | Device::Y | Device::L | Device::B => write_bit_count(conn, device),
                     _ => read_count(device, d_count, conn.w_count.get()),
                 };
@@ -253,8 +310,7 @@ fn tag_diagnostic(
                             )
                         } else if model.family == ModelFamily::Q25PrhWireOnly {
                             TagVerdict::Unknown("q25prh-general-range-unconfirmed".into())
-                        } else if (conn.bit_sd_refused.get()
-                            && matches!(device, Device::M | Device::Y | Device::L | Device::B))
+                        } else if (conn.bit_sd_refused.get() && uses_bit_sd(model.family, device))
                             || (conn.dw_sd_refused.get() && matches!(device, Device::D | Device::W))
                         {
                             TagVerdict::Unknown("sd-refused".into())
@@ -362,7 +418,7 @@ impl diagnostics_v1::Guest for Component {
         };
         drop(phase);
         if let Some(model) = model {
-            if requested_bit_count(&specs) && !conn.bit_sd_attempted.get() {
+            if requested_bit_count(&specs, model.family) && !conn.bit_sd_attempted.get() {
                 if let Some(span) = bit_count_span(&model) {
                     let route = conn.route();
                     let series = known_series(&model).expect("supported Q/R model");
