@@ -937,3 +937,232 @@ fn inapplicable_and_unrecognized_models_do_not_request_bit_sd() -> wasmtime::Res
     }
     Ok(())
 }
+
+#[test]
+fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime::Result<()> {
+    use diagnostic_host::banto::driver::types::{Setting, TagSpec};
+    use diagnostic_host::exports::banto::driver::diagnostics_v1::{Progress, TagVerdict};
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest =
+        diagnostic_host::DriverWithDiagnosticsV1::instantiate(&mut store, &component, &linker)?;
+    let settings = vec![
+        Setting {
+            key: "host".into(),
+            value: "fixture.invalid".into(),
+        },
+        Setting {
+            key: "port".into(),
+            value: "5000".into(),
+        },
+    ];
+    let string = |address: &str, words: u32| TagSpec {
+        address: address.into(),
+        data_type: "string".into(),
+        string_words: Some(words),
+    };
+    // Every tag starts inside the configured count; all but D96/f64 and
+    // W1E/u32 end beyond it. Strings are not a supported SLMP guest type.
+    let specs = vec![
+        spec("D99", "u32"),
+        spec("D97", "u64"),
+        spec("D99", "f32"),
+        spec("D96", "f64"),
+        spec("W1F", "u32"),
+        spec("W1E", "u32"),
+        string("D98", 4),
+        string("W1E", 4),
+    ];
+    // (model, SD reply, expected numeric verdicts and reasons for D99..W1E)
+    for (name, code, sd, expected) in [
+        (
+            "R04CPU",
+            0x4800,
+            Some(vec![100u16, 0, 32, 0]),
+            [
+                ("outside", "complete-configured-count"),
+                ("outside", "complete-configured-count"),
+                ("outside", "complete-configured-count"),
+                ("inside", "same-connection-sd-guaranteed-span"),
+                ("outside", "complete-configured-count"),
+                ("inside", "same-connection-sd-guaranteed-span"),
+            ],
+        ),
+        (
+            "R04CPU",
+            0x4800,
+            None,
+            [
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
+            ],
+        ),
+        (
+            "Q02UCPU",
+            0x0263,
+            Some(vec![100, 32]),
+            [
+                ("unknown", "configured-range-unproven"),
+                ("unknown", "configured-range-unproven"),
+                ("unknown", "configured-range-unproven"),
+                ("inside", "same-connection-sd-guaranteed-span"),
+                (
+                    "unknown",
+                    "internal-w-prefix-unproven; guest-read-path-unavailable",
+                ),
+                ("inside", "same-connection-sd-guaranteed-span"),
+            ],
+        ),
+    ] {
+        let conn = guest
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("create");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+            .expect("D/W SD request");
+        let reply = match &sd {
+            Some(words) => {
+                let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+                response(2, &bytes)
+            }
+            None => {
+                let mut refused = response(2, &[]);
+                refused[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+                refused
+            }
+        };
+        assert!(guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&reply))?
+            .expect("ready")
+            .is_none());
+        let Progress::Done(report) = guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("diagnose")
+        else {
+            panic!("D/W evidence is already in handshake");
+        };
+        assert_eq!(report.tags.len(), specs.len());
+        for (index, (kind, expected_reason)) in expected.iter().enumerate() {
+            let (actual, reason) = match &report.tags[index].verdict {
+                TagVerdict::Inside(reason) => ("inside", reason),
+                TagVerdict::Outside(reason) => ("outside", reason),
+                TagVerdict::Unknown(reason) => ("unknown", reason),
+                TagVerdict::Invalid(reason) => ("invalid", reason),
+                TagVerdict::Unsupported(reason) => ("unsupported", reason),
+            };
+            assert_eq!(
+                (actual, reason.as_str()),
+                (*kind, *expected_reason),
+                "{name} {:?} {}",
+                sd,
+                specs[index].address
+            );
+        }
+        for tag in &report.tags[6..] {
+            assert!(
+                matches!(&tag.verdict, TagVerdict::Invalid(reason) if !reason.is_empty()),
+                "{name}: string {} must not be judged from a word prefix",
+                tag.address
+            );
+        }
+        // The read path never turns a crossing tag into a value either: only
+        // tags this report proved inside may be planned.
+        let plans = guest
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs[..6])?
+            .expect("plan");
+        for plan in &plans {
+            for &cover in &plan.covers {
+                assert!(
+                    !matches!(report.tags[cover as usize].verdict, TagVerdict::Outside(_)),
+                    "{name}: {} planned although outside",
+                    specs[cover as usize].address
+                );
+            }
+        }
+        conn.resource_drop(&mut store)?;
+    }
+
+    // Without a usable model no span is judged, even one that crosses an end.
+    for (reply, model_reason, tag_reason) in [
+        (
+            Some(model_response("RCPU", 0x0360)),
+            "unsupported-model-name-code-pair",
+            "unsupported-model-name-code-pair",
+        ),
+        (
+            Some(model_response("Q02UCPU", 0x9999)),
+            "unsupported-model-name-code-pair",
+            "unsupported-model-name-code-pair",
+        ),
+        (
+            None,
+            "0101-refused-or-unavailable",
+            "0101-model-unavailable",
+        ),
+    ] {
+        let conn = guest
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("create");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        let reply = reply.unwrap_or_else(|| {
+            let mut refused = response(1, &[]);
+            refused[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+            refused
+        });
+        assert!(guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&reply))?
+            .expect("no SD without a known model")
+            .is_none());
+        let Progress::Done(report) = guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("diagnose")
+        else {
+            panic!("no SD request without a known model");
+        };
+        assert_eq!(report.model_reason.as_deref(), Some(model_reason));
+        assert_eq!(
+            report.model.is_none(),
+            model_reason == "0101-refused-or-unavailable"
+        );
+        for tag in &report.tags[..6] {
+            assert!(
+                matches!(&tag.verdict, TagVerdict::Unknown(reason) if reason == tag_reason),
+                "{model_reason}: {} {:?}",
+                tag.address,
+                tag.verdict
+            );
+        }
+        for tag in &report.tags[6..] {
+            assert!(matches!(tag.verdict, TagVerdict::Invalid(_)));
+        }
+        conn.resource_drop(&mut store)?;
+    }
+    Ok(())
+}

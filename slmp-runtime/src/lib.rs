@@ -1133,6 +1133,184 @@ mod tests {
     }
 
     #[test]
+    fn standard_r_dw_and_q_internal_w_writes_send_nothing_without_complete_sd_span(
+    ) -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{ItemError, Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        enum Discovery {
+            Counts(Vec<u8>),
+            SdRefused,
+            SdBroken,
+            UnknownModel(&'static str, u16),
+            ModelRefused,
+        }
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let settings = [
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+            Setting {
+                key: "d_u16_write_mode".into(),
+                value: "enabled".into(),
+            },
+            Setting {
+                key: "d_u16_write_allowlist".into(),
+                value: "D100-D109,W1A-W1F".into(),
+            },
+        ];
+        let items = |first: &str, second: &str| {
+            [first, second].map(|address| WriteItem {
+                spec: TagSpec {
+                    address: address.into(),
+                    data_type: "u16".into(),
+                    string_words: None,
+                },
+                value: Value::Float(1.0),
+            })
+        };
+        let r_sd = |d: u16, w: u16| {
+            [d.to_le_bytes(), [0, 0], w.to_le_bytes(), [0, 0]]
+                .concat()
+                .to_vec()
+        };
+        // Both items are allowlisted. The second word is the first one
+        // beyond the short SD count, so only the SD span can refuse it.
+        for (target, name, code, write, full, short) in [
+            (
+                "R D",
+                "R04CPU",
+                0x4800,
+                items("D100", "D101"),
+                r_sd(102, 32),
+                r_sd(101, 32),
+            ),
+            (
+                "R W",
+                "R04CPU",
+                0x4800,
+                items("W1E", "W1F"),
+                r_sd(102, 32),
+                r_sd(102, 31),
+            ),
+            (
+                "Q internal W",
+                "Q02UCPU",
+                0x0263,
+                items("W1E", "W1F"),
+                q_sd_data(102, 32).to_vec(),
+                q_sd_data(102, 31).to_vec(),
+            ),
+        ] {
+            for (discovery, reason) in [
+                (Discovery::Counts(full), None),
+                (
+                    Discovery::Counts(short),
+                    Some("not within the same-connection SD range"),
+                ),
+                (
+                    Discovery::SdRefused,
+                    Some("not within the same-connection SD range"),
+                ),
+                (Discovery::SdBroken, Some("discovery is incomplete")),
+                (
+                    Discovery::UnknownModel(if name == "R04CPU" { "RCPU" } else { name }, 0x9999),
+                    Some("discovery is incomplete"),
+                ),
+                (Discovery::ModelRefused, Some("discovery is incomplete")),
+            ] {
+                let conn = driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_create(&mut store, &settings)?
+                    .expect("valid policy");
+                driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(&mut store, conn, None)?
+                    .expect("0101");
+                let model = match discovery {
+                    Discovery::UnknownModel(name, code) => model_response(name, code),
+                    Discovery::ModelRefused => {
+                        let mut refused = response(1, &[]);
+                        refused[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+                        refused
+                    }
+                    _ => model_response(name, code),
+                };
+                let sd = driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(&mut store, conn, Some(&model))?
+                    .expect("0101 response");
+                let label = match &discovery {
+                    Discovery::Counts(words) => format!("{target} SD {words:?}"),
+                    Discovery::SdRefused => format!("{target} SD refused"),
+                    Discovery::SdBroken => format!("{target} SD broken"),
+                    Discovery::UnknownModel(..) => format!("{target} unknown model"),
+                    Discovery::ModelRefused => format!("{target} 0101 refused"),
+                };
+                match &discovery {
+                    Discovery::UnknownModel(..) | Discovery::ModelRefused => {
+                        assert!(sd.is_none(), "{label}: no SD without a known model");
+                    }
+                    other => {
+                        assert!(sd.is_some(), "{label}: SD request");
+                        let reply = match other {
+                            Discovery::Counts(words) => response(2, words),
+                            Discovery::SdRefused => {
+                                let mut refused = response(2, &[]);
+                                refused[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
+                                refused
+                            }
+                            _ => response(2, &[1, 0]),
+                        };
+                        let ready = driver
+                            .banto_driver_session()
+                            .connection()
+                            .call_handshake_next(&mut store, conn, Some(&reply))?;
+                        assert_eq!(
+                            ready.is_err(),
+                            matches!(other, Discovery::SdBroken),
+                            "{label}: only a malformed SD reply is fatal"
+                        );
+                    }
+                }
+                let outcome = driver
+                    .banto_driver_write_v1()
+                    .call_write_next(&mut store, conn, &write, None)?
+                    .expect("preflight");
+                match reason {
+                    None => {
+                        let WriteProgress::Send(plan) = outcome else {
+                            panic!("{label}: full SD span must send")
+                        };
+                        assert_eq!(plan.covers, [0, 1], "{label}");
+                    }
+                    Some(reason) => assert!(
+                        matches!(&outcome, WriteProgress::Done(results)
+                            if results.len() == 2
+                                && results.iter().all(|result| matches!(result,
+                                    Err(ItemError::Rejected(message)) if message.contains(reason)))),
+                        "{label}: expected no frame and {reason:?}, got {outcome:?}"
+                    ),
+                }
+                conn.resource_drop(&mut store)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn standard_q_r_bit_writes_require_same_session_sd_and_preserve_covers() -> wasmtime::Result<()>
     {
         use write_host::banto::driver::types::{Setting, TagSpec, Value};
