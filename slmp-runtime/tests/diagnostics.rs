@@ -142,6 +142,7 @@ fn same_connection_diagnosis_reads_one_bounded_bit_sd_and_preserves_ranges() -> 
     let mut words = [0u16; 14];
     words[2] = 32; // M SD264-265
     words[4] = 16; // B SD266-267
+    words[8] = 8; // F SD270-271
     for word in words {
         bit_sd.extend_from_slice(&word.to_le_bytes());
     }
@@ -161,7 +162,7 @@ fn same_connection_diagnosis_reads_one_bounded_bit_sd_and_preserves_ranges() -> 
     assert!(matches!(report.tags[2].verdict, TagVerdict::Inside(_)));
     assert!(matches!(report.tags[3].verdict, TagVerdict::Inside(_)));
     assert!(matches!(report.tags[4].verdict, TagVerdict::Outside(_)));
-    assert!(matches!(report.tags[5].verdict, TagVerdict::Unknown(_)));
+    assert!(matches!(report.tags[5].verdict, TagVerdict::Inside(_)));
     assert!(
         matches!(&report.tags[6].verdict, TagVerdict::Invalid(reason) if reason.contains("one-scan edge"))
     );
@@ -169,7 +170,7 @@ fn same_connection_diagnosis_reads_one_bounded_bit_sd_and_preserves_ranges() -> 
     assert!(
         matches!(&report.tags[8].verdict, TagVerdict::Invalid(reason) if reason == "address-span-overflow")
     );
-    assert_eq!(report.counts.len(), 6);
+    assert_eq!(report.counts.len(), 8);
     let repeat = guest
         .banto_driver_diagnostics_v1()
         .call_diagnose_next(&mut store, conn, &specs, None)?
@@ -293,7 +294,7 @@ fn sd_refusal_is_unknown_and_an_abandoned_step_poisoned_until_reconnect() -> was
             .connection()
             .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))?
             .expect("ready");
-        let specs = vec![spec("M10", "bit")];
+        let specs = vec![spec("F0", "bit")];
         let first = guest
             .banto_driver_diagnostics_v1()
             .call_diagnose_next(&mut store, conn, &specs, None)?
@@ -331,6 +332,58 @@ fn sd_refusal_is_unknown_and_an_abandoned_step_poisoned_until_reconnect() -> was
                 .is_err());
         }
     }
+    let conn = guest
+        .banto_driver_session()
+        .connection()
+        .call_create(&mut store, &settings)?
+        .expect("fresh connection");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, None)?
+        .expect("0101");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+        .expect("D/W");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(
+            &mut store,
+            conn,
+            Some(&response(2, &[100, 0, 0, 0, 0, 0, 0, 0])),
+        )?
+        .expect("ready");
+    let specs = vec![spec("F0", "bit")];
+    assert!(matches!(
+        guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("send"),
+        Progress::Send(_)
+    ));
+    // A wrong serial must be fatal and cannot be retried on this resource.
+    assert!(guest
+        .banto_driver_diagnostics_v1()
+        .call_diagnose_next(&mut store, conn, &specs, Some(&response(4, &[0; 28])))?
+        .is_err());
+    assert!(guest
+        .banto_driver_diagnostics_v1()
+        .call_diagnose_next(&mut store, conn, &specs, None)?
+        .is_err());
+    let fresh = guest
+        .banto_driver_session()
+        .connection()
+        .call_create(&mut store, &settings)?
+        .expect("reconnect");
+    assert!(guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, fresh, None)?
+        .expect("fresh 0101")
+        .is_some());
     Ok(())
 }
 
@@ -407,5 +460,480 @@ fn q_exact_bit_boundary_and_saturated_m_prefix_are_distinct() -> wasmtime::Resul
     assert!(matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
     assert!(matches!(report.tags[2].verdict, TagVerdict::Inside(_)));
     assert!(matches!(report.tags[3].verdict, TagVerdict::Unknown(_)));
+    Ok(())
+}
+
+#[test]
+fn q_x_exact_count_uses_the_existing_five_word_request() -> wasmtime::Result<()> {
+    use diagnostic_host::banto::driver::types::Setting;
+    use diagnostic_host::exports::banto::driver::diagnostics_v1::{
+        CountBound, Progress, TagVerdict,
+    };
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest =
+        diagnostic_host::DriverWithDiagnosticsV1::instantiate(&mut store, &component, &linker)?;
+    let settings = vec![
+        Setting {
+            key: "host".into(),
+            value: "fixture.invalid".into(),
+        },
+        Setting {
+            key: "port".into(),
+            value: "5000".into(),
+        },
+        Setting {
+            key: "word_order".into(),
+            value: "high_low".into(),
+        },
+    ];
+    let conn = guest
+        .banto_driver_session()
+        .connection()
+        .call_create(&mut store, &settings)?
+        .expect("create");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, None)?
+        .expect("0101");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, Some(&model_response("Q02UCPU", 0x0263)))?
+        .expect("D/W SD");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, Some(&response(2, &[100, 0, 100, 0])))?
+        .expect("ready");
+    let specs = vec![spec("X7FFF", "bit"), spec("X8000", "bit")];
+    let Progress::Send(step) = guest
+        .banto_driver_diagnostics_v1()
+        .call_diagnose_next(&mut store, conn, &specs, None)?
+        .expect("send")
+    else {
+        panic!("Q X needs a count")
+    };
+    assert_eq!(&step.send[19..25], &[0x22, 1, 0, 0xa9, 5, 0]); // SD290, five words.
+    let mut words = Vec::new();
+    for word in [32768u16, 0, 0, 0, 0] {
+        words.extend_from_slice(&word.to_le_bytes());
+    }
+    let Progress::Done(report) = guest
+        .banto_driver_diagnostics_v1()
+        .call_diagnose_next(&mut store, conn, &specs, Some(&response(3, &words)))?
+        .expect("done")
+    else {
+        panic!("one request")
+    };
+    let x = report
+        .counts
+        .iter()
+        .find(|count| count.area == "X")
+        .expect("X count");
+    assert_eq!(x.source, "SD290");
+    assert!(matches!(x.bound, CountBound::Exact(32768)));
+    assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
+    assert!(matches!(
+        guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("cached"),
+        Progress::Done(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn r_sb_f_counts_are_low_high_and_family_specific() -> wasmtime::Result<()> {
+    use diagnostic_host::banto::driver::types::Setting;
+    use diagnostic_host::exports::banto::driver::diagnostics_v1::{
+        CountBound, Progress, TagVerdict,
+    };
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest =
+        diagnostic_host::DriverWithDiagnosticsV1::instantiate(&mut store, &component, &linker)?;
+    let settings = vec![
+        Setting {
+            key: "host".into(),
+            value: "fixture.invalid".into(),
+        },
+        Setting {
+            key: "port".into(),
+            value: "5000".into(),
+        },
+        Setting {
+            key: "word_order".into(),
+            value: "high_low".into(),
+        },
+    ];
+    let conn = guest
+        .banto_driver_session()
+        .connection()
+        .call_create(&mut store, &settings)?
+        .expect("create");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, None)?
+        .expect("0101");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+        .expect("D/W SD");
+    guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(
+            &mut store,
+            conn,
+            Some(&response(2, &[100, 0, 0, 0, 0, 0, 0, 0])),
+        )?
+        .expect("ready");
+    let mut specs = vec![
+        spec("SB10001", "bit"),
+        spec("SB10002", "bit"),
+        spec("F2", "bit"),
+        spec("F3", "bit"),
+        spec("X0", "bit"),
+    ];
+    specs.extend((0..251).map(|_| spec("F0", "bit")));
+    let mut too_many = specs.clone();
+    too_many.push(spec("F0", "bit"));
+    assert!(guest
+        .banto_driver_diagnostics_v1()
+        .call_diagnose_next(&mut store, conn, &too_many, None)?
+        .is_err());
+    let Progress::Send(step) = guest
+        .banto_driver_diagnostics_v1()
+        .call_diagnose_next(&mut store, conn, &specs, None)?
+        .expect("send")
+    else {
+        panic!("R SB/F need counts")
+    };
+    assert_eq!(&step.send[19..27], &[6, 1, 0, 0, 0xa9, 0, 14, 0]); // SD262, fourteen words.
+    let mut words = [0u16; 14];
+    words[6] = 2;
+    words[7] = 1; // SB count 0x00010002, independent of tag word_order.
+    words[8] = 3; // F decimal count.
+    let mut data = Vec::new();
+    for word in words {
+        data.extend_from_slice(&word.to_le_bytes());
+    }
+    let Progress::Done(report) = guest
+        .banto_driver_diagnostics_v1()
+        .call_diagnose_next(&mut store, conn, &specs, Some(&response(3, &data)))?
+        .expect("done")
+    else {
+        panic!("one request")
+    };
+    let sb = report
+        .counts
+        .iter()
+        .find(|count| count.area == "SB")
+        .expect("SB count");
+    let f = report
+        .counts
+        .iter()
+        .find(|count| count.area == "F")
+        .expect("F count");
+    assert_eq!(sb.source, "SD268-269");
+    assert_eq!(f.source, "SD270-271");
+    assert!(matches!(sb.bound, CountBound::Exact(65538)));
+    assert!(matches!(f.bound, CountBound::Exact(3)));
+    assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
+    assert!(matches!(report.tags[2].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[3].verdict, TagVerdict::Outside(_)));
+    assert!(matches!(report.tags[4].verdict, TagVerdict::Unknown(_)));
+    assert_eq!(report.tags.len(), 256);
+    assert!(matches!(
+        guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("cached"),
+        Progress::Done(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn r_sb_and_f_each_trigger_one_existing_bounded_request() -> wasmtime::Result<()> {
+    use diagnostic_host::banto::driver::types::Setting;
+    use diagnostic_host::exports::banto::driver::diagnostics_v1::{Progress, TagVerdict};
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest =
+        diagnostic_host::DriverWithDiagnosticsV1::instantiate(&mut store, &component, &linker)?;
+    let settings = vec![
+        Setting {
+            key: "host".into(),
+            value: "fixture.invalid".into(),
+        },
+        Setting {
+            key: "port".into(),
+            value: "5000".into(),
+        },
+    ];
+    for area in ["SB", "F"] {
+        let conn = guest
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("create");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("D/W");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[100, 0, 0, 0, 0, 0, 0, 0])),
+            )?
+            .expect("ready");
+        let specs = vec![spec(&format!("{area}0"), "bit")];
+        let Progress::Send(step) = guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("send")
+        else {
+            panic!("{area} must trigger SD")
+        };
+        assert_eq!(&step.send[19..27], &[6, 1, 0, 0, 0xa9, 0, 14, 0]);
+        let mut words = [0u16; 14];
+        words[if area == "SB" { 6 } else { 8 }] = 1;
+        let mut data = Vec::new();
+        for word in words {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        let Progress::Done(report) = guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, Some(&response(3, &data)))?
+            .expect("done")
+        else {
+            panic!("one request")
+        };
+        assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+        assert!(matches!(
+            guest
+                .banto_driver_diagnostics_v1()
+                .call_diagnose_next(&mut store, conn, &specs, None)?
+                .expect("cached"),
+            Progress::Done(_)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn handshake_acquired_bit_sd_is_reused_for_new_diagnostic_areas() -> wasmtime::Result<()> {
+    use diagnostic_host::banto::driver::types::Setting;
+    use diagnostic_host::exports::banto::driver::diagnostics_v1::{
+        CountBound, Progress, TagVerdict,
+    };
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest =
+        diagnostic_host::DriverWithDiagnosticsV1::instantiate(&mut store, &component, &linker)?;
+    let settings = vec![
+        Setting {
+            key: "host".into(),
+            value: "fixture.invalid".into(),
+        },
+        Setting {
+            key: "port".into(),
+            value: "5000".into(),
+        },
+        Setting {
+            key: "d_u16_write_mode".into(),
+            value: "enabled".into(),
+        },
+        Setting {
+            key: "d_u16_write_allowlist".into(),
+            value: "M0-M0".into(),
+        },
+    ];
+    for (name, code, q) in [("Q02UCPU", 0x0263, true), ("R04CPU", 0x4800, false)] {
+        let conn = guest
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("create");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+            .expect("D/W");
+        let dw = if q {
+            vec![100, 0, 100, 0]
+        } else {
+            vec![100, 0, 0, 0, 0, 0, 0, 0]
+        };
+        let step = guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))?
+            .expect("bit SD")
+            .expect("step");
+        assert_eq!(
+            &step.send[19..22],
+            if q { &[0x22, 1, 0] } else { &[6, 1, 0] }
+        );
+        let mut words = vec![0u16; if q { 5 } else { 14 }];
+        if q {
+            words[0] = 8;
+        } else {
+            words[8] = 3;
+        }
+        let mut data = Vec::new();
+        for word in words {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(3, &data)))??
+            .is_none());
+        let specs = if q {
+            vec![spec("X7", "bit"), spec("X8", "bit")]
+        } else {
+            vec![spec("SB0", "bit"), spec("F2", "bit"), spec("F3", "bit")]
+        };
+        let Progress::Done(report) = guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("cached diagnosis")
+        else {
+            panic!("handshake SD must be reused")
+        };
+        if q {
+            assert!(matches!(
+                report
+                    .counts
+                    .iter()
+                    .find(|count| count.area == "X")
+                    .unwrap()
+                    .bound,
+                CountBound::Exact(8)
+            ));
+            assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+            assert!(matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
+        } else {
+            assert!(matches!(
+                report
+                    .counts
+                    .iter()
+                    .find(|count| count.area == "SB")
+                    .unwrap()
+                    .bound,
+                CountBound::Exact(0)
+            ));
+            assert!(matches!(report.tags[0].verdict, TagVerdict::Outside(_)));
+            assert!(matches!(report.tags[1].verdict, TagVerdict::Inside(_)));
+            assert!(matches!(report.tags[2].verdict, TagVerdict::Outside(_)));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn inapplicable_and_unrecognized_models_do_not_request_bit_sd() -> wasmtime::Result<()> {
+    use diagnostic_host::banto::driver::types::Setting;
+    use diagnostic_host::exports::banto::driver::diagnostics_v1::{Progress, TagVerdict};
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest =
+        diagnostic_host::DriverWithDiagnosticsV1::instantiate(&mut store, &component, &linker)?;
+    let settings = vec![
+        Setting {
+            key: "host".into(),
+            value: "fixture.invalid".into(),
+        },
+        Setting {
+            key: "port".into(),
+            value: "5000".into(),
+        },
+    ];
+    for (name, code, specs, dw) in [
+        (
+            "Q02UCPU",
+            0x0263,
+            vec![spec("SB0", "bit"), spec("F0", "bit")],
+            Some(vec![100, 0, 100, 0]),
+        ),
+        (
+            "R04CPU",
+            0x4800,
+            vec![spec("X0", "bit")],
+            Some(vec![100, 0, 0, 0, 0, 0, 0, 0]),
+        ),
+        (
+            "Q25PRHCPU",
+            0x004c,
+            vec![spec("X0", "bit")],
+            Some(vec![100, 0, 100, 0]),
+        ),
+        ("Q02UCPU", 0x9999, vec![spec("X0", "bit")], None),
+    ] {
+        let conn = guest
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("create");
+        guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        let step = guest
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+            .expect("model");
+        if let Some(dw) = dw {
+            assert!(step.is_some());
+            assert!(guest
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))??
+                .is_none());
+        } else {
+            assert!(step.is_none());
+        }
+        let Progress::Done(report) = guest
+            .banto_driver_diagnostics_v1()
+            .call_diagnose_next(&mut store, conn, &specs, None)?
+            .expect("no SD for inapplicable area")
+        else {
+            panic!("unexpected bit SD request")
+        };
+        assert!(report
+            .tags
+            .iter()
+            .all(|tag| matches!(tag.verdict, TagVerdict::Unknown(_))));
+    }
     Ok(())
 }

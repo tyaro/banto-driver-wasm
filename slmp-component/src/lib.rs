@@ -56,6 +56,7 @@ struct SlmpConnection {
     phase: RefCell<Phase>,
     w_count: Cell<PointCount>,
     bit_counts: Cell<[PointCount; 4]>, // M, Y, L, B; only same-connection SD evidence.
+    diagnostic_bit_counts: Cell<[PointCount; 3]>, // X, SB, F; never a write grant.
     pending: RefCell<BTreeMap<u16, PendingRead>>,
     pending_write: RefCell<Option<PendingWrite>>,
     write_poisoned: Cell<bool>,
@@ -922,6 +923,7 @@ impl session::GuestConnection for SlmpConnection {
             phase: RefCell::new(Phase::Start),
             w_count: Cell::new(PointCount::Unknown),
             bit_counts: Cell::new([PointCount::Unknown; 4]),
+            diagnostic_bit_counts: Cell::new([PointCount::Unknown; 3]),
             pending: RefCell::new(BTreeMap::new()),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
@@ -1081,26 +1083,7 @@ impl session::GuestConnection for SlmpConnection {
                     }
                 };
                 if let Some(words) = decoded {
-                    let evidence = BasicEvidence {
-                        route_confirmed: true,
-                        r_firmware: None,
-                    };
-                    let counts = if model.family == ModelFamily::StandardQ {
-                        [
-                            basic_sd_count(&model, BasicArea::M, evidence, words.get(2..3)),
-                            basic_sd_count(&model, BasicArea::Y, evidence, words.get(1..2)),
-                            basic_sd_count(&model, BasicArea::L, evidence, words.get(3..4)),
-                            basic_sd_count(&model, BasicArea::B, evidence, words.get(4..5)),
-                        ]
-                    } else {
-                        [
-                            basic_sd_count(&model, BasicArea::M, evidence, words.get(2..4)),
-                            basic_sd_count(&model, BasicArea::Y, evidence, words.get(0..2)),
-                            basic_sd_count(&model, BasicArea::L, evidence, words.get(12..14)),
-                            basic_sd_count(&model, BasicArea::B, evidence, words.get(4..6)),
-                        ]
-                    };
-                    self.bit_counts.set(counts);
+                    diagnostics::update_bit_counts(self, &model, &words);
                 }
                 *self.phase.borrow_mut() = Phase::Ready {
                     model,
