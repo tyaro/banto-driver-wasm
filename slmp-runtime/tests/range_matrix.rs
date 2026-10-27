@@ -214,6 +214,14 @@ fn run(
             "unsupported" | "outside" => {
                 assert!(!planned, "{} {address} {kind} but planned", model.0)
             }
+            // Missing, refused or prefix-only evidence keeps the explicit
+            // one-tag read; only Q W beyond its SD303 prefix has no path.
+            "unknown" => assert_eq!(
+                planned,
+                *reason != Q_W_PREFIX,
+                "{} {address} unknown ({reason}) plan",
+                model.0
+            ),
             _ => {}
         }
         let dw = address.starts_with('D') || address.starts_with('W');
