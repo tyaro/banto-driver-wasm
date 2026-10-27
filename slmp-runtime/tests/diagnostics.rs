@@ -1082,8 +1082,8 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
                 tag.address
             );
         }
-        // The read path never turns a crossing tag into a value either: only
-        // tags this report proved inside may be planned.
+        // The read path never plans a tag this report found outside. Unknown
+        // tags on a known wire may still be read explicitly by contract.
         let plans = guest
             .banto_driver_read()
             .call_plan(&mut store, conn, &specs[..6])?
