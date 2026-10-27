@@ -6,7 +6,7 @@ const cases = [
   ['main push', 'push', ['docs/PLAN.md'], [true, true, true]],
   ['missing diff', 'pull_request', null, [true, true, true]],
   ['empty diff', 'pull_request', [], [true, true, true]],
-  ['docs only', 'pull_request', ['README.md', 'docs/STATUS.md'], [false, false, false]],
+  ['docs only', 'pull_request', ['README.md', 'docs/PLAN.md'], [false, false, false]],
   ['Modbus only', 'pull_request', ['drivers/modbus/src/lib.rs'], [false, true, false]],
   ['native comparison', 'pull_request', ['comparison/src/lib.rs'], [false, true, false]],
   ['WASM component', 'pull_request', ['component/src/lib.rs'], [false, true, false]],
