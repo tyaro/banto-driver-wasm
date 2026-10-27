@@ -14,11 +14,12 @@ use banto_slmp_read_core::{
     encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount,
     ReadSpan, ResponseError, Route, Series, TypeName, Values,
 };
-use exports::banto::driver::{address, config, read, session, write_v1};
+use exports::banto::driver::{address, config, diagnostics_v1, read, session, write_v1};
+mod diagnostics;
 mod write_policy;
 use write_policy::{WritePolicy, ALLOWLIST_KEY, MODE_KEY};
 
-wit_bindgen::generate!({ path: "../wit", world: "driver-with-write-v1" });
+wit_bindgen::generate!({ path: "../wit", world: "driver-with-write-and-diagnostics-v1" });
 
 struct Component;
 
@@ -58,6 +59,11 @@ struct SlmpConnection {
     pending: RefCell<BTreeMap<u16, PendingRead>>,
     pending_write: RefCell<Option<PendingWrite>>,
     write_poisoned: Cell<bool>,
+    pending_diagnostic: RefCell<Option<diagnostics::PendingDiagnostic>>,
+    diagnostic_poisoned: Cell<bool>,
+    bit_sd_attempted: Cell<bool>,
+    bit_sd_refused: Cell<bool>,
+    dw_sd_refused: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -322,6 +328,7 @@ impl SlmpConnection {
                     count: 14,
                 }
             };
+            self.bit_sd_attempted.set(true);
             let route = self.route();
             let series = known_series(&model).expect("standard Q/R model");
             let send = encode_read(route, series, span)
@@ -914,6 +921,11 @@ impl session::GuestConnection for SlmpConnection {
             pending: RefCell::new(BTreeMap::new()),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
+            pending_diagnostic: RefCell::new(None),
+            diagnostic_poisoned: Cell::new(false),
+            bit_sd_attempted: Cell::new(false),
+            bit_sd_refused: Cell::new(false),
+            dw_sd_refused: Cell::new(false),
         }))
     }
 
@@ -921,6 +933,11 @@ impl session::GuestConnection for SlmpConnection {
         &self,
         prev_response: Option<Vec<u8>>,
     ) -> Result<Option<session::Step>, FatalError> {
+        if self.pending_diagnostic.borrow().is_some() || self.diagnostic_poisoned.get() {
+            return Err(FatalError::Protocol(
+                "diagnostic response is pending; reconnect".into(),
+            ));
+        }
         let phase = std::mem::replace(&mut *self.phase.borrow_mut(), Phase::NoRange(None));
         match (phase, prev_response) {
             (Phase::Start, None) => {
@@ -975,6 +992,7 @@ impl session::GuestConnection for SlmpConnection {
                     Err(ResponseError::EndCode(_)) => {
                         // A PLC refusal leaves the count unknown, but the confirmed
                         // model still gives us a supported wire format for explicit reads.
+                        self.dw_sd_refused.set(true);
                         return self.finish_dw_discovery(model, PointCount::Unknown);
                     }
                     Err(error) => return Err(response_error(error)),
@@ -1049,7 +1067,10 @@ impl session::GuestConnection for SlmpConnection {
             ) => {
                 let decoded = match decode_read(route, span, &frame) {
                     Ok(Values::Words(words)) => Some(words),
-                    Err(ResponseError::EndCode(_)) => None,
+                    Err(ResponseError::EndCode(_)) => {
+                        self.bit_sd_refused.set(true);
+                        None
+                    }
                     Err(error) => return Err(response_error(error)),
                     Ok(Values::Bits(_)) => {
                         return Err(FatalError::Protocol("SD read returned bits".into()))
@@ -1120,8 +1141,17 @@ impl read::Guest for Component {
         specs: Vec<TagSpec>,
     ) -> Result<Vec<read::Planned>, FatalError> {
         let conn = conn.get::<SlmpConnection>();
-        if conn.pending_write.borrow().is_some() || conn.write_poisoned.get() {
+        if conn.pending_write.borrow().is_some()
+            || conn.write_poisoned.get()
+            || conn.pending_diagnostic.borrow().is_some()
+            || conn.diagnostic_poisoned.get()
+        {
             return Err(FatalError::Protocol("write response is pending".into()));
+        }
+        if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
+            return Err(FatalError::Protocol(
+                "diagnostic response is pending; reconnect".into(),
+            ));
         }
         let phase = conn.phase.borrow();
         let Phase::Ready { model, count } = &*phase else {
@@ -1240,6 +1270,11 @@ impl read::Guest for Component {
         response: Vec<u8>,
     ) -> Result<Vec<Result<Value, ItemError>>, FatalError> {
         let conn = conn.get::<SlmpConnection>();
+        if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
+            return Err(FatalError::Protocol(
+                "diagnostic response is pending; reconnect".into(),
+            ));
+        }
         let phase = conn.phase.borrow();
         let Phase::Ready { model, count } = &*phase else {
             return Err(FatalError::Protocol(
@@ -1359,6 +1394,11 @@ impl write_v1::Guest for Component {
         prev_response: Option<Vec<u8>>,
     ) -> Result<write_v1::WriteProgress, FatalError> {
         let conn = conn.get::<SlmpConnection>();
+        if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
+            return Err(FatalError::Protocol(
+                "diagnostic response is pending; reconnect".into(),
+            ));
+        }
         if let Some(response) = prev_response {
             // Consume before parsing so a malformed or refused ACK cannot be retried.
             conn.write_poisoned.set(true);

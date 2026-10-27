@@ -48,10 +48,12 @@ const allowed = new Set([
   'slmp-component/Cargo.toml',
   'slmp-component/Cargo.lock',
   'slmp-component/src/lib.rs',
+  'slmp-component/src/diagnostics.rs',
   'slmp-component/src/write_policy.rs',
   'slmp-runtime/Cargo.toml',
   'slmp-runtime/Cargo.lock',
   'slmp-runtime/src/lib.rs',
+  'slmp-runtime/tests/diagnostics.rs',
   'comparison/Cargo.toml',
   'comparison/Cargo.lock',
   'comparison/src/lib.rs',
@@ -64,6 +66,7 @@ const allowed = new Set([
   'runtime-comparison/src/lib.rs',
   'wit/driver.wit',
   'wit/write-v1.wit',
+  'wit/diagnostics-v1.wit',
 ]);
 function checkTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

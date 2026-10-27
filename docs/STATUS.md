@@ -1,5 +1,11 @@
 # STATUS
 
+## Local optional SLMP diagnostics-v1 stage (2026-10-26, unmerged)
+
+- Built from merged main `94f65e4a534a864fdd5f56af68ef2dc7a562a8bd`. Added a separately versioned diagnostics interface and read-only/combined worlds without changing the existing `driver` or `driver-with-write-v1` definitions. The guest borrows the same connection resource and reports raw/display CPU identity, D/W and M/Y/L/B count evidence, exact/at-least/unknown scope, and one reasoned verdict per input tag. Invalid syntax and unsupported guest paths remain distinct from a range-unknown result.
+- Diagnostic calls accept at most 256 tags and at most one extra same-connection SD request, Q SD290-294 or R SD262-275, when M/Y/L/B evidence is needed. D/W handshake evidence is reused. Other areas remain unknown in this v1 rather than receiving inferred ranges. A pending diagnostic excludes handshake/read/write; an abandoned or malformed response requires connection disposal. Hub owns I/O, connection generation, attempt token, presentation, quality and audit. Existing read/write allowlists and read optimization issue #871 are unchanged.
+- Local Rust 1.98.1 checks passed: guest 18 unit and one doc test, 30 existing and four new real Wasmtime controlled fixtures, strict Clippy/fmt, wasm32 component build/validation and all four WIT world target checks, scaffold and 17 CI-classification cases, and `git diff --check`. A SHA-matched prior guest component binds to the old world and lacks the new diagnostic world; the new guest binds to all four. Host integration, hosted CI, and PLC communication remain unverified.
+
 ## Local typed-word and bit-write stage (2026-10-26, unpublished)
 
 - Based on merged main `9c7d9ec87a467be779e94b0dd3670e566f2e917c`, an isolated worktree extends the existing disabled-by-default common write policy without changing WIT. D/W accept numeric `i16/u16/i32/u32/i64/u64/f32/f64` with full 1/2/4-word spans and both word orders. M/Y/L/B accept Bool bit points with Q/R 1401 bit-unit frames. Existing saved D/W ranges do not grant bit access; D3000/D3001 protection, preflight of the entire request, and no replay after an uncertain ACK remain.
