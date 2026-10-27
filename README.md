@@ -2,12 +2,12 @@
 
 ## 現在の実装と適用範囲
 
-2026-10-27 の main `b3d944f` には PR #32–#35 がマージ済みです。以下はゲストと I/O を持たないコアの能力です。ゲストの制御フィクスチャと独立 Wasmtime 検証に加え、後述の範囲は模擬 Hub 結合試験を通過しています。実機 PLC と本番配置は未検証です。
+2026-10-27 の main `b3d944f` には PR #32–#35 がマージ済みです。その後、Modbus の 4xxxx.N register-bit write を FC22 マスク書込みとして追加しました（Hub の固定 #35 には含まれません）。以下はゲストと I/O を持たないコアの能力です。ゲストの制御フィクスチャと独立 Wasmtime 検証に加え、後述の範囲は模擬 Hub 結合試験を通過しています。実機 PLC と本番配置は未検証です。
 
 | 対象 | 現在のゲスト能力 | 制限 |
 | --- | --- | --- |
-| Modbus TCP | FC1/FC2 の Bool、FC3/FC4 の `i16/u16/i32/u32/i64/u64/f32/f64`、3xxxx/4xxxx の `.0`–`.15` register-bit Bool を読取る。FC3/FC4 の設定済み 1 レジスタ probe を接続 handshake で実行する | register-bit write は、holding register でも送信前にバッチ全体を `Unsupported` とする |
-| Modbus TCP 書込み | 任意の `write-v1` world で FC5 単一 coil または FC16 連続 holding words | 初期値 `write_mode=disabled`。`enabled` と要求全体を含む明示 `write_allowlist` の両方が必要。Hub の保存済み運用ポリシー・権限・監査は独立した第二ゲート。tyaro/banto-industrial#881 の模擬結合試験で FC5/FC16 と拒否経路を確認済み |
+| Modbus TCP | FC1/FC2 の Bool、FC3/FC4 の `i16/u16/i32/u32/i64/u64/f32/f64`、3xxxx/4xxxx の `.0`–`.15` register-bit Bool を読取る。FC3/FC4 の設定済み 1 レジスタ probe を接続 handshake で実行する | 3xxxx.N（入力レジスタ）の bit は読取り専用 |
+| Modbus TCP 書込み | 任意の `write-v1` world で FC5 単一 coil、FC16 連続 holding words、または FC22 マスク書込みによる 4xxxx.N 単一 bit | 初期値 `write_mode=disabled`。`enabled` と要求全体を含む明示 `write_allowlist` の両方が必要。Hub の保存済み運用ポリシー・権限・監査は独立した第二ゲート。tyaro/banto-industrial#881 の模擬結合試験で FC5/FC16 と拒否経路を確認済み。FC22 の register-bit write は Hub で未検証で、FC22 非対応機器では項目単位の `Device` エラーになる |
 | SLMP | 既知 Q/R 系列の明示タグについて、D/W 等の数値 8 型、対応 bit エリアの Bool、機種別に実装した timer/counter・ZR・D word-bit を読取る。任意の diagnostics-v1 は標準 Q X、標準 R SB/F の点数を報告する | `Unknown` は範囲の保証ではない。既知 wire 系列の範囲不明タグは明示的な単独読取りに限り、未知の型式・経路や確定範囲外を推測して読まない。診断点数は読書き許可を広げない |
 | SLMP 書込み | ゲスト内の既定無効ポリシーで D/W 数値・M/Y/L/B Bool を検証する制御試作 | 明示 allowlist、同一接続の SD 根拠、Hub の独立運用ゲートが必要。tyaro/banto-industrial#885 は #34 固定の模擬受入れで既存ポリシーを回帰確認。Hub の CI の固定は tyaro/banto-industrial#887 で #35 `b3d944f5` に置き換え。V edge relay は周期収集タグから意図的に除外する |
 

@@ -175,7 +175,7 @@ mod tests {
         let valid: JsonValue =
             serde_json::from_str(include_str!("../../component/manifest.json")).unwrap();
         assert_eq!(manifest_settings_version(&valid), Ok(1));
-        assert_eq!(valid["version"], "0.4.0");
+        assert_eq!(valid["version"], "0.5.0");
         assert_eq!(valid["hubApi"], "1");
         assert_eq!(
             valid["displayName"],
@@ -1054,7 +1054,7 @@ mod write_runtime {
     wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-write-v1" });
 
     #[test]
-    fn real_component_register_bit_write_world_rejects_before_send() -> wasmtime::Result<()> {
+    fn real_component_register_bit_write_world_uses_one_fc22_mask_write() -> wasmtime::Result<()> {
         use banto::driver::types::{ItemError, Setting, TagSpec, Value};
         use exports::banto::driver::write_v1::{WriteItem, WriteProgress};
         let path = std::env::var("BANTO_COMPONENT_WASM")?;
@@ -1153,19 +1153,51 @@ mod write_runtime {
             },
             value: Value::Uint(7),
         };
+        let input_bit = WriteItem {
+            spec: input_spec[0].clone(),
+            value: Value::Bool(true),
+        };
+        let outside_bit = WriteItem {
+            spec: TagSpec {
+                address: "40011.0".into(),
+                data_type: "bool".into(),
+                string_words: None,
+            },
+            value: Value::Bool(true),
+        };
         for items in [
-            vec![bit.clone()],
             vec![word.clone(), bit.clone()],
             vec![bit.clone(), word.clone()],
+            vec![bit.clone(), bit.clone()],
+            vec![input_bit],
+            vec![outside_bit],
         ] {
             let progress = driver
                 .banto_driver_write_v1()
                 .call_write_next(&mut store, conn, &items, None)?
                 .unwrap();
             assert!(
-                matches!(progress, WriteProgress::Done(results) if results.len() == items.len() && results.iter().all(|result| matches!(result, Err(ItemError::Unsupported(_)))))
+                matches!(progress, WriteProgress::Done(results) if results.len() == items.len() && results.iter().all(|result| matches!(result, Err(ItemError::Rejected(_)))))
             );
         }
+        let items = [bit];
+        let WriteProgress::Send(planned) = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, None)?
+            .unwrap()
+        else {
+            panic!("FC22 request expected");
+        };
+        // FC22 sets only bit 3: AND=0xFFF7, OR=0x0008 at offset zero.
+        assert_eq!(
+            &planned.step.send[2..],
+            &[0, 0, 0, 8, 1, 22, 0, 0, 0xff, 0xf7, 0, 8]
+        );
+        assert_eq!(planned.covers, [0]);
+        let ack = planned.step.send.clone();
+        assert!(
+            matches!(driver.banto_driver_write_v1().call_write_next(&mut store, conn, &items, Some(&ack))?, Ok(WriteProgress::Done(results)) if matches!(results.as_slice(), [Ok(())]))
+        );
         conn.resource_drop(&mut store)?;
         Ok(())
     }
