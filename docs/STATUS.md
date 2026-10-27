@@ -4,7 +4,7 @@
 
 ## 現行スナップショット（2026-10-27）
 
-- `origin/main` は #38 `f53c8a1`（文書の参照先修正）。#32（Modbus 基本）、#33（register-bit read）、#34 `c9cf3b8`（V 周期収集除外）、#35 `b3d944f`（Q X / R SB・F 診断）、#37（Hub が guest に委ねた SLMP 書込み・診断範囲の境界試験）はマージ済み。
+- `origin/main` は #39 `ded43c5`（STATUS を現状と残件に絞る文書整理）。#38 `f53c8a1`（文書の参照先修正）、#32（Modbus 基本）、#33（register-bit read）、#34 `c9cf3b8`（V 周期収集除外）、#35 `b3d944f`（Q X / R SB・F 診断）、#37（Hub が guest に委ねた SLMP 書込み・診断範囲の境界試験）はマージ済み。
 - Modbus guest: FC1/FC2 Bool、FC3/FC4 `i16/u16/i32/u32/i64/u64/f32/f64` と 3xxxx/4xxxx `.0`–`.15` Bool を読取る。FC3/FC4 probe は接続 handshake。任意の FC5 単一 coil / FC16 contiguous holding write は `write_mode=enabled` と要求全体を覆う明示 `write_allowlist` を要し、初期値は無効。register-bit write は意図的に送信前 `Unsupported`。
 - SLMP guest: 既知 Q/R wire 系列の明示タグ、D/W などの数値 8 型と対応 bit Bool、機種別に確認した読取り経路、既定無効の D/W 数値・M/Y/L/B Bool 書込み試作、任意の diagnostics-v1 を持つ。`Unknown` 範囲は成功読取り後も確定しない。型式・wire が不明なら読取りを送らず、書込みは SD 根拠が不明なら拒否する。V edge relay は周期収集で見逃すため登録から除外する。#35 診断は点数を報告するだけで読書き権限を広げない。
 - Hub の保存済み運用ポリシー、権限・監査は guest とは独立した第二ゲート。manifest の `capabilities` は認可ではない。
