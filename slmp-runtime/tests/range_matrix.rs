@@ -75,41 +75,21 @@ impl Fixture {
         Ok(Self { store, guest })
     }
 
-    /// Run 0101, the D/W SD handshake and one diagnostic attempt on a fresh
-    /// connection. `bit_sd` answers the bounded bit-count request when the
-    /// guest sends one; `None` inside answers it with a PLC refusal.
+    /// Plan on a fresh connection that has D/W evidence only, then run one
+    /// diagnostic attempt and plan again on a second fresh connection.
+    /// `bit_sd` answers the bounded bit-count request when the guest sends
+    /// one; `None` inside answers it with a PLC refusal.
     fn diagnose(
         &mut self,
         model: (&str, u16),
         dw_sd: Option<&[u16]>,
         bit_sd: Option<Option<&[u16]>>,
         specs: &[TagSpec],
-    ) -> wasmtime::Result<(Report, Vec<u32>)> {
-        let settings =
-            [("host", "fixture.invalid"), ("port", "5000")].map(|(key, value)| Setting {
-                key: key.into(),
-                value: value.into(),
-            });
-        let session = self.guest.banto_driver_session().connection();
-        let conn: ResourceAny = session
-            .call_create(&mut self.store, &settings)?
-            .expect("create");
-        session
-            .call_handshake_next(&mut self.store, conn, None)?
-            .expect("0101")
-            .expect("0101 step");
-        session
-            .call_handshake_next(
-                &mut self.store,
-                conn,
-                Some(&model_response(model.0, model.1)),
-            )?
-            .expect("D/W SD request")
-            .expect("D/W SD step");
-        assert!(session
-            .call_handshake_next(&mut self.store, conn, Some(&words_response(2, dw_sd)))?
-            .expect("ready")
-            .is_none());
+    ) -> wasmtime::Result<(Report, Vec<u32>, Vec<u32>)> {
+        let conn = self.ready(model, dw_sd)?;
+        let before = self.covers(conn, specs)?;
+        conn.resource_drop(&mut self.store)?;
+        let conn = self.ready(model, dw_sd)?;
         let diagnostics = self.guest.banto_driver_diagnostics_v1();
         let report = match diagnostics
             .call_diagnose_next(&mut self.store, conn, specs, None)?
@@ -135,16 +115,54 @@ impl Fixture {
                 report
             }
         };
-        let covered = self
+        let after = self.covers(conn, specs)?;
+        conn.resource_drop(&mut self.store)?;
+        Ok((report, before, after))
+    }
+
+    /// Run 0101 and the D/W SD handshake to Ready on a fresh connection.
+    fn ready(
+        &mut self,
+        model: (&str, u16),
+        dw_sd: Option<&[u16]>,
+    ) -> wasmtime::Result<ResourceAny> {
+        let settings =
+            [("host", "fixture.invalid"), ("port", "5000")].map(|(key, value)| Setting {
+                key: key.into(),
+                value: value.into(),
+            });
+        let session = self.guest.banto_driver_session().connection();
+        let conn: ResourceAny = session
+            .call_create(&mut self.store, &settings)?
+            .expect("create");
+        session
+            .call_handshake_next(&mut self.store, conn, None)?
+            .expect("0101")
+            .expect("0101 step");
+        session
+            .call_handshake_next(
+                &mut self.store,
+                conn,
+                Some(&model_response(model.0, model.1)),
+            )?
+            .expect("D/W SD request")
+            .expect("D/W SD step");
+        assert!(session
+            .call_handshake_next(&mut self.store, conn, Some(&words_response(2, dw_sd)))?
+            .expect("ready")
+            .is_none());
+        Ok(conn)
+    }
+
+    fn covers(&mut self, conn: ResourceAny, specs: &[TagSpec]) -> wasmtime::Result<Vec<u32>> {
+        Ok(self
             .guest
             .banto_driver_read()
             .call_plan(&mut self.store, conn, specs)?
             .expect("plan")
             .into_iter()
             .flat_map(|plan| plan.covers)
-            .collect();
-        conn.resource_drop(&mut self.store)?;
-        Ok((report, covered))
+            .collect())
     }
 }
 
@@ -173,7 +191,7 @@ fn run(
             string_words: None,
         })
         .collect();
-    let (report, covered) = fixture.diagnose(model, dw_sd, bit_sd, &specs)?;
+    let (report, before, after) = fixture.diagnose(model, dw_sd, bit_sd, &specs)?;
     assert_eq!(report.tags.len(), cases.len());
     for (index, (tag, (address, data_type, kind, reason))) in
         report.tags.iter().zip(cases).enumerate()
@@ -185,17 +203,27 @@ fn run(
             "{} {address}/{data_type}",
             model.0
         );
-        // An inside verdict needs a guest read path; an unsupported tag has
-        // none. Read planning uses only D/W counts, so only those outside
-        // verdicts also bind the plan.
-        let planned = covered.contains(&(index as u32));
+        // An inside verdict needs a guest read path; an unsupported or
+        // outside tag is never planned. Handshake-only D/W evidence already
+        // excludes D/W outside tags; a bit tag is excluded once the same
+        // connection holds its exact SD count, and is readable before that.
+        let index = index as u32;
+        let planned = after.contains(&index);
         match *kind {
             "inside" => assert!(planned, "{} {address} inside but unplanned", model.0),
-            "unsupported" => assert!(!planned, "{} {address} unsupported but planned", model.0),
-            "outside" if address.starts_with('D') || address.starts_with('W') => {
-                assert!(!planned, "{} {address} outside but planned", model.0)
+            "unsupported" | "outside" => {
+                assert!(!planned, "{} {address} {kind} but planned", model.0)
             }
             _ => {}
+        }
+        let dw = address.starts_with('D') || address.starts_with('W');
+        if *kind == "outside" {
+            assert_eq!(
+                before.contains(&index),
+                !dw,
+                "{} {address} plan before bit SD evidence",
+                model.0
+            );
         }
     }
     Ok(())
