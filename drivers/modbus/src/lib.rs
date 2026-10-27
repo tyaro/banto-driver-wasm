@@ -1,6 +1,6 @@
 //! A small, transport-free Modbus TCP core.
 //!
-//! This core frames FC1-FC4 reads and FC5/FC16 writes. It is not a
+//! This core frames FC1-FC4 reads and FC5/FC16/FC22 writes. It is not a
 //! `FrameDriver` or a WIT component. The Hub still owns I/O and the
 //! production Modbus driver.
 //! The shape is checked against the native implementation at
@@ -240,15 +240,51 @@ pub fn write_registers_request(
     Ok(frame)
 }
 
-/// Strict ACK validation for FC5 and FC16; exceptions remain item-level.
+/// FC22 AND/OR masks that change only `bit` of one holding register. The
+/// device applies `(current & and) | (or & !and)`, so the other 15 bits are
+/// preserved without a separate read.
+pub fn register_bit_masks(bit: u8, value: bool) -> Result<(u16, u16), RequestError> {
+    if bit > 15 {
+        return Err(RequestError::AddressRange);
+    }
+    let mask = 1u16 << bit;
+    Ok((!mask, if value { mask } else { 0 }))
+}
+
+/// FC22 mask-writes one holding register. A device that lacks FC22 answers
+/// with an exception, which remains item-level.
+pub fn mask_write_register_request(
+    transaction_id: u16,
+    unit_id: u8,
+    offset: u16,
+    and_mask: u16,
+    or_mask: u16,
+) -> [u8; 14] {
+    let [tid_hi, tid_lo] = transaction_id.to_be_bytes();
+    let [hi, lo] = offset.to_be_bytes();
+    let [and_hi, and_lo] = and_mask.to_be_bytes();
+    let [or_hi, or_lo] = or_mask.to_be_bytes();
+    [
+        tid_hi, tid_lo, 0, 0, 0, 8, unit_id, 22, hi, lo, and_hi, and_lo, or_hi, or_lo,
+    ]
+}
+
+/// Strict ACK validation for FC5, FC16 and FC22; exceptions remain
+/// item-level. `echo` is the request PDU after the function code: four bytes
+/// for FC5/FC16 and six for FC22.
 pub fn decode_write_ack(
     response: &[u8],
     transaction_id: u16,
     unit_id: u8,
     function: u8,
-    echo: [u8; 4],
+    echo: &[u8],
 ) -> Result<(), ReadError> {
-    if !matches!(function, 5 | 16) {
+    let echo_len = match function {
+        5 | 16 => 4,
+        22 => 6,
+        _ => return Err(ReadError::Protocol),
+    };
+    if echo.len() != echo_len {
         return Err(ReadError::Protocol);
     }
     if response.len() < 7 || response.len() > MAX_RESPONSE_LEN || response[2..4] != [0, 0] {
@@ -263,8 +299,10 @@ pub fn decode_write_ack(
     }
     match &response[7..] {
         [code, exception] if *code == (function | 0x80) => Err(ReadError::Device(*exception)),
-        [code, a, b, c, d] if *code == function && [*a, *b, *c, *d] == echo => Ok(()),
-        [code, ..] if *code == function && response.len() == 12 => Err(ReadError::Protocol),
+        [code, rest @ ..] if *code == function && rest == echo => Ok(()),
+        [code, rest @ ..] if *code == function && rest.len() == echo_len => {
+            Err(ReadError::Protocol)
+        }
         _ => Err(ReadError::Framing),
     }
 }
@@ -621,7 +659,7 @@ mod tests {
         let coil = write_coil_request(0x1234, 1, 65535, true);
         assert_eq!(coil, [0x12, 0x34, 0, 0, 0, 6, 1, 5, 255, 255, 255, 0]);
         assert_eq!(
-            decode_write_ack(&coil, 0x1234, 1, 5, [255, 255, 255, 0]),
+            decode_write_ack(&coil, 0x1234, 1, 5, &[255, 255, 255, 0]),
             Ok(())
         );
         let words = write_registers_request(0x1234, 1, 65534, &[0x1234, 0xabcd]).unwrap();
@@ -631,7 +669,7 @@ mod tests {
         );
         let ack = [0x12, 0x34, 0, 0, 0, 6, 1, 16, 255, 254, 0, 2];
         assert_eq!(
-            decode_write_ack(&ack, 0x1234, 1, 16, [255, 254, 0, 2]),
+            decode_write_ack(&ack, 0x1234, 1, 16, &[255, 254, 0, 2]),
             Ok(())
         );
         assert_eq!(
@@ -640,7 +678,7 @@ mod tests {
                 0x1234,
                 1,
                 16,
-                [255, 254, 0, 2]
+                &[255, 254, 0, 2]
             ),
             Err(ReadError::Device(2))
         );
@@ -651,7 +689,7 @@ mod tests {
             [0x12, 0x34, 0, 0, 0, 7, 1, 16, 255, 254, 0, 2],
             [0x12, 0x34, 0, 0, 0, 6, 1, 5, 255, 254, 0, 2],
         ] {
-            assert!(decode_write_ack(&bad, 0x1234, 1, 16, [255, 254, 0, 2]).is_err());
+            assert!(decode_write_ack(&bad, 0x1234, 1, 16, &[255, 254, 0, 2]).is_err());
         }
         assert_eq!(
             write_registers_request(1, 1, 65535, &[1, 2]),
@@ -664,6 +702,59 @@ mod tests {
         assert_eq!(
             write_registers_request(1, 1, 0, &[0; 124]),
             Err(RequestError::Count)
+        );
+    }
+
+    #[test]
+    fn fc22_mask_write_changes_one_bit_and_checks_full_echo() {
+        assert_eq!(register_bit_masks(0, true), Ok((0xfffe, 0x0001)));
+        assert_eq!(register_bit_masks(15, false), Ok((0x7fff, 0x0000)));
+        assert_eq!(
+            register_bit_masks(16, true),
+            Err(RequestError::AddressRange)
+        );
+        // The device result `(current & and) | (or & !and)` keeps other bits.
+        for bit in 0..16 {
+            for value in [false, true] {
+                let (and, or) = register_bit_masks(bit, value).unwrap();
+                for current in [0u16, 0xffff, 0xa5a5, 0x5a5a] {
+                    let result = (current & and) | (or & !and);
+                    assert_eq!(result & !(1 << bit), current & !(1 << bit));
+                    assert_eq!((result >> bit) & 1 != 0, value);
+                }
+            }
+        }
+        let frame = mask_write_register_request(0x1234, 1, 65535, 0xfff7, 0x0008);
+        assert_eq!(
+            frame,
+            [0x12, 0x34, 0, 0, 0, 8, 1, 22, 255, 255, 0xff, 0xf7, 0, 8]
+        );
+        let echo = &frame[8..14];
+        assert_eq!(decode_write_ack(&frame, 0x1234, 1, 22, echo), Ok(()));
+        assert_eq!(
+            decode_write_ack(&[0x12, 0x34, 0, 0, 0, 3, 1, 0x96, 1], 0x1234, 1, 22, echo),
+            Err(ReadError::Device(1))
+        );
+        let mut wrong_mask = frame;
+        wrong_mask[13] = 0;
+        assert_eq!(
+            decode_write_ack(&wrong_mask, 0x1234, 1, 22, echo),
+            Err(ReadError::Protocol)
+        );
+        assert_eq!(
+            decode_write_ack(&frame, 0x1234, 1, 22, &frame[8..12]),
+            Err(ReadError::Protocol)
+        );
+        for bad in [
+            &frame[..12],
+            &[0x12, 0x34, 0, 0, 0, 6, 1, 22, 255, 255, 0xff, 0xf7][..],
+            &[0x12, 0x34, 0, 0, 0, 8, 1, 16, 255, 255, 0xff, 0xf7, 0, 8][..],
+        ] {
+            assert!(decode_write_ack(bad, 0x1234, 1, 22, echo).is_err());
+        }
+        assert_eq!(
+            decode_write_ack(&frame, 0x1234, 1, 6, echo),
+            Err(ReadError::Protocol)
         );
     }
 

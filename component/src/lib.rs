@@ -5,9 +5,9 @@ use std::cell::{Cell, RefCell};
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_modbus_read_core::{
-    decode_write_ack, write_coil_request, write_registers_request, BitFunction, NumericKind,
-    NumericValue, ReadBit, ReadError, ReadHoldingNumeric, ReadRegisterBit, RegisterFunction,
-    WordOrder, MAX_RESPONSE_LEN,
+    decode_write_ack, mask_write_register_request, register_bit_masks, write_coil_request,
+    write_registers_request, BitFunction, NumericKind, NumericValue, ReadBit, ReadError,
+    ReadHoldingNumeric, ReadRegisterBit, RegisterFunction, WordOrder, MAX_RESPONSE_LEN,
 };
 use exports::banto::driver::{address, config, read, session, write_v1};
 
@@ -49,7 +49,7 @@ struct PendingWrite {
     count: usize,
     transaction_id: u16,
     function: u8,
-    echo: [u8; 4],
+    echo: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,13 +485,19 @@ fn numeric_words(kind: Kind, value: &Value, order: WordOrder) -> Result<Vec<u16>
     Ok(words)
 }
 
+/// Function code, request frame and the PDU bytes the ACK must echo.
+type WriteRequest = (u8, Vec<u8>, Vec<u8>);
+
 fn preflight_write(
     conn: &ModbusConnection,
     items: &[write_v1::WriteItem],
     transaction_id: u16,
-) -> Result<(u8, Vec<u8>, [u8; 4]), String> {
+) -> Result<WriteRequest, String> {
     if items.is_empty() || items.len() > 123 {
         return Err("write requires 1..123 items".into());
+    }
+    if let Some(request) = preflight_register_bit_write(conn, items, transaction_id)? {
+        return Ok(request);
     }
     let mut first = None;
     let mut area_kind = None;
@@ -528,7 +534,9 @@ fn preflight_write(
             TagKind::Numeric(kind, RegisterFunction::Holding) => {
                 words.extend(numeric_words(kind, &item.value, conn.word_order)?)
             }
-            TagKind::RegisterBit(_, _) => return Err("register-bit writes are unsupported".into()),
+            TagKind::RegisterBit(_, _) => {
+                return Err("register-bit writes require one point per request".into())
+            }
             _ => return Err("input-only area is not writable".into()),
         }
     }
@@ -552,33 +560,57 @@ fn preflight_write(
             start,
             coil.expect("checked coil value"),
         );
-        Ok((
-            5,
-            frame.to_vec(),
-            frame[8..12].try_into().expect("four echo bytes"),
-        ))
+        Ok((5, frame.to_vec(), frame[8..12].to_vec()))
     } else {
         let frame = write_registers_request(transaction_id, conn.unit_id, start, &words)
             .map_err(|_| "register write exceeds the FC16 count or address limit")?;
-        let mut echo = [0; 4];
-        echo[..2].copy_from_slice(&start.to_be_bytes());
-        echo[2..].copy_from_slice(&(words.len() as u16).to_be_bytes());
+        let mut echo = start.to_be_bytes().to_vec();
+        echo.extend_from_slice(&(words.len() as u16).to_be_bytes());
         Ok((16, frame, echo))
     }
+}
+
+/// A holding register bit is written alone with FC22, so the device changes
+/// only that bit. The word must lie in a holding allowlist interval.
+fn preflight_register_bit_write(
+    conn: &ModbusConnection,
+    items: &[write_v1::WriteItem],
+    transaction_id: u16,
+) -> Result<Option<WriteRequest>, String> {
+    let [item] = items else {
+        return Ok(None);
+    };
+    let (offset, kind) = parse_tag(
+        &item.spec.address,
+        &item.spec.data_type,
+        item.spec.string_words,
+    )?;
+    let TagKind::RegisterBit(function, bit) = kind else {
+        return Ok(None);
+    };
+    if function != RegisterFunction::Holding {
+        return Err("input-only area is not writable".into());
+    }
+    let Value::Bool(value) = item.value else {
+        return Err("register-bit write requires a Bool value".into());
+    };
+    if !conn
+        .write_allowlist
+        .iter()
+        .any(|range| range.area == Area::Holding && range.first <= offset && offset <= range.last)
+    {
+        return Err("write span is outside the enabled allowlist".into());
+    }
+    let (and_mask, or_mask) = register_bit_masks(bit, value).map_err(|_| "invalid register bit")?;
+    let frame =
+        mask_write_register_request(transaction_id, conn.unit_id, offset, and_mask, or_mask);
+    Ok(Some((22, frame.to_vec(), frame[8..14].to_vec())))
 }
 
 fn rejected_write(count: usize, message: &str) -> write_v1::WriteProgress {
     write_v1::WriteProgress::Done(
         (0..count)
             .map(|_| Err(ItemError::Rejected(message.into())))
-            .collect(),
-    )
-}
-
-fn unsupported_write(count: usize, message: &str) -> write_v1::WriteProgress {
-    write_v1::WriteProgress::Done(
-        (0..count)
-            .map(|_| Err(ItemError::Unsupported(message.into())))
             .collect(),
     )
 }
@@ -902,7 +934,7 @@ fn write_next_impl(
             pending.transaction_id,
             conn.unit_id,
             pending.function,
-            pending.echo,
+            &pending.echo,
         ) {
             Ok(()) => {
                 conn.write_poisoned.set(false);
@@ -942,21 +974,6 @@ fn write_next_impl(
     if items.is_empty() {
         return Err(FatalError::InvalidConfig(
             "write requires at least one item".into(),
-        ));
-    }
-    if items.iter().any(|item| {
-        matches!(
-            parse_tag(
-                &item.spec.address,
-                &item.spec.data_type,
-                item.spec.string_words
-            ),
-            Ok((_, TagKind::RegisterBit(_, _)))
-        )
-    }) {
-        return Ok(unsupported_write(
-            items.len(),
-            "register-bit writes are unsupported",
         ));
     }
     if !conn.write_enabled {
@@ -1051,7 +1068,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). Register-bit writes are unsupported. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
+        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write; 3xxxx.N is read-only. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
             .into()
     }
 
@@ -1321,13 +1338,75 @@ mod tests {
     }
 
     #[test]
-    fn register_bit_writes_are_unsupported_before_any_send() {
+    fn holding_register_bit_write_uses_one_fc22_mask_write() {
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.write_allowlist = parse_write_allowlist("400001-400010,000001-000010").unwrap();
+        for (address, value, offset, and_mask, or_mask) in [
+            ("40001.0", true, 0u16, 0xfffeu16, 0x0001u16),
+            ("40001.0", false, 0, 0xfffe, 0),
+            ("400010.15", true, 9, 0x7fff, 0x8000),
+            ("40005.3", false, 4, 0xfff7, 0),
+        ] {
+            let item = write_item(address, "bool", Value::Bool(value));
+            let (function, frame, echo) =
+                preflight_write(&conn, std::slice::from_ref(&item), 7).unwrap();
+            let expected = mask_write_register_request(7, 1, offset, and_mask, or_mask);
+            assert_eq!((function, frame.as_slice()), (22, &expected[..]));
+            assert_eq!(echo, &expected[8..14]);
+        }
+        let item = write_item("40002.3", "bool", Value::Bool(true));
+        let sent = write_next_impl(&conn, vec![item.clone()], None).unwrap();
+        let write_v1::WriteProgress::Send(planned) = sent else {
+            panic!("FC22 request expected");
+        };
+        assert_eq!(
+            planned.step.send,
+            [0, 0, 0, 0, 0, 8, 1, 22, 0, 1, 0xff, 0xf7, 0, 8]
+        );
+        assert_eq!(planned.covers, [0]);
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], Some(planned.step.send.clone())),
+            Ok(write_v1::WriteProgress::Done(results)) if matches!(results.as_slice(), [Ok(())])
+        ));
+        // A device without FC22 answers with an exception: item-level only.
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], Some(vec![0, 1, 0, 0, 0, 3, 1, 0x96, 1])),
+            Ok(write_v1::WriteProgress::Done(results))
+                if matches!(results.as_slice(), [Err(ItemError::Device(error))] if error.code == 1)
+        ));
+        // A different mask echo leaves the outcome uncertain and poisons writes.
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        assert!(matches!(
+            write_next_impl(
+                &conn,
+                vec![item.clone()],
+                Some(vec![0, 2, 0, 0, 0, 8, 1, 22, 0, 1, 0xff, 0xf7, 0, 0])
+            ),
+            Err(FatalError::Protocol(_))
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, vec![item], None),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn register_bit_writes_outside_one_allowed_holding_point_are_rejected_before_send() {
         for enabled in [false, true] {
             let mut conn = conn();
             conn.write_enabled = enabled;
             conn.write_allowlist = parse_write_allowlist("400001-400010,000001-000010").unwrap();
             for items in [
-                vec![write_item("40001.0", "bool", Value::Bool(true))],
+                vec![write_item("40011.0", "bool", Value::Bool(true))],
+                vec![write_item("40001.0", "bool", Value::Uint(1))],
                 vec![
                     write_item("40001", "u16", Value::Uint(1)),
                     write_item("40002.15", "bool", Value::Bool(true)),
@@ -1336,12 +1415,16 @@ mod tests {
                     write_item("40001.0", "bool", Value::Bool(false)),
                     write_item("40002", "u16", Value::Uint(2)),
                 ],
+                vec![
+                    write_item("40001.0", "bool", Value::Bool(false)),
+                    write_item("40001.1", "bool", Value::Bool(true)),
+                ],
                 vec![write_item("30001.15", "bool", Value::Bool(true))],
             ] {
                 assert!(preflight_write(&conn, &items, 0).is_err());
                 let progress = write_next_impl(&conn, items.clone(), None).unwrap();
                 assert!(
-                    matches!(progress, write_v1::WriteProgress::Done(results) if results.len() == items.len() && results.iter().all(|result| matches!(result, Err(ItemError::Unsupported(_)))))
+                    matches!(progress, write_v1::WriteProgress::Done(results) if results.len() == items.len() && results.iter().all(|result| matches!(result, Err(ItemError::Rejected(_)))))
                 );
                 assert_eq!(conn.next_transaction_id.get(), 0);
                 assert!(conn.pending_write.borrow().is_none());
