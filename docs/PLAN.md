@@ -4,7 +4,7 @@
 
 main `c9c3d83` では #32 Modbus 基本、#33 register-bit read、#34 SLMP V 周期収集除外、#35 標準 Q X / 標準 R SB・F 診断、#43 SLMP 範囲外 bit の読取り除外、#44 Modbus FC22 register-bit write がマージ済みです。Modbus は FC1/FC2 Bool、FC3/FC4 数値 8 型と register-bit Bool を読取り、任意の FC5/FC16 write-v1 と 4xxxx.N の FC22 register-bit write を既定無効のゲスト設定で制限します（FC22 は tyaro/banto-industrial#896 で模擬 Hub 受入れ済み）。SLMP は既知 Q/R の明示読取り、D/W 数値 8 型と対応 bit Bool、既定無効のゲスト書込み試作、任意の diagnostics-v1 を持ち、同じ接続の SD で exact 点数を得た bit 領域では範囲外のタグを読みません（#43 は tyaro/banto-industrial#895 で模擬 Hub 受入れ済み）。数値 8 型は `i16/u16/i32/u32/i64/u64/f32/f64`。現状と残件はローカルの引継ぎメモ `docs/STATUS.md`（git 追跡外）、個々の経緯は git 履歴と各 PR に残します。
 
-ゲスト実装と段階の製品完了は別です。Hub の CI が固定するのは SLMP・Modbus とも #44 の `c9c3d83` です。SLMP は tyaro/banto-industrial#895 で #35 `b3d944f5` から置き換え（#35 は tyaro/banto-industrial#887 で #34 `c9cf3b8` から置き換えた）、Modbus は tyaro/banto-industrial#896 で #33 `02a92645` から置き換えました。#35 診断は tyaro/banto-industrial#887、#43 の範囲外除外は tyaro/banto-industrial#895、FC22 register-bit write は tyaro/banto-industrial#896 で模擬受入れ済み。Modbus の保存済み書込みポリシー・運用ゲート・監査は tyaro/banto-industrial#881 の模擬結合試験で確認済みで、tyaro/banto-industrial#884 は register-bit 経路を確認済みです。SLMP #34 は tyaro/banto-industrial#885 の模擬受入れを通過しています。未検証なのは全型・全設定の網羅、実機 I/O、本番配置・資格情報、GUI、#35 診断の実機確認、条件付き範囲の追加証拠、文字列と配布 manifest の製品受入れです。manifest の `capabilities` は認可ではありません。SLMP `Unknown` は確定範囲と混同せず、未確定の機種・wire では安全側に送信を見送ります。V の周期収集除外は意図した現行制限で、修正必須項目ではありません。Modbus register-bit write は FC22 マスク書込みで 1 点ずつ送ります（3xxxx.N は読取り専用）。#35 は診断のみで読書き許可を増やしません。読取り最適化 tyaro/banto-industrial#871 は後回しです。将来候補の採否はこの計画更新では決めません。
+ゲスト実装と段階の製品完了は別です。Hub の CI が固定するのは SLMP・Modbus とも #44 の `c9c3d83` です。SLMP は tyaro/banto-industrial#895 で #35 `b3d944f5` から置き換え（#35 は tyaro/banto-industrial#887 で #34 `c9cf3b8` から置き換えた）、Modbus は tyaro/banto-industrial#896 で #33 `02a92645` から置き換えました。#35 診断は tyaro/banto-industrial#887、#43 の範囲外除外は tyaro/banto-industrial#895、FC22 register-bit write は tyaro/banto-industrial#896 で模擬受入れ済み。Modbus の保存済み書込みポリシー・運用ゲート・監査は tyaro/banto-industrial#881 の模擬結合試験で確認済みで、tyaro/banto-industrial#884 は register-bit 経路を確認済みです。SLMP #34 は tyaro/banto-industrial#885 の模擬受入れを通過しています。未検証なのは全型・全設定の網羅、実機 I/O、本番配置・資格情報、GUI、#35 診断の実機確認、条件付き範囲の追加証拠、文字列と配布 manifest の製品受入れです。manifest の `capabilities` は認可ではありません。SLMP `Unknown` は確定範囲と混同せず、未確定の機種・wire では安全側に送信を見送ります。V の周期収集除外は意図した現行制限で、修正必須項目ではありません。Modbus register-bit write は FC22 マスク書込みで 1 点ずつ送ります（3xxxx.N は読取り専用）。#35 は診断のみで読書き許可を増やしません。読取り最適化 tyaro/banto-industrial#871 は後回しです。未対応項目の対応順と採否は下の「対応範囲の拡張計画」に従います。
 
 | 段階 | 既存の実装・検証 | 製品段階の未完了条件 |
 | --- | --- | --- |
@@ -13,7 +13,37 @@ main `c9c3d83` では #32 Modbus 基本、#33 register-bit read、#34 SLMP V 周
 | P3 SLMP | コア・guest の Q/R 読取りと制御フィクスチャ、条件付き点数、diagnostics-v1。tyaro/banto-industrial#885 で #34 固定 guest と既存 write policy を模擬 Hub 受入れ、tyaro/banto-industrial#887 で #35 固定 guest の診断、tyaro/banto-industrial#895 で #44 固定 guest の範囲外除外を模擬 Hub 受入れ | #35 診断の実機確認、未試験の機種・経路・型、実機と本番配置 |
 | P4 運用拡張 | 任意 write-v1 とバッチ書込みを実装。tyaro/banto-industrial#881 / tyaro/banto-industrial#884 の Modbus と tyaro/banto-industrial#885 の SLMP で既存 Hub ゲート・監査を模擬確認 | 未試験の書込み対象、実 PLC、本番鍵・配置、UI・配布形式の製品確認 |
 
-指定タグの SLMP 読取り試験命令、文字列、機種・経路別範囲拡張、配布管理は将来候補です。0101 型式取得と実際の 0401 読取りは異なる証拠であり、成功値は設定範囲全体の証明になりません。Hub が I/O と接続の世代を管理します。これらを採用する場合は別途契約と検証を定めます。
+指定タグの SLMP 読取り試験命令、機種・経路別範囲拡張、配布管理は将来候補です。文字列は下の拡張計画で採用しました。0101 型式取得と実際の 0401 読取りは異なる証拠であり、成功値は設定範囲全体の証明になりません。Hub が I/O と接続の世代を管理します。これらを採用する場合は別途契約と検証を定めます。
+
+## 対応範囲の拡張計画（2026-10-28 作者決定）
+
+未対応項目への対応順と方針を定める。各段階は個別 PR とし、ゲストを変える PR では Hub 固定版との契約差確認、manifest の版更新、banto-industrial 側の模擬 Hub 受入れまでを 1 単位とする。読取りを書込みより先に、WIT 不変の項目を WIT・Hub 変更を要する項目より先に進める。書込みは既定無効で、ゲストの明示 allowlist と Hub の独立ゲートの両方を要する。実機確認は別途承認を受け、README・CI では模擬確認と実機確認を区別する。
+
+作者の決定:
+
+- FC22 非対応機器は、設定で明示して 4xxxx.N 書込みを送信前に `Rejected` とする。RMW 方式は引き続き不採用。
+- SLMP のブロック切替式 R（現在ブロックをゲストから確定できない）と、SD / SW / SM 等の特殊デバイスへの書込みは恒久的に対象外とする。R の代わりに ZR を案内する。
+- 文字列、Modbus FC6 / FC15、SLMP 3E / ASCII はいずれも利用予定があるため採用する。
+
+| 段階 | 対象 | 方針 | WIT / Hub への影響 |
+| --- | --- | --- | --- |
+| A1 | Modbus コイル／接点だけの機器 | `probe_address` に `0xxxx`（FC1）/ `1xxxx`（FC2）の 1 点を許し、handshake で 1 bit を読む。既定 `40001` は変えない | WIT 不変。Hub 接続テストを FC1/FC2 のみの模擬機器で受入れ |
+| A2 | SLMP W のビット読取り（`W1A.0`） | 既存の D ワード内ビット読取りを W に拡張（ワード番号・ビットとも 16 進）。範囲判定は W の点数根拠を使う | WIT 不変 |
+| B1 | FC22 非対応機器 | 書込み設定で FC22 不使用を明示した接続では、4xxxx.N 書込みを送信前 `Rejected`。無応答によるバッチ `Timeout` と切断を避ける | WIT 不変 |
+| B2 | Modbus FC6 / FC15 | FC6 は 1 ワードの単一書込み（FC16 非対応機器向け、設定で明示選択）。FC15 は連続 coil の一括書込み。どちらも要求全体を覆う allowlist を要する | WIT 不変。Hub で write 経路を模擬受入れ |
+| C0 | 文字列の Hub 受入れ確認 | WIT の `tag-spec.string-words` と `value::bytes` を Hub の WASM 経路（保存済みタグ・品質・REST）が扱えるか確認する。未対応なら Hub 側の作業を先行させる | Hub 側の確認・作業 |
+| C1 | 文字列（Modbus・SLMP 共通） | Modbus FC3/FC4、SLMP D/W の連続ワードとして読む。ワード内バイト順、NUL 終端、最大ワード数を契約に定める。書込みは Modbus FC16、SLMP 1401 で allowlist が要求全体を覆う場合のみ。長さ超過・埋め方を明記する | C0 に依存 |
+| D1 | SLMP Z / LZ / RD / S | 公式表でデバイスコードと単位を確認して読取りのみ追加し、範囲は `Unknown`（1 タグ 1 要求） | WIT 不変 |
+| D2 | Q の ZR | 既存の条件付き `q_zr`（SD306–307）を handshake に配線し、適用条件を満たす機種・経路だけ読む | WIT 不変 |
+| D3 | Q の拡張 W | 既存 API の配線だけでは成立しない。`q_extension` の `FastWInternal`（SD284–285）は内部 W 点数で、内部＋拡張の総点数ではなく、内部点数を拡張領域へ広げて解釈しない。対象機種・経路への適用条件、内部＋拡張 W 総点数の取得（対象機種での SD310–311 等）、内部点数との区別、必要な経路別アドレス変換、境界試験を別途設計してから実装する | WIT 不変（設計後に再判断） |
+| E1 | SLMP 3E バイナリ | フレームヘッダの変種をコアに追加し、シリアル番号がない場合の応答照合を試験する | WIT 不変。manifest 設定追加 |
+| E2 | SLMP 経由接続 | 既存 `Route` のネットワーク番号・局番号等を設定化して検証し、経路ごとに範囲根拠を作り直す | WIT 不変 |
+| E3 | SLMP ASCII | ASCII のエンコード・デコード系を追加し、バイナリと同じフィクスチャで結果一致を確認する。WIT の `ascii-hex` 長さ前置きを使う | WIT 不変 |
+| E4 | SLMP UDP | v1 `transports` は `tcp` のみのため、Hub トランスポートと manifest 契約の変更を先に設計する | Hub・契約の変更 |
+| F | SLMP 書込み対象の拡張 | ワード内ビット書込みは原子的手段の有無を公式資料で調査し、なければ RMW を採らず未対応を維持する。TN/CN 等の現在値書込みは同じ接続の点数根拠を設計してから候補とする | 調査後に判断 |
+| G | SLMP U/G バッファメモリ、ラベル、FX5 / L / MX / 特殊 CPU | 拡張指定サブコマンド、ラベル用コマンド、機種別の型式・基数・点数根拠をそれぞれ契約設計してから段階的に追加する。Q25PRH と同様に機種別の限定対応とする | 段階ごとに判断 |
+
+実施順は A1・A2 → B1 → B2 → C0 → D1・D2 → E1・E2 → C1 → E3 → D3・F・G・E4 とする。各段階の完了は「ゲスト実装・試験・CI 配線」と「Hub 模擬受入れ」を分けて記録する。
 
 ## CI の拡張順
 
