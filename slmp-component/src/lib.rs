@@ -509,19 +509,37 @@ fn parse_read_address(
     data_type: &str,
     words: Option<u32>,
 ) -> Result<(Device, u32, ReadKind), String> {
-    if let Some((word, bit)) = text.strip_prefix('D').and_then(|rest| rest.split_once('.')) {
+    // Dn.h and Wn.h read one bit of one word. D numbers are decimal and W
+    // numbers hexadecimal; the bit index is one hexadecimal digit for both.
+    for (prefix, device, radix) in [('D', Device::D, 10), ('W', Device::W, 16)] {
+        let Some((word, bit)) = text
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.split_once('.'))
+        else {
+            continue;
+        };
         if data_type != "bit" || words.is_some() {
-            return Err("D word-bit requires bit type without string_words".into());
+            return Err(format!(
+                "{prefix} word-bit requires bit type without string_words"
+            ));
         }
-        if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("invalid D word-bit address".into());
+        let digit = |b: u8| {
+            if radix == 10 {
+                b.is_ascii_digit()
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        };
+        if word.is_empty() || !word.bytes().all(digit) {
+            return Err(format!("invalid {prefix} word-bit address"));
         }
         if bit.len() != 1 || !bit.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("word bit must be one hexadecimal digit".into());
         }
-        let number = word.parse::<u32>().map_err(|_| "D address exceeds u32")?;
+        let number = u32::from_str_radix(word, radix)
+            .map_err(|_| format!("{prefix} address exceeds u32"))?;
         let bit = u8::from_str_radix(bit, 16).map_err(|_| "invalid word bit")?;
-        return Ok((Device::D, number, ReadKind::WordBit(bit)));
+        return Ok((device, number, ReadKind::WordBit(bit)));
     }
     // LTS/LTC/LSTS/LSTC cannot head a batch bit read. Read their corresponding
     // current-value code in word units and take the contact/coil flag from
@@ -1701,7 +1719,7 @@ impl address::Guest for Component {
                 .ok_or("offset overflow")?;
             let next_bit = start.checked_add(n).ok_or("offset overflow")?;
             if next_bit < 0 {
-                return Err("offset before D0.0".into());
+                return Err("offset before word 0 bit 0".into());
             }
             canonical_read_tag(
                 device,
@@ -1743,7 +1761,7 @@ impl address::Guest for Component {
         {
             return Err("offset_words is undefined for long current values".into());
         }
-        let kind = if text.starts_with('D') && text.contains('.')
+        let kind = if (text.starts_with('D') || text.starts_with('W')) && text.contains('.')
             || [
                 "STS", "STC", "TS", "TC", "SS", "SC", "CS", "CC", "M", "X", "Y", "B", "L", "F",
                 "V", "SB", "SM",
@@ -1765,7 +1783,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR; block-switched R is not supported. Dn.h reads one hexadecimal-indexed bit of Dn. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read and is read-only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -2434,6 +2452,103 @@ mod tests {
             <Component as address::Guest>::offset_words("WA".into(), 1).unwrap(),
             "WB"
         );
+    }
+
+    #[test]
+    fn w_word_bit_uses_hex_word_and_bit_and_the_one_word_w_range_proof() {
+        let parsed =
+            <Component as address::Guest>::parse("W1a.f".into(), "bit".into(), None).unwrap();
+        assert_eq!(parsed.canonical, "W1A.F");
+        assert_eq!(parsed.area, "W");
+        assert_eq!(parsed.bit, Some(15));
+        assert_eq!(parsed.index, Some(0x1A));
+        assert_eq!(parsed.word_count, 1);
+        assert!(!parsed.writable_area);
+        assert_eq!(
+            parse_read_address("WFFFFFFFF.0", "bit", None),
+            Ok((Device::W, u32::MAX, ReadKind::WordBit(0)))
+        );
+        for (text, kind, words) in [
+            ("W1G.0", "bit", None),
+            ("W.0", "bit", None),
+            ("W+1.0", "bit", None),
+            ("W1.10", "bit", None),
+            ("W1.", "bit", None),
+            ("W1.0", "u16", None),
+            ("W1.0", "bit", Some(1)),
+            ("W100000000.0", "bit", None),
+        ] {
+            assert!(
+                parse_read_address(text, kind, words).is_err(),
+                "{text}/{kind}"
+            );
+        }
+        assert_eq!(
+            <Component as address::Guest>::offset("W1F.F".into(), "bit".into(), None, 1).unwrap(),
+            "W20.0"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset("W0.0".into(), "bit".into(), None, -1),
+            Err("offset before word 0 bit 0".into())
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("W1F.3".into(), 1).unwrap(),
+            "W20.3"
+        );
+
+        let r = model(ModelFamily::StandardR);
+        let q = model(ModelFamily::StandardQ);
+        let last = TagSpec {
+            address: "W1F.F".into(),
+            data_type: "bit".into(),
+            string_words: None,
+        };
+        let past = TagSpec {
+            address: "W20.0".into(),
+            ..last.clone()
+        };
+        for family in [&r, &q] {
+            assert_eq!(
+                checked_read_span(&last, family, PointCount::Unknown, PointCount::Exact(32))
+                    .unwrap(),
+                ReadSpan {
+                    device: Device::W,
+                    start: 31,
+                    count: 1
+                }
+            );
+            assert!(
+                checked_read_span(&past, family, PointCount::Unknown, PointCount::Exact(32))
+                    .is_err()
+            );
+        }
+        // As with one-word W reads, standard Q needs the SD303 count and
+        // Q25PRH the guaranteed prefix; standard R reads an unknown count.
+        assert!(checked_read_span(&last, &q, PointCount::Unknown, PointCount::Unknown).is_err());
+        assert!(checked_read_span(&last, &r, PointCount::Unknown, PointCount::Unknown).is_ok());
+        let q25 = model(ModelFamily::Q25PrhWireOnly);
+        assert!(
+            checked_read_span(&last, &q25, PointCount::Unknown, PointCount::AtLeast(32)).is_ok()
+        );
+        assert!(
+            checked_read_span(&past, &q25, PointCount::Unknown, PointCount::AtLeast(32)).is_err()
+        );
+        assert!(matches!(
+            ReadKind::WordBit(0xA).decode_words(&[0x0400], WordOrder::HighLow),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            ReadKind::WordBit(0xA).decode_words(&[0xFBFF], WordOrder::LowHigh),
+            Ok(Value::Bool(false))
+        ));
+        assert!(parse_write_run(
+            &[write_v1::WriteItem {
+                spec: last.clone(),
+                value: Value::Bool(true),
+            }],
+            WordOrder::LowHigh
+        )
+        .is_err());
     }
 
     #[test]
