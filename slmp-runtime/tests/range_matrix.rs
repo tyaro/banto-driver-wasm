@@ -390,11 +390,12 @@ fn standard_q_exact_bit_counts_and_internal_dw_prefixes() -> wasmtime::Result<()
             ("F0", "bit", "unknown", UNPROVEN),
             ("SN0", "u16", "unknown", UNPROVEN),
             ("SS0", "bit", "unknown", UNPROVEN),
-            // R-only devices and Q ZR have no Q read path.
+            // R-only devices have no Q read path; Q ZR is range-Unknown.
             ("STN0", "u16", "unsupported", NO_PATH),
             ("LTN0", "i32", "unsupported", NO_PATH),
             ("LCS0", "bit", "unsupported", NO_PATH),
-            ("ZR0", "u16", "unsupported", NO_PATH),
+            ("ZR0", "u16", "unknown", UNPROVEN),
+            ("ZRFFFFFF", "u16", "unknown", UNPROVEN),
             ("S0", "bit", "unknown", UNPROVEN),
             ("Z0", "u16", "unknown", UNPROVEN),
             ("LZ0", "i32", "invalid", LZ_0403),
@@ -461,4 +462,22 @@ fn q25prh_keeps_general_ranges_unknown_beside_its_internal_w_prefix() -> wasmtim
             ("RD0", "u32", "unsupported", NO_PATH),
         ],
     )
+}
+
+#[test]
+fn q00j_and_q00uj_have_no_file_register_read_path() -> wasmtime::Result<()> {
+    for model in [("Q00JCPU", 0x0250), ("Q00UJCPU", 0x0260)] {
+        let mut fixture = Fixture::new()?;
+        run(
+            &mut fixture,
+            model,
+            Some(&[100, 0x50]),
+            None,
+            &[
+                ("ZR0", "u16", "unsupported", NO_PATH),
+                ("D0", "u16", "inside", INSIDE),
+            ],
+        )?;
+    }
+    Ok(())
 }

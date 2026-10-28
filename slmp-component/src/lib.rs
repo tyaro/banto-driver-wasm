@@ -855,6 +855,21 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
     }
 }
 
+/// ZR is a read-only, range-Unknown, one-tag read on standard R and on
+/// standard Q CPUs that have a file register. Q00JCPU (no standard RAM) and
+/// Q00UJCPU (no file register) are matched by the exact name/code pair the
+/// type-name classifier uses. Q25PRH has no ZR path. SD306-307 is not read.
+fn zr_read_allowed(model: &TypeName) -> bool {
+    match model.family {
+        ModelFamily::StandardR => true,
+        ModelFamily::StandardQ => !matches!(
+            (model.name.as_str(), model.code),
+            ("Q00JCPU", 0x0250) | ("Q00UJCPU", 0x0260)
+        ),
+        _ => false,
+    }
+}
+
 fn checked_read_span(
     spec: &TagSpec,
     model: &TypeName,
@@ -893,9 +908,9 @@ fn checked_read_span(
                 | Device::LCN
                 | Device::LCS
                 | Device::LCC
-                | Device::ZR
                 | Device::RD
         ) && model.family != ModelFamily::StandardR))
+        || (device == Device::ZR && !zr_read_allowed(model))
     {
         return Err(FatalError::InvalidConfig(
             "device is unsupported for this CPU family".into(),
@@ -1809,7 +1824,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read and is read-only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read and is read-only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -2174,7 +2189,57 @@ mod tests {
                 count: 2
             }
         );
-        assert!(checked_read_span(&zr, &q, PointCount::Unknown, PointCount::Unknown).is_err());
+        // Q ZR is range-Unknown and read-only; Q00J/Q00UJ/Q25PRH have no path.
+        let expected = ReadSpan {
+            device: Device::ZR,
+            start: 26,
+            count: 2,
+        };
+        assert_eq!(
+            checked_read_span(&zr, &q, PointCount::Unknown, PointCount::Unknown).unwrap(),
+            expected
+        );
+        for (name, code) in [("Q02UCPU", 0x0263), ("Q06HCPU", 0x0042)] {
+            let mut named = model(ModelFamily::StandardQ);
+            named.name = name.into();
+            named.code = code;
+            assert_eq!(
+                checked_read_span(&zr, &named, PointCount::Unknown, PointCount::Unknown).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        for (name, code) in [("Q00JCPU", 0x0250), ("Q00UJCPU", 0x0260)] {
+            let mut named = model(ModelFamily::StandardQ);
+            named.name = name.into();
+            named.code = code;
+            assert!(
+                checked_read_span(&zr, &named, PointCount::Unknown, PointCount::Unknown).is_err(),
+                "{name}"
+            );
+        }
+        assert!(checked_read_span(
+            &zr,
+            &model(ModelFamily::Q25PrhWireOnly),
+            PointCount::Unknown,
+            PointCount::Unknown
+        )
+        .is_err());
+        assert_eq!(
+            read_count(Device::ZR, PointCount::Exact(1), PointCount::Exact(1)),
+            PointCount::Unknown
+        );
+        // ZR never becomes writable.
+        let zr_write = write_v1::WriteItem {
+            spec: zr.clone(),
+            value: Value::Float(1.0),
+        };
+        assert!(parse_write_run(&[zr_write], WordOrder::LowHigh).is_err());
+        assert!(
+            !<Component as address::Guest>::parse("ZR1A".into(), "u32".into(), None)
+                .unwrap()
+                .writable_area
+        );
         let parsed =
             <Component as address::Guest>::parse("D10.f".into(), "bit".into(), None).unwrap();
         assert_eq!(

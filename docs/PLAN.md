@@ -34,7 +34,7 @@ main `25b5a1b`（#48）では #32 Modbus 基本、#33 register-bit read、#34 SL
 | C0 | 文字列の Hub 受入れ確認 | WIT の `tag-spec.string-words` と `value::bytes` を Hub の WASM 経路（保存済みタグ・品質・REST）が扱えるか確認する。未対応なら Hub 側の作業を先行させる | Hub 側の確認・作業 |
 | C1 | 文字列（Modbus・SLMP 共通） | Modbus FC3/FC4、SLMP D/W の連続ワードとして読む。ワード内バイト順、NUL 終端、最大ワード数を契約に定める。書込みは Modbus FC16、SLMP 1401 で allowlist が要求全体を覆う場合のみ。長さ超過・埋め方を明記する | C0 に依存 |
 | D1 | SLMP Z / LZ / RD / S | 公式表でデバイスコードと単位を確認して読取りのみ追加し、範囲は `Unknown`（1 タグ 1 要求） | WIT 不変 |
-| D2 | Q の ZR | 既存の条件付き `q_zr`（SD306–307）を handshake に配線し、適用条件を満たす機種・経路だけ読む | WIT 不変 |
+| D2 | Q の ZR | 作者決定 A（2026-10-28）: 標準 R の ZR と同様に範囲 `Unknown`・読取り専用・1 タグ 1 要求の 0401 で開く（Q00JCPU・Q00UJCPU・Q25PRH は経路なし）。`q_zr`（SD306–307）は handshake に配線しない | WIT 不変 |
 | D3 | Q の拡張 W | 既存 API の配線だけでは成立しない。`q_extension` の `FastWInternal`（SD284–285）は内部 W 点数で、内部＋拡張の総点数ではなく、内部点数を拡張領域へ広げて解釈しない。対象機種・経路への適用条件、内部＋拡張 W 総点数の取得（対象機種での SD310–311 等）、内部点数との区別、必要な経路別アドレス変換、境界試験を別途設計してから実装する | WIT 不変（設計後に再判断） |
 | E1 | SLMP 3E バイナリ | フレームヘッダの変種をコアに追加し、シリアル番号がない場合の応答照合を試験する | WIT 不変。manifest 設定追加 |
 | E2 | SLMP 経由接続 | 既存 `Route` のネットワーク番号・局番号等を設定化して検証し、経路ごとに範囲根拠を作り直す | WIT 不変 |
@@ -46,6 +46,8 @@ main `25b5a1b`（#48）では #32 Modbus 基本、#33 register-bit read、#34 SL
 C0 の確認結果（2026-10-28、Hub main `1120419` の静的照合）: Hub の WASM 経路は文字列を通せない。タグ登録（`string`、1–128 words、UTF-8 / Shift_JIS）、engine の復号（最初の NUL で切り、不正な符号は項目エラー）、REST の read-now と書込み・監査、native SLMP の文字列は対応済みで、周期収集・履歴・ライブ表示は全ドライバで文字列を扱わない（設計どおり）。不足は WASM アダプタ（`crates/banto-driver-wasm`）だけで、`string` を宣言したゲストの読込み拒否、文字列アドレスの照合拒否、`bytes` 結果のバッチ全体 Fatal、Modbus・SLMP 書込みゲートの数値限定（`string-words` 未設定・`bytes` への変換なし）、Modbus の 1 要求 123 ワードと登録上限 128 ワードの差がある。tyaro/banto-industrial#914 はこの一部を記録している。作者の判断で Hub 側の修正はいったん保留し、C1 はその修正の後に行う。先に WIT・Hub 不変の D1・D2 を進める。
 
 D1 の確認結果（2026-10-28、SLMP 参照マニュアル SH-080956ENG N の公式表）: S は 98H（Q/R、読取り専用、S 対応機種のみ）、Z は CCH（Q）/ 00CCH（R）、RD は 002CH（サブコマンド 0002/0003 のみ＝iQ-R）、いずれも 10 進。ゲストはこの 3 つを範囲 `Unknown` の単独 0401 読取りとして追加し、書込みは持たない。LZ（0062H、ダブルワード）は 0401 一括読出し・1401 一括書込み・0406/1406 ブロックで指定できず、0403 ランダム読出しのダブルワード点だけで読めるため、D1 では追加せずアドレス解析で拒否する。LZ を読むなら 0403 のフレームを新設する別段階になる（採否は未決）。
+
+D2 の確認結果（2026-10-28、作者決定 A）: SD306–307（ZR の点数）は QnU（Q00UJ を除く）だけで、拡張 D または拡張 W を 1K 点以上設定したときだけ値が入る。拡張 D/W は CPU のシリアル先頭 5 桁 09042 以降が必要だが、SLMP ではシリアルを読めず、handshake も拡張点数を読まないため、ゲストは適用条件の証拠を得られない。そこで `q_zr`（`plan_q_zr`/`decode_q_zr_count`）は変更せずゲストからも呼ばず、Q の ZR は標準 R の ZR と同じ方式（0401 サブコマンド 0000、デバイスコード B0H、3 バイトの 16 進番号で 24 ビットに収まること、範囲 `Unknown`、1 タグ 1 要求、書込みなし）で開く。対象は標準 Q のうち Q00JCPU（標準 RAM なし＝ファイルレジスタなし、[QCPU 取扱説明書 SH-080483ENG 印刷 p.147](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=149)）と Q00UJCPU（「ファイルレジスタを持たない」、[QnUCPU 機能解説 SH-080807ENG 印刷 p.392](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=394)）を除いた機種で、Q25PRH は従来どおりファイルレジスタの対応表を持たず経路なし。注意: QnU では ZR の点数を超える ZR 番号が拡張 D/W 領域を指しうる（[QnU pp.402–404](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080807eng/sh080807engae.pdf#page=404)）ため、ZR の読取りが成功しても ZR の範囲の証明にはならない（読取り専用・範囲 `Unknown` のままなので害はない）。WIT・Hub は変更なし。
 
 C1 の規約（2026-10-28 作者決定を含む）: `value::bytes` は文字順の符号化済みバイト列で、長さは常に `2 × string-words`。ゲストは読取り結果を復号・NUL 切りせずに返し、書込みでは Hub が符号化して 0 埋めした全 span を 1 要求で書く（切詰めはしない）。1 ワード内の詰め方は SLMP が下位バイト先（native SLMP と同じ）、Modbus は上位バイト先とする（作者決定）。Modbus の文字列は 123 ワードを上限とする。
 

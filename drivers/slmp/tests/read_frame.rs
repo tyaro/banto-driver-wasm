@@ -303,3 +303,27 @@ fn read_only_s_z_rd_use_their_codes_and_units() {
         Ok(Values::Words(vec![0x1234, 0xbeef]))
     );
 }
+
+#[test]
+fn q_zr_uses_word_unit_b0_and_the_24_bit_limit() {
+    // Q ZR: 0401/0000, 3-byte number, code B0h (the R row above covers 4 bytes).
+    let q = encode_read(Route::default(), Series::Q, span(Device::ZR, 0x123, 2)).unwrap();
+    assert_eq!(&q[17..25], &[0, 0, 0x23, 1, 0, 0xb0, 2, 0]);
+    let q = encode_read(
+        Route::default(),
+        Series::Q,
+        span(Device::ZR, 0x00ff_ffff, 1),
+    )
+    .unwrap();
+    assert_eq!(&q[17..25], &[0, 0, 0xff, 0xff, 0xff, 0xb0, 1, 0]);
+    for (start, count) in [(0x0100_0000, 1), (0x00ff_ffff, 2)] {
+        assert_eq!(
+            encode_read(Route::default(), Series::Q, span(Device::ZR, start, count)),
+            Err(RequestError::DeviceNumber)
+        );
+    }
+    assert_eq!(
+        decode_read(Route::default(), span(Device::ZR, 0, 2), &D100_RESPONSE),
+        Ok(Values::Words(vec![0x1234, 0xbeef]))
+    );
+}
