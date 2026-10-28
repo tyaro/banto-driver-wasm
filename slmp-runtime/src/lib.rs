@@ -5224,4 +5224,178 @@ mod tests {
         conn.resource_drop(&mut store)?;
         Ok(())
     }
+
+    #[test]
+    fn word_bit_write_runs_a_three_step_rmw_through_the_component() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{ItemError, Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let parsed = driver
+            .banto_driver_address()
+            .call_parse(&mut store, "D10.3", "bit", None)?
+            .expect("D word bit");
+        assert!(parsed.writable_area);
+        assert_eq!(parsed.bit, Some(3));
+        let settings = vec![
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+            Setting {
+                key: "d_u16_write_mode".into(),
+                value: "enabled".into(),
+            },
+            Setting {
+                key: "d_u16_write_allowlist".into(),
+                value: "D10.0-D10.7,W1A.0-W1A.F".into(),
+            },
+        ];
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("settings");
+        let session = driver.banto_driver_session().connection();
+        session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101")
+            .expect("type send");
+        session
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("SD280")
+            .expect("SD send");
+        assert!(
+            session
+                .call_handshake_next(
+                    &mut store,
+                    conn,
+                    Some(&response(2, &[32, 0, 0, 0, 32, 0, 0, 0])),
+                )?
+                .expect("ready")
+                .is_none(),
+            "word-bit intervals do not add a bit-count SD read"
+        );
+        let bit = |address: &str, value: bool| WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: "bit".into(),
+                string_words: None,
+            },
+            value: Value::Bool(value),
+        };
+        let items = [bit("D10.3", true), bit("D10.5", false)];
+        let read_tail = [1, 4, 2, 0, 10, 0, 0, 0, 0xa8, 0, 1, 0];
+        let send = |progress: WriteProgress, serial: u8| {
+            let WriteProgress::Send(plan) = progress else {
+                panic!("RMW step must send")
+            };
+            assert_eq!(plan.covers, [0, 1]);
+            assert_eq!(&plan.step.send[2..4], &[serial, 0]);
+            plan.step.send[15..].to_vec()
+        };
+        let write = driver.banto_driver_write_v1();
+
+        // (1) read, (2) write back with only bits 3 and 5 changed, (3) confirm.
+        let progress = write
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("read");
+        assert_eq!(send(progress, 3), read_tail);
+        assert!(
+            write
+                .call_write_next(&mut store, conn, &items, None)?
+                .is_err(),
+            "an RMW in progress cannot restart"
+        );
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_plan(
+                    &mut store,
+                    conn,
+                    &[TagSpec {
+                        address: "D0".into(),
+                        data_type: "u16".into(),
+                        string_words: None,
+                    }]
+                )?
+                .is_err(),
+            "reads are refused while an RMW step is pending"
+        );
+        let progress = write
+            .call_write_next(&mut store, conn, &items, Some(&response(3, &[0x20, 0xa5])))?
+            .expect("write back");
+        assert_eq!(
+            send(progress, 4),
+            [1, 0x14, 2, 0, 10, 0, 0, 0, 0xa8, 0, 1, 0, 0x08, 0xa5]
+        );
+        let progress = write
+            .call_write_next(&mut store, conn, &items, Some(&response(4, &[])))?
+            .expect("confirm");
+        assert_eq!(send(progress, 5), read_tail);
+        let done = write
+            .call_write_next(&mut store, conn, &items, Some(&response(5, &[0x08, 0xa5])))?
+            .expect("verified");
+        assert!(matches!(done, WriteProgress::Done(results)
+            if matches!(results.as_slice(), [Ok(()), Ok(())])));
+
+        // A confirm read that disagrees fails only that item.
+        write
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("read");
+        write
+            .call_write_next(&mut store, conn, &items, Some(&response(6, &[0, 0])))?
+            .expect("write back");
+        write
+            .call_write_next(&mut store, conn, &items, Some(&response(7, &[])))?
+            .expect("confirm");
+        let done = write
+            .call_write_next(&mut store, conn, &items, Some(&response(8, &[0x28, 0])))?
+            .expect("partially verified");
+        assert!(matches!(done, WriteProgress::Done(results)
+            if matches!(results.as_slice(), [Ok(()), Err(ItemError::VerificationFailed(_))])));
+
+        // Pre-send refusals: outside the bit allowlist and a word-only grant.
+        for refused in [
+            vec![bit("D10.8", true)],
+            vec![bit("D11.0", true)],
+            vec![bit("D10.3", true), bit("D10.3", false)],
+            vec![bit("D10.3", true), bit("W1A.0", true)],
+        ] {
+            let outcome = write
+                .call_write_next(&mut store, conn, &refused, None)?
+                .expect("preflight");
+            assert!(matches!(outcome, WriteProgress::Done(results)
+                if results.len() == refused.len()
+                    && results.iter().all(|r| matches!(r, Err(ItemError::Rejected(_))))));
+        }
+
+        // A malformed write-back ACK is fatal and poisons writes until reconnect.
+        let progress = write
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("read");
+        assert_eq!(send(progress, 9), read_tail);
+        write
+            .call_write_next(&mut store, conn, &items, Some(&response(9, &[0, 0])))?
+            .expect("write back");
+        assert!(write
+            .call_write_next(&mut store, conn, &items, Some(&response(99, &[])))?
+            .is_err());
+        assert!(
+            write
+                .call_write_next(&mut store, conn, &items, None)?
+                .is_err(),
+            "poisoned until reconnect"
+        );
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
 }
