@@ -2316,6 +2316,61 @@ mod tests {
     }
 
     #[test]
+    fn standard_q_w_word_bits_read_hex_words_inside_the_sd303_prefix() -> wasmtime::Result<()> {
+        use banto::driver::types::{TagSpec, Value};
+        let (mut store, driver) = load()?;
+        let conn = ready_q(&mut store, &driver, 100)?; // SD302=100, SD303=32
+        let specs = [
+            bit_spec("W1E.3"),
+            TagSpec {
+                address: "W1F".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            bit_spec("W20.0"), // Past the SD303 prefix: no read path.
+            bit_spec("W1F.A"),
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("verified Q internal W word bits");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers, [0, 1]);
+        assert_eq!(plans[1].covers, [3]);
+        assert_eq!(&plans[0].step.send[17..25], &[0, 0, 0x1e, 0, 0, 0xb4, 2, 0]);
+        assert_eq!(&plans[1].step.send[17..25], &[0, 0, 0x1f, 0, 0, 0xb4, 1, 0]);
+        let serial = u16::from_le_bytes([plans[0].step.send[2], plans[0].step.send[3]]);
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(serial, &[0x08, 0x00, 0x00, 0x04]),
+            )?
+            .expect("word bit and word share one batch");
+        assert!(matches!(
+            values.as_slice(),
+            [Ok(Value::Bool(true)), Ok(Value::Uint(0x0400))]
+        ));
+        let serial = u16::from_le_bytes([plans[1].step.send[2], plans[1].step.send[3]]);
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[1],
+                &specs,
+                &response(serial, &[0xff, 0xfb]),
+            )?
+            .expect("bit A of W1F");
+        assert!(matches!(values.as_slice(), [Ok(Value::Bool(false))]));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
     fn mixed_width_numeric_batch_maps_words_to_tag_covers() -> wasmtime::Result<()> {
         use banto::driver::types::{ItemError, TagSpec, Value};
         let (mut store, driver) = load()?;

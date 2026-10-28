@@ -281,6 +281,9 @@ fn standard_r_exact_counts_bound_every_unit_radix_and_span() -> wasmtime::Result
             ("W4F", "u32", "outside", OUTSIDE),
             ("W4C", "u64", "inside", INSIDE),
             ("W4D", "f64", "outside", OUTSIDE),
+            // A W word bit occupies its whole hexadecimal W word.
+            ("W4F.F", "bit", "inside", INSIDE),
+            ("W50.0", "bit", "outside", OUTSIDE),
             // Bit areas count bit points: M/F/L decimal, Y/B/SB hexadecimal.
             ("M69999", "bit", "inside", INSIDE),
             ("M70000", "bit", "outside", OUTSIDE),
@@ -362,6 +365,8 @@ fn standard_q_exact_bit_counts_and_internal_dw_prefixes() -> wasmtime::Result<()
             ("W50", "u16", "unknown", Q_W_PREFIX),
             ("W4C", "u64", "inside", INSIDE),
             ("W4D", "u64", "unknown", Q_W_PREFIX),
+            ("W4F.F", "bit", "inside", INSIDE),
+            ("W50.0", "bit", "unknown", Q_W_PREFIX),
             // Exact Q bit counts: X/Y/B hexadecimal, L decimal.
             ("X1F", "bit", "inside", INSIDE),
             ("X20", "bit", "outside", OUTSIDE),
@@ -402,6 +407,7 @@ fn standard_q_saturated_b_and_exact_m_keep_distinct_rules() -> wasmtime::Result<
             ("D32767", "u16", "inside", INSIDE),
             ("D32768", "u16", "unknown", UNPROVEN),
             ("W0", "u16", "unknown", Q_W_PREFIX),
+            ("W0.0", "bit", "unknown", Q_W_PREFIX),
             ("X0", "bit", "outside", OUTSIDE),
             ("YF", "bit", "inside", INSIDE),
             ("Y10", "bit", "outside", OUTSIDE),
@@ -432,6 +438,8 @@ fn q25prh_keeps_general_ranges_unknown_beside_its_internal_w_prefix() -> wasmtim
             ("W4E", "u32", "inside", INSIDE),
             ("W4F", "u32", "unknown", Q_W_PREFIX),
             ("W50", "u16", "unknown", Q_W_PREFIX),
+            ("W4F.F", "bit", "inside", INSIDE),
+            ("W50.0", "bit", "unknown", Q_W_PREFIX),
             ("M0", "bit", "unknown", Q25PRH),
             ("X0", "bit", "unknown", Q25PRH),
             ("TN0", "u16", "unsupported", NO_PATH),
