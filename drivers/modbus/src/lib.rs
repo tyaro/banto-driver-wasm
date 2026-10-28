@@ -1,6 +1,6 @@
 //! A small, transport-free Modbus TCP core.
 //!
-//! This core frames FC1-FC4 reads and FC5/FC16/FC22 writes. It is not a
+//! This core frames FC1-FC4 reads and FC5/FC6/FC15/FC16/FC22 writes. It is not a
 //! `FrameDriver` or a WIT component. The Hub still owns I/O and the
 //! production Modbus driver.
 //! The shape is checked against the native implementation at
@@ -211,6 +211,57 @@ pub fn write_coil_request(transaction_id: u16, unit_id: u8, offset: u16, value: 
     ]
 }
 
+/// FC6 writes one holding register. The ACK echoes the address and value.
+pub fn write_single_register_request(
+    transaction_id: u16,
+    unit_id: u8,
+    offset: u16,
+    value: u16,
+) -> [u8; 12] {
+    let [tid_hi, tid_lo] = transaction_id.to_be_bytes();
+    let [hi, lo] = offset.to_be_bytes();
+    let [value_hi, value_lo] = value.to_be_bytes();
+    [
+        tid_hi, tid_lo, 0, 0, 0, 6, unit_id, 6, hi, lo, value_hi, value_lo,
+    ]
+}
+
+/// FC15 writes a contiguous coil span. Values are packed LSB-first, the first
+/// coil in bit 0 of the first byte; unused high bits of the last byte are 0.
+pub fn write_coils_request(
+    transaction_id: u16,
+    unit_id: u8,
+    offset: u16,
+    values: &[bool],
+) -> Result<Vec<u8>, RequestError> {
+    if values.is_empty() || values.len() > 1968 {
+        return Err(RequestError::Count);
+    }
+    let count = u16::try_from(values.len()).map_err(|_| RequestError::Count)?;
+    offset
+        .checked_add(count - 1)
+        .ok_or(RequestError::AddressRange)?;
+    let byte_count = values.len().div_ceil(8);
+    let mbap_len = 7 + byte_count;
+    let mut frame = Vec::with_capacity(6 + mbap_len);
+    frame.extend_from_slice(&transaction_id.to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&(mbap_len as u16).to_be_bytes());
+    frame.extend_from_slice(&[unit_id, 15]);
+    frame.extend_from_slice(&offset.to_be_bytes());
+    frame.extend_from_slice(&count.to_be_bytes());
+    frame.push(byte_count as u8);
+    for chunk in values.chunks(8) {
+        frame.push(
+            chunk
+                .iter()
+                .enumerate()
+                .fold(0, |byte, (bit, value)| byte | (u8::from(*value) << bit)),
+        );
+    }
+    Ok(frame)
+}
+
 /// FC16 writes a complete contiguous register span, capped by the Modbus PDU.
 pub fn write_registers_request(
     transaction_id: u16,
@@ -269,9 +320,10 @@ pub fn mask_write_register_request(
     ]
 }
 
-/// Strict ACK validation for FC5, FC16 and FC22; exceptions remain
-/// item-level. `echo` is the request PDU after the function code: four bytes
-/// for FC5/FC16 and six for FC22.
+/// Strict ACK validation for FC5, FC6, FC15, FC16 and FC22; exceptions
+/// remain item-level. `echo` is the request PDU after the function code (for
+/// FC15/FC16 only address and quantity): four bytes for FC5/FC6/FC15/FC16 and
+/// six for FC22.
 pub fn decode_write_ack(
     response: &[u8],
     transaction_id: u16,
@@ -280,7 +332,7 @@ pub fn decode_write_ack(
     echo: &[u8],
 ) -> Result<(), ReadError> {
     let echo_len = match function {
-        5 | 16 => 4,
+        5 | 6 | 15 | 16 => 4,
         22 => 6,
         _ => return Err(ReadError::Protocol),
     };
@@ -754,6 +806,121 @@ mod tests {
         }
         assert_eq!(
             decode_write_ack(&frame, 0x1234, 1, 6, echo),
+            Err(ReadError::Protocol)
+        );
+    }
+
+    #[test]
+    fn fc6_single_register_write_checks_address_and_value_echo() {
+        let frame = write_single_register_request(0x1234, 1, 65535, 0xabcd);
+        assert_eq!(frame, [0x12, 0x34, 0, 0, 0, 6, 1, 6, 255, 255, 0xab, 0xcd]);
+        let echo = &frame[8..12];
+        assert_eq!(decode_write_ack(&frame, 0x1234, 1, 6, echo), Ok(()));
+        assert_eq!(
+            decode_write_ack(&[0x12, 0x34, 0, 0, 0, 3, 1, 0x86, 1], 0x1234, 1, 6, echo),
+            Err(ReadError::Device(1))
+        );
+        let mut wrong_value = frame;
+        wrong_value[11] = 0xce;
+        assert_eq!(
+            decode_write_ack(&wrong_value, 0x1234, 1, 6, echo),
+            Err(ReadError::Protocol)
+        );
+        let mut wrong_address = frame;
+        wrong_address[9] = 0;
+        assert_eq!(
+            decode_write_ack(&wrong_address, 0x1234, 1, 6, echo),
+            Err(ReadError::Protocol)
+        );
+        for bad in [
+            &frame[..11],
+            &[0x12, 0x34, 0, 0, 0, 6, 1, 16, 255, 255, 0xab, 0xcd][..],
+            &[0x12, 0x35, 0, 0, 0, 6, 1, 6, 255, 255, 0xab, 0xcd][..],
+        ] {
+            assert!(decode_write_ack(bad, 0x1234, 1, 6, echo).is_err());
+        }
+    }
+
+    #[test]
+    fn fc15_coil_write_packs_bits_lsb_first_and_checks_quantity_echo() {
+        let one = write_coils_request(0x1234, 1, 65535, &[true]).unwrap();
+        assert_eq!(one, [0x12, 0x34, 0, 0, 0, 8, 1, 15, 255, 255, 0, 1, 1, 1]);
+        let eight = [true, false, true, true, false, false, true, false];
+        assert_eq!(
+            write_coils_request(1, 1, 0, &eight).unwrap()[12..],
+            [1, 0b0100_1101]
+        );
+        let nine = [true, false, false, false, false, false, false, false, true];
+        assert_eq!(
+            write_coils_request(1, 1, 0, &nine).unwrap(),
+            [
+                0,
+                1,
+                0,
+                0,
+                0,
+                9,
+                1,
+                15,
+                0,
+                0,
+                0,
+                9,
+                2,
+                0b0000_0001,
+                0b0000_0001
+            ]
+        );
+        // The Modbus specification example: coils 20-29 = 1100 1101 01.
+        let ten = [
+            true, false, true, true, false, false, true, true, true, false,
+        ];
+        assert_eq!(
+            write_coils_request(1, 1, 19, &ten).unwrap(),
+            [0, 1, 0, 0, 0, 9, 1, 15, 0, 19, 0, 10, 2, 0xcd, 0x01]
+        );
+        let max = write_coils_request(1, 1, 0, &[true; 1968]).unwrap();
+        assert_eq!(max.len(), 13 + 246);
+        assert_eq!(max[10..13], [0x07, 0xb0, 246]);
+        assert_eq!(
+            write_coils_request(1, 1, 0, &[true; 1969]),
+            Err(RequestError::Count)
+        );
+        assert_eq!(write_coils_request(1, 1, 0, &[]), Err(RequestError::Count));
+        assert_eq!(
+            write_coils_request(1, 1, 65535, &[true, false]),
+            Err(RequestError::AddressRange)
+        );
+
+        let echo = [0, 19, 0, 10];
+        let ack = [0, 1, 0, 0, 0, 6, 1, 15, 0, 19, 0, 10];
+        assert_eq!(decode_write_ack(&ack, 1, 1, 15, &echo), Ok(()));
+        assert_eq!(
+            decode_write_ack(&[0, 1, 0, 0, 0, 3, 1, 0x8f, 2], 1, 1, 15, &echo),
+            Err(ReadError::Device(2))
+        );
+        for mismatch in [
+            [0, 1, 0, 0, 0, 6, 1, 15, 0, 19, 0, 9],
+            [0, 1, 0, 0, 0, 6, 1, 15, 0, 20, 0, 10],
+        ] {
+            assert_eq!(
+                decode_write_ack(&mismatch, 1, 1, 15, &echo),
+                Err(ReadError::Protocol)
+            );
+        }
+        for bad in [
+            &ack[..11],
+            &[0, 1, 0, 0, 0, 6, 1, 5, 0, 19, 0, 10][..],
+            &[0, 1, 0, 0, 0, 7, 1, 15, 0, 19, 0, 10, 2][..],
+        ] {
+            assert!(decode_write_ack(bad, 1, 1, 15, &echo).is_err());
+        }
+        assert_eq!(
+            decode_write_ack(&ack, 1, 1, 15, &[0, 19, 0, 10, 2]),
+            Err(ReadError::Protocol)
+        );
+        assert_eq!(
+            decode_write_ack(&ack, 1, 1, 7, &echo),
             Err(ReadError::Protocol)
         );
     }

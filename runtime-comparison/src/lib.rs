@@ -175,7 +175,7 @@ mod tests {
         let valid: JsonValue =
             serde_json::from_str(include_str!("../../component/manifest.json")).unwrap();
         assert_eq!(manifest_settings_version(&valid), Ok(1));
-        assert_eq!(valid["version"], "0.7.0");
+        assert_eq!(valid["version"], "0.8.0");
         assert_eq!(valid["hubApi"], "1");
         assert_eq!(
             valid["displayName"],
@@ -541,11 +541,16 @@ mod tests {
             .call_secret_keys(&mut store)?
             .is_empty());
         let schema = driver.banto_driver_config().call_schema(&mut store)?;
-        assert_eq!(schema.len(), 8);
+        assert_eq!(schema.len(), 9);
         assert!(matches!(
             schema.iter().find(|field| field.key == "register_bit_write")
                 .and_then(|field| field.default.as_ref()),
             Some(exports::banto::driver::config::SettingValue::Text(value)) if value == "fc22"
+        ));
+        assert!(matches!(
+            schema.iter().find(|field| field.key == "register_write")
+                .and_then(|field| field.default.as_ref()),
+            Some(exports::banto::driver::config::SettingValue::Text(value)) if value == "fc16"
         ));
         assert!(matches!(
             schema.iter().find(|field| field.key == "word_order")
@@ -1161,6 +1166,116 @@ mod tests {
 #[cfg(test)]
 mod write_runtime {
     wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-write-v1" });
+
+    #[test]
+    fn real_component_fc15_coil_run_and_fc6_single_register_write() -> wasmtime::Result<()> {
+        use banto::driver::types::{ItemError, Setting, TagSpec, Value};
+        use exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_COMPONENT_WASM")?;
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+        let mut store = wasmtime::Store::new(&engine, ());
+        let driver = DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let settings = [
+            ("host", "fixture.invalid"),
+            ("port", "502"),
+            ("write_mode", "enabled"),
+            ("write_allowlist", "000001-000016,400001-400010"),
+            ("register_write", "fc6"),
+        ]
+        .map(|(key, value)| Setting {
+            key: key.into(),
+            value: value.into(),
+        });
+        assert!(driver
+            .banto_driver_config()
+            .call_validate(&mut store, &settings)?
+            .is_empty());
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .unwrap();
+        let item = |address: &str, data_type: &str, value| WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: data_type.into(),
+                string_words: None,
+            },
+            value,
+        };
+
+        // Coils 00001-00010 = 1011 0011 10 as one FC15 frame.
+        let coils: Vec<_> = [
+            true, false, true, true, false, false, true, true, true, false,
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, value)| item(&format!("{:05}", index + 1), "bool", Value::Bool(*value)))
+        .collect();
+        let WriteProgress::Send(planned) = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &coils, None)?
+            .unwrap()
+        else {
+            panic!("FC15 request expected");
+        };
+        assert_eq!(
+            planned.step.send,
+            [0, 0, 0, 0, 0, 9, 1, 15, 0, 0, 0, 10, 2, 0xcd, 0x01]
+        );
+        assert!(matches!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &coils, Some(&[0, 0, 0, 0, 0, 6, 1, 15, 0, 0, 0, 10]))?
+                .unwrap(),
+            WriteProgress::Done(results) if results.len() == 10 && results.iter().all(Result::is_ok)
+        ));
+
+        // A multi-word holding write is refused before send under fc6.
+        let wide = [item("40001", "u32", Value::Uint(1))];
+        let progress = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &wide, None)?
+            .unwrap();
+        assert!(
+            matches!(&progress, WriteProgress::Done(results) if matches!(results.as_slice(),
+                [Err(ItemError::Rejected(message))] if message.contains("register_write=fc6"))),
+            "{progress:?}"
+        );
+
+        // One u16 is FC6 with the next transaction ID.
+        let word = [item("40002", "u16", Value::Uint(0xabcd))];
+        let WriteProgress::Send(planned) = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &word, None)?
+            .unwrap()
+        else {
+            panic!("FC6 request expected");
+        };
+        assert_eq!(
+            planned.step.send,
+            [0, 1, 0, 0, 0, 6, 1, 6, 0, 1, 0xab, 0xcd]
+        );
+        assert!(matches!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &word, Some(&[0, 1, 0, 0, 0, 6, 1, 6, 0, 1, 0xab, 0xcd]))?
+                .unwrap(),
+            WriteProgress::Done(results) if matches!(results.as_slice(), [Ok(())])
+        ));
+        conn.resource_drop(&mut store)?;
+
+        let mut invalid = settings.to_vec();
+        invalid[4].value = "fc5".into();
+        assert!(driver
+            .banto_driver_config()
+            .call_validate(&mut store, &invalid)?
+            .iter()
+            .any(|error| error.key == "register_write"));
+        Ok(())
+    }
 
     #[test]
     fn real_component_register_bit_write_disabled_sends_no_fc22() -> wasmtime::Result<()> {

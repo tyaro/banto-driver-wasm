@@ -6,8 +6,9 @@ use std::cell::{Cell, RefCell};
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_modbus_read_core::{
     decode_write_ack, mask_write_register_request, register_bit_masks, write_coil_request,
-    write_registers_request, BitFunction, NumericKind, NumericValue, ReadBit, ReadError,
-    ReadHoldingNumeric, ReadRegisterBit, RegisterFunction, WordOrder, MAX_RESPONSE_LEN,
+    write_coils_request, write_registers_request, write_single_register_request, BitFunction,
+    NumericKind, NumericValue, ReadBit, ReadError, ReadHoldingNumeric, ReadRegisterBit,
+    RegisterFunction, WordOrder, MAX_RESPONSE_LEN,
 };
 use exports::banto::driver::{address, config, read, session, write_v1};
 
@@ -27,6 +28,9 @@ struct ModbusConnection {
     /// False when the device is declared without FC22: register-bit writes
     /// are refused before send instead of timing out the batch.
     register_bit_write: bool,
+    /// True when the device is declared without FC16: a holding numeric
+    /// write is one single-word FC6 request, and anything wider is refused.
+    register_write_fc6: bool,
     write_allowlist: Vec<WriteRange>,
     pending_write: RefCell<Option<PendingWrite>>,
     write_poisoned: Cell<bool>,
@@ -178,6 +182,14 @@ fn check_settings(settings: &[banto::driver::types::Setting]) -> Vec<config::Fie
             errors.push(config::FieldError {
                 key: "register_bit_write".into(),
                 message: "register_bit_write must be fc22 or disabled".into(),
+            });
+        }
+    }
+    if let Some(mode) = setting(settings, "register_write") {
+        if !matches!(mode, "fc16" | "fc6") {
+            errors.push(config::FieldError {
+                key: "register_write".into(),
+                message: "register_write must be fc16 or fc6".into(),
             });
         }
     }
@@ -597,7 +609,7 @@ fn preflight_write(
     let mut area_kind = None;
     let mut words = Vec::new();
     let mut end = 0u32;
-    let mut coil = None;
+    let mut coils = Vec::new();
     for item in items {
         let (offset, kind) = parse_tag(
             &item.spec.address,
@@ -622,7 +634,7 @@ fn preflight_write(
         }
         match kind {
             TagKind::Bit(BitFunction::Coil) => match item.value {
-                Value::Bool(value) => coil = Some(value),
+                Value::Bool(value) => coils.push(value),
                 _ => return Err("coil write requires a Bool value".into()),
             },
             TagKind::Numeric(kind, RegisterFunction::Holding) => {
@@ -644,17 +656,24 @@ fn preflight_write(
     {
         return Err("write span is outside the enabled allowlist".into());
     }
-    if area == Area::Coil {
-        if items.len() != 1 {
-            return Err("coil writes require one point per request".into());
-        }
-        let frame = write_coil_request(
-            transaction_id,
-            conn.unit_id,
-            start,
-            coil.expect("checked coil value"),
-        );
+    if let [value] = coils[..] {
+        let frame = write_coil_request(transaction_id, conn.unit_id, start, value);
         Ok((5, frame.to_vec(), frame[8..12].to_vec()))
+    } else if area == Area::Coil {
+        // A contiguous coil run inside one allowlist interval is one FC15.
+        let frame = write_coils_request(transaction_id, conn.unit_id, start, &coils)
+            .map_err(|_| "coil write exceeds the FC15 count or address limit")?;
+        let mut echo = start.to_be_bytes().to_vec();
+        echo.extend_from_slice(&(coils.len() as u16).to_be_bytes());
+        Ok((15, frame, echo))
+    } else if conn.register_write_fc6 {
+        let [word] = words[..] else {
+            return Err(
+                "register_write=fc6 allows only one i16/u16 holding register per request".into(),
+            );
+        };
+        let frame = write_single_register_request(transaction_id, conn.unit_id, start, word);
+        Ok((6, frame.to_vec(), frame[8..12].to_vec()))
     } else {
         let frame = write_registers_request(transaction_id, conn.unit_id, start, &words)
             .map_err(|_| "register write exceeds the FC16 count or address limit")?;
@@ -810,6 +829,7 @@ impl session::GuestConnection for ModbusConnection {
             probe_poisoned: Cell::new(false),
             write_enabled: setting(&settings, "write_mode") == Some("enabled"),
             register_bit_write: setting(&settings, "register_bit_write") != Some("disabled"),
+            register_write_fc6: setting(&settings, "register_write") == Some("fc6"),
             write_allowlist: parse_write_allowlist(
                 setting(&settings, "write_allowlist").unwrap_or(""),
             )
@@ -1081,7 +1101,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write unless register_bit_write=disabled declares a device without FC22; 3xxxx.N is read-only. Connection probe defaults to 40001; probe_address may select one 0xxxx coil, 1xxxx discrete input or 3xxxx input register instead. Writes require write_mode=enabled and write_allowlist."
+        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write unless register_bit_write=disabled declares a device without FC22; 3xxxx.N is read-only. Coils are written with FC5 (one point) or FC15 (a contiguous run); holding words with FC16, or one i16/u16 with FC6 when register_write=fc6. Connection probe defaults to 40001; probe_address may select one 0xxxx coil, 1xxxx discrete input or 3xxxx input register instead. Writes require write_mode=enabled and write_allowlist."
             .into()
     }
 
@@ -1198,6 +1218,15 @@ impl config::Guest for Component {
                     ChoiceOption { value: "disabled".into(), label: "disabled".into() },
                 ]),
                 required: false, default: Some(SettingValue::Text("fc22".into())), group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "register_write".into(), label: "Register write".into(),
+                help: Some("fc16 writes holding words with FC16; fc6 writes one i16/u16 with FC6 and refuses wider writes before send for devices without FC16".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption { value: "fc16".into(), label: "fc16".into() },
+                    ChoiceOption { value: "fc6".into(), label: "fc6".into() },
+                ]),
+                required: false, default: Some(SettingValue::Text("fc16".into())), group: FieldGroup::Advanced,
             },
             SettingField {
                 key: "write_allowlist".into(), label: "Write address ranges".into(),
@@ -1476,6 +1505,282 @@ mod tests {
         }
     }
 
+    fn assert_rejected_before_send(conn: &ModbusConnection, items: Vec<write_v1::WriteItem>) {
+        let count = items.len();
+        let transaction_id = conn.next_transaction_id.get();
+        assert!(
+            matches!(
+                write_next_impl(conn, items.clone(), None),
+                Ok(write_v1::WriteProgress::Done(results))
+                    if results.len() == count
+                        && results.iter().all(|r| matches!(r, Err(ItemError::Rejected(_))))
+            ),
+            "{items:?}"
+        );
+        assert_eq!(conn.next_transaction_id.get(), transaction_id);
+        assert!(conn.pending_write.borrow().is_none());
+        assert!(!conn.write_poisoned.get());
+    }
+
+    fn coil_run(first: u16, values: &[bool]) -> Vec<write_v1::WriteItem> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                write_item(
+                    &format!("{:05}", first + index as u16),
+                    "bool",
+                    Value::Bool(*value),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contiguous_coil_run_is_one_fc15_and_single_coil_keeps_fc5() {
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.write_allowlist =
+            parse_write_allowlist("000001-000016,000017-000030,400001-400010").unwrap();
+        // One coil is the unchanged FC5 frame.
+        assert_eq!(
+            preflight_write(&conn, &coil_run(3, &[true]), 0x1234).unwrap(),
+            (
+                5,
+                vec![0x12, 0x34, 0, 0, 0, 6, 1, 5, 0, 2, 0xff, 0],
+                vec![0, 2, 0xff, 0]
+            )
+        );
+        // Ten coils 00001-00010 = 1011 0011 10, packed LSB-first.
+        let values = [
+            true, false, true, true, false, false, true, true, true, false,
+        ];
+        let items = coil_run(1, &values);
+        let Ok(write_v1::WriteProgress::Send(planned)) =
+            write_next_impl(&conn, items.clone(), None)
+        else {
+            panic!("FC15 request expected");
+        };
+        assert_eq!(
+            planned.step.send,
+            [0, 0, 0, 0, 0, 9, 1, 15, 0, 0, 0, 10, 2, 0xcd, 0x01]
+        );
+        assert_eq!(planned.covers, (0..10).collect::<Vec<u32>>());
+        assert!(matches!(
+            write_next_impl(&conn, items, Some(vec![0, 0, 0, 0, 0, 6, 1, 15, 0, 0, 0, 10])),
+            Ok(write_v1::WriteProgress::Done(results))
+                if results.len() == 10 && results.iter().all(Result::is_ok)
+        ));
+        assert!(!conn.write_poisoned.get());
+
+        // An exception is item-level for every coil of the run.
+        let items = coil_run(17, &[true, false, true]);
+        assert!(matches!(
+            write_next_impl(&conn, items.clone(), None),
+            Ok(write_v1::WriteProgress::Send(planned))
+                if planned.step.send == [0, 1, 0, 0, 0, 8, 1, 15, 0, 16, 0, 3, 1, 0b101]
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, items, Some(vec![0, 1, 0, 0, 0, 3, 1, 0x8f, 4])),
+            Ok(write_v1::WriteProgress::Done(results))
+                if results.len() == 3 && results.iter().all(|r| matches!(
+                    r, Err(ItemError::Device(error)) if error.code == 4))
+        ));
+        assert!(!conn.write_poisoned.get());
+
+        // A quantity mismatch is fatal and the request is not replayed.
+        let items = coil_run(1, &[false, false]);
+        assert!(matches!(
+            write_next_impl(&conn, items.clone(), None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        assert!(matches!(
+            write_next_impl(
+                &conn,
+                items.clone(),
+                Some(vec![0, 2, 0, 0, 0, 6, 1, 15, 0, 0, 0, 1])
+            ),
+            Err(FatalError::Protocol(_))
+        ));
+        assert!(conn.write_poisoned.get());
+        assert!(matches!(
+            write_next_impl(&conn, items, None),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn coil_runs_outside_one_contiguous_allowed_interval_are_rejected_before_send() {
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.write_allowlist =
+            parse_write_allowlist("000001-000016,000017-000030,400001-400010").unwrap();
+        for items in [
+            // gap
+            vec![
+                write_item("00001", "bool", Value::Bool(true)),
+                write_item("00003", "bool", Value::Bool(true)),
+            ],
+            // descending
+            vec![
+                write_item("00002", "bool", Value::Bool(true)),
+                write_item("00001", "bool", Value::Bool(true)),
+            ],
+            // mixed areas
+            vec![
+                write_item("00001", "bool", Value::Bool(true)),
+                write_item("40001", "u16", Value::Uint(1)),
+            ],
+            vec![
+                write_item("00001", "bool", Value::Bool(true)),
+                write_item("40001.0", "bool", Value::Bool(true)),
+            ],
+            // non-Bool value
+            vec![
+                write_item("00001", "bool", Value::Bool(true)),
+                write_item("00002", "bool", Value::Uint(1)),
+            ],
+            // partly outside the allowlist
+            coil_run(30, &[true, true]),
+            // across two allowlist intervals
+            coil_run(16, &[true, true]),
+        ] {
+            assert_rejected_before_send(&conn, items);
+        }
+        // The item cap still applies to coil runs.
+        conn.write_allowlist = parse_write_allowlist("000001-000200").unwrap();
+        assert_rejected_before_send(&conn, coil_run(1, &[true; 124]));
+        assert_eq!(
+            preflight_write(&conn, &coil_run(1, &[true; 123]), 0)
+                .unwrap()
+                .0,
+            15
+        );
+    }
+
+    #[test]
+    fn register_write_fc6_sends_one_word_and_refuses_wider_writes_before_send() {
+        use banto::driver::types::Setting;
+        let settings = |mode: &str| {
+            [
+                ("host", "fixture.invalid"),
+                ("port", "502"),
+                ("write_mode", "enabled"),
+                ("write_allowlist", "400001-400010,000001-000010"),
+                ("register_write", mode),
+            ]
+            .map(|(key, value)| Setting {
+                key: key.into(),
+                value: value.into(),
+            })
+        };
+        assert!(check_settings(&settings("fc16")).is_empty());
+        assert!(check_settings(&settings("fc6")).is_empty());
+        for invalid in ["", "FC6", "fc5", "single"] {
+            assert!(
+                check_settings(&settings(invalid))
+                    .iter()
+                    .any(|error| error.key == "register_write"),
+                "{invalid:?}"
+            );
+        }
+        let mut duplicate = settings("fc6").to_vec();
+        duplicate.push(Setting {
+            key: "register_write".into(),
+            value: "fc16".into(),
+        });
+        assert!(check_settings(&duplicate)
+            .iter()
+            .any(|error| error.key == "register_write"));
+
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.write_allowlist = parse_write_allowlist("400001-400010,000001-000010").unwrap();
+        // fc16 is the default and keeps FC16 even for one word.
+        assert_eq!(
+            preflight_write(&conn, &[write_item("40002", "u16", Value::Uint(7))], 0).unwrap(),
+            (
+                16,
+                vec![0, 0, 0, 0, 0, 9, 1, 16, 0, 1, 0, 1, 2, 0, 7],
+                vec![0, 1, 0, 1]
+            )
+        );
+        conn.register_write_fc6 = true;
+        let item = vec![write_item("40002", "u16", Value::Uint(0xabcd))];
+        assert!(matches!(
+            write_next_impl(&conn, item.clone(), None),
+            Ok(write_v1::WriteProgress::Send(planned))
+                if planned.step.send == [0, 0, 0, 0, 0, 6, 1, 6, 0, 1, 0xab, 0xcd]
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, item, Some(vec![0, 0, 0, 0, 0, 6, 1, 6, 0, 1, 0xab, 0xcd])),
+            Ok(write_v1::WriteProgress::Done(results)) if matches!(results.as_slice(), [Ok(())])
+        ));
+        let item = vec![write_item("40010", "i16", Value::Int(-2))];
+        assert!(matches!(
+            write_next_impl(&conn, item.clone(), None),
+            Ok(write_v1::WriteProgress::Send(planned))
+                if planned.step.send == [0, 1, 0, 0, 0, 6, 1, 6, 0, 9, 0xff, 0xfe]
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, item, Some(vec![0, 1, 0, 0, 0, 3, 1, 0x86, 1])),
+            Ok(write_v1::WriteProgress::Done(results))
+                if matches!(results.as_slice(), [Err(ItemError::Device(error))] if error.code == 1)
+        ));
+
+        // Anything wider than one word is refused before send.
+        for items in [
+            vec![
+                write_item("40001", "u16", Value::Uint(1)),
+                write_item("40002", "u16", Value::Uint(2)),
+            ],
+            vec![write_item("40001", "i32", Value::Int(-1))],
+            vec![write_item("40001", "u32", Value::Uint(1))],
+            vec![write_item("40001", "f32", Value::Float(1.5))],
+            vec![write_item("40001", "i64", Value::Int(-1))],
+            vec![write_item("40001", "u64", Value::Uint(1))],
+            vec![write_item("40001", "f64", Value::Float(1.5))],
+        ] {
+            assert!(
+                matches!(
+                    preflight_write(&conn, &items, 0),
+                    Err(message) if message.contains("register_write=fc6")
+                ),
+                "{items:?}"
+            );
+            assert_rejected_before_send(&conn, items);
+        }
+        assert_rejected_before_send(&conn, vec![write_item("40011", "u16", Value::Uint(1))]);
+
+        // FC22 register bits and coils ignore register_write.
+        for (items, function) in [
+            (vec![write_item("40001.3", "bool", Value::Bool(true))], 22),
+            (coil_run(1, &[true]), 5),
+            (coil_run(1, &[true, false]), 15),
+        ] {
+            assert_eq!(preflight_write(&conn, &items, 0).unwrap().0, function);
+        }
+
+        // An echo with a different value is fatal; nothing is replayed.
+        let item = vec![write_item("40001", "u16", Value::Uint(1))];
+        assert!(matches!(
+            write_next_impl(&conn, item.clone(), None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        assert!(matches!(
+            write_next_impl(
+                &conn,
+                item.clone(),
+                Some(vec![0, 2, 0, 0, 0, 6, 1, 6, 0, 0, 0, 2])
+            ),
+            Err(FatalError::Protocol(_))
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, item, None),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
     #[test]
     fn register_bit_writes_outside_one_allowed_holding_point_are_rejected_before_send() {
         for enabled in [false, true] {
@@ -1521,6 +1826,7 @@ mod tests {
             probe_poisoned: Cell::new(false),
             write_enabled: false,
             register_bit_write: true,
+            register_write_fc6: false,
             write_allowlist: Vec::new(),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
@@ -1581,6 +1887,7 @@ mod tests {
             probe_poisoned: Cell::new(false),
             write_enabled: false,
             register_bit_write: true,
+            register_write_fc6: false,
             write_allowlist: Vec::new(),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
@@ -2178,6 +2485,7 @@ mod tests {
             ("probe_address", "200001"),
             ("write_mode", "yes"),
             ("register_bit_write", "no"),
+            ("register_write", "fc5"),
             ("write_allowlist", "300001-300002"),
             ("write_allowlist", "000001-400001"),
             ("write_allowlist", "400001-400004,400004-400005"),
