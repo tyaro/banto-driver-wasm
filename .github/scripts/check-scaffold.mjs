@@ -40,6 +40,7 @@ const allowed = new Set([
   'drivers/slmp/src/q_extension.rs',
   'drivers/slmp/src/sd_basic.rs',
   'drivers/slmp/src/type_name.rs',
+  'drivers/slmp/tests/frame_3e.rs',
   'drivers/slmp/tests/q_zr.rs',
   'drivers/slmp/tests/q_extension.rs',
   'drivers/slmp/tests/read_frame.rs',

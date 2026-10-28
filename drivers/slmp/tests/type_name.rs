@@ -216,6 +216,7 @@ fn request_uses_the_selected_route_and_keeps_command_fixed() {
         io: 0x0123,
         station: 5,
         timer: 0x0099,
+        ..Route::default()
     };
     let req = encode_type_name(route);
     assert_eq!(

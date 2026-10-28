@@ -1,5 +1,6 @@
-//! Binary 4E SLMP read (0401) and bounded Q/R word or bit write (1401) framing.
+//! Binary 4E or 3E SLMP read (0401) and bounded Q/R word or bit write (1401) framing.
 //! This core does no I/O or configured-range lookup; the guest gates writes.
+//! 3E has no serial number, so the caller must match its responses by order.
 #![no_std]
 
 extern crate alloc;
@@ -148,8 +149,40 @@ pub struct ReadSpan {
     pub count: u16,
 }
 
+/// Binary frame header variant. Command and data fields are the same in both.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Frame {
+    /// Subheader 5400/D400 with a serial number and two reserved bytes.
+    #[default]
+    E4,
+    /// Subheader 5000/D000 without a serial number; responses are matched by order.
+    E3,
+}
+
+impl Frame {
+    /// Response bytes up to and including the end code.
+    pub const fn response_header_len(self) -> usize {
+        match self {
+            Self::E4 => 15,
+            Self::E3 => 11,
+        }
+    }
+
+    /// Offset of the little-endian u16 response data length.
+    pub const fn length_offset(self) -> usize {
+        self.response_header_len() - 4
+    }
+
+    /// Complete response length minus the length field value.
+    pub const fn length_adjust(self) -> usize {
+        self.length_offset() + 2
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Route {
+    pub frame: Frame,
+    /// Sent and echoed by 4E only; 3E ignores it.
     pub serial: u16,
     pub network: u8,
     pub pc: u8,
@@ -161,6 +194,7 @@ pub struct Route {
 impl Default for Route {
     fn default() -> Self {
         Self {
+            frame: Frame::E4,
             serial: 1,
             network: 0,
             pc: 0xff,
@@ -209,9 +243,14 @@ fn check_span(series: Series, span: ReadSpan) -> Result<(), RequestError> {
 
 fn request_head(route: Route, data_length: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(27);
-    out.extend_from_slice(&[0x54, 0x00]);
-    out.extend_from_slice(&route.serial.to_le_bytes());
-    out.extend_from_slice(&[0, 0]);
+    match route.frame {
+        Frame::E4 => {
+            out.extend_from_slice(&[0x54, 0x00]);
+            out.extend_from_slice(&route.serial.to_le_bytes());
+            out.extend_from_slice(&[0, 0]);
+        }
+        Frame::E3 => out.extend_from_slice(&[0x50, 0x00]),
+    }
     out.push(route.network);
     out.push(route.pc);
     out.extend_from_slice(&route.io.to_le_bytes());
@@ -221,7 +260,7 @@ fn request_head(route: Route, data_length: u16) -> Vec<u8> {
     out
 }
 
-/// Build one complete binary 4E batch-read request (command 0401).
+/// Build one complete binary 4E or 3E batch-read request (command 0401).
 pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u8>, RequestError> {
     check_span(series, span)?;
     let mut out = request_head(route, if series == Series::Q { 12 } else { 14 });
@@ -243,7 +282,7 @@ pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u
     Ok(out)
 }
 
-/// Build one binary 4E iQ-R word write for contiguous D or W points.
+/// Build one binary 4E or 3E iQ-R word write for contiguous D or W points.
 /// The caller must establish the CPU model and configured area range first.
 pub fn encode_r_dw_words(
     route: Route,
@@ -263,7 +302,7 @@ pub fn encode_r_dw_words(
             count,
         },
     )?;
-    let data_length = 14 + count * 2; // 960 words fit in the 4E length field.
+    let data_length = 14 + count * 2; // 960 words fit in the length field.
     let mut out = request_head(route, data_length);
     out.extend_from_slice(&0x1401u16.to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
@@ -282,10 +321,10 @@ pub fn encode_r_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<
 
 /// Preserve the original single-point API for its existing callers.
 pub fn encode_r_d_write(route: Route, number: u32, value: u16) -> Vec<u8> {
-    encode_r_d_words(route, number, &[value]).expect("one D word fits a 4E request")
+    encode_r_d_words(route, number, &[value]).expect("one D word fits a request")
 }
 
-/// Build one binary 4E Q word write for contiguous D or W points.
+/// Build one binary 4E or 3E Q word write for contiguous D or W points.
 /// The caller must establish the exact CPU model and configured area span first.
 pub fn encode_q_dw_words(
     route: Route,
@@ -321,7 +360,7 @@ pub fn encode_q_d_words(route: Route, number: u32, words: &[u16]) -> Result<Vec<
     encode_q_dw_words(route, Device::D, number, words)
 }
 
-/// Build one binary 4E bit-unit write. Model and configured point counts must
+/// Build one binary 4E or 3E bit-unit write. Model and configured point counts must
 /// be checked by the caller before this wire-only function is used.
 pub fn encode_bits(
     route: Route,
@@ -377,25 +416,44 @@ pub fn decode_write_ack(route: Route, frame: &[u8]) -> Result<(), ResponseError>
 }
 
 /// Parse a complete response to this request. The Hub owns stream framing and I/O.
-/// Even PLC refusals must echo the request's route and serial number.
+/// Even PLC refusals must echo the request's route, and with 4E its serial number.
 fn response_data(route: Route, frame: &[u8]) -> Result<&[u8], ResponseError> {
-    if frame.len() < 15
-        || frame[0..2] != [0xd4, 0]
-        || frame[2..4] != route.serial.to_le_bytes()
-        || frame[4..6] != [0, 0]
-        || frame[6] != route.network
-        || frame[7] != route.pc
-        || frame[8..10] != route.io.to_le_bytes()
-        || frame[10] != route.station
-        || usize::from(u16::from_le_bytes([frame[11], frame[12]])) != frame.len() - 13
+    let header = route.frame.response_header_len();
+    if frame.len() < header {
+        return Err(ResponseError::Framing);
+    }
+    let route_at = match route.frame {
+        Frame::E4 => {
+            if frame[0..2] != [0xd4, 0]
+                || frame[2..4] != route.serial.to_le_bytes()
+                || frame[4..6] != [0, 0]
+            {
+                return Err(ResponseError::Framing);
+            }
+            6
+        }
+        Frame::E3 => {
+            if frame[0..2] != [0xd0, 0] {
+                return Err(ResponseError::Framing);
+            }
+            2
+        }
+    };
+    let length_at = route.frame.length_offset();
+    if frame[route_at] != route.network
+        || frame[route_at + 1] != route.pc
+        || frame[route_at + 2..route_at + 4] != route.io.to_le_bytes()
+        || frame[route_at + 4] != route.station
+        || usize::from(u16::from_le_bytes([frame[length_at], frame[length_at + 1]]))
+            != frame.len() - route.frame.length_adjust()
     {
         return Err(ResponseError::Framing);
     }
-    let end_code = u16::from_le_bytes([frame[13], frame[14]]);
+    let end_code = u16::from_le_bytes([frame[header - 2], frame[header - 1]]);
     if end_code != 0 {
         return Err(ResponseError::EndCode(end_code));
     }
-    Ok(&frame[15..])
+    Ok(&frame[header..])
 }
 
 pub fn decode_read(route: Route, span: ReadSpan, frame: &[u8]) -> Result<Values, ResponseError> {
