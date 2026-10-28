@@ -583,6 +583,11 @@ fn parse_read_address(
             return Ok((device, number, kind));
         }
     }
+    // LZ is not allowed in 0401 batch read; it needs 0403 random read.
+    // Check before the single-letter L bit prefix.
+    if text.starts_with("LZ") {
+        return Err("LZ long index register needs 0403 random read and is not supported".into());
+    }
     // Multi-letter prefixes precede their single-letter names.
     let bit_prefixes = [
         ("LCS", Device::LCS, 10),
@@ -603,6 +608,8 @@ fn parse_read_address(
         ("B", Device::B, 16),
         ("L", Device::L, 10),
         ("F", Device::F, 10),
+        // Step relay S: only when a digit follows, so SD/SW/SN keep their word parsing.
+        ("S", Device::S, 10),
     ];
     if text.starts_with('V') {
         return Err(
@@ -611,6 +618,9 @@ fn parse_read_address(
     }
     if let Some((device, radix, digits)) =
         bit_prefixes.iter().find_map(|(prefix, device, radix)| {
+            if *prefix == "S" && !text.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
             text.strip_prefix(prefix)
                 .map(|digits| (*device, *radix, digits))
         })
@@ -665,6 +675,10 @@ fn parse_read_address(
         (Device::W, 16, digits)
     } else if let Some(digits) = text.strip_prefix("ZR") {
         (Device::ZR, 16, digits)
+    } else if let Some(digits) = text.strip_prefix('Z') {
+        (Device::Z, 10, digits)
+    } else if let Some(digits) = text.strip_prefix("RD") {
+        (Device::RD, 10, digits)
     } else {
         return Err("unsupported word device address".into());
     };
@@ -725,6 +739,9 @@ fn canonical_read(device: Device, number: i64) -> Result<String, String> {
         Device::LCS => Ok(format!("LCS{number}")),
         Device::LCC => Ok(format!("LCC{number}")),
         Device::ZR => Ok(format!("ZR{number:X}")),
+        Device::S => Ok(format!("S{number}")),
+        Device::Z => Ok(format!("Z{number}")),
+        Device::RD => Ok(format!("RD{number}")),
     }
 }
 
@@ -831,7 +848,10 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
         | Device::LCN
         | Device::LCS
         | Device::LCC
-        | Device::ZR => PointCount::Unknown,
+        | Device::ZR
+        | Device::S
+        | Device::Z
+        | Device::RD => PointCount::Unknown,
     }
 }
 
@@ -874,6 +894,7 @@ fn checked_read_span(
                 | Device::LCS
                 | Device::LCC
                 | Device::ZR
+                | Device::RD
         ) && model.family != ModelFamily::StandardR))
     {
         return Err(FatalError::InvalidConfig(
@@ -1686,6 +1707,9 @@ impl address::Guest for Component {
                 Device::LCS => "LCS",
                 Device::LCC => "LCC",
                 Device::ZR => "ZR",
+                Device::S => "S",
+                Device::Z => "Z",
+                Device::RD => "RD",
             }
             .into(),
             // Static capability only; the common setting, SD proof and Host gate still decide writes.
@@ -1769,6 +1793,8 @@ impl address::Guest for Component {
             .iter()
             .any(|prefix| text.starts_with(prefix))
                 && !text.starts_with("SW")
+            // Step relay S is a bit device only when a digit follows.
+            || text.starts_with('S') && text.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
         {
             "bit"
         } else {
@@ -1783,7 +1809,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read and is read-only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read and is read-only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -2222,6 +2248,125 @@ mod tests {
             ReadKind::LongTimer.decode_words(&[0x1234, 0xffff, 3, 0], WordOrder::HighLow),
             Ok(Value::Int(-60876))
         ));
+    }
+
+    #[test]
+    fn s_z_rd_are_read_only_unknown_range_devices() {
+        let spec = |address: &str, kind: &str| TagSpec {
+            address: address.into(),
+            data_type: kind.into(),
+            string_words: None,
+        };
+        let none = (PointCount::Unknown, PointCount::Unknown);
+        let q = model(ModelFamily::StandardQ);
+        let r = model(ModelFamily::StandardR);
+        let q25 = model(ModelFamily::Q25PrhWireOnly);
+        // (address, type, canonical, area, device, number, wire count, value words, on Q)
+        for (text, kind, canonical, area, device, number, count, words, on_q) in [
+            ("S10", "bit", "S10", "S", Device::S, 10, 1, 1, true),
+            ("Z3", "u16", "Z3", "Z", Device::Z, 3, 1, 1, true),
+            ("z3", "u16", "Z3", "Z", Device::Z, 3, 1, 1, true),
+            ("Z3", "u64", "Z3", "Z", Device::Z, 3, 4, 4, true),
+            ("RD7", "f32", "RD7", "RD", Device::RD, 7, 2, 2, false),
+            ("RD7", "u16", "RD7", "RD", Device::RD, 7, 1, 1, false),
+        ] {
+            let parsed = <Component as address::Guest>::parse(text.into(), kind.into(), None);
+            if text.starts_with('z') {
+                assert!(parsed.is_err(), "{text} is case-sensitive");
+                continue;
+            }
+            let parsed = parsed.unwrap();
+            assert_eq!(parsed.canonical, canonical);
+            assert_eq!(parsed.area, area);
+            assert_eq!(parsed.index, Some(number));
+            assert_eq!(parsed.word_count, words);
+            assert!(!parsed.writable_area, "{text}");
+            let tag = spec(text, kind);
+            let expected = ReadSpan {
+                device,
+                start: number as u32,
+                count,
+            };
+            assert_eq!(
+                checked_read_span(&tag, &r, none.0, none.1).unwrap(),
+                expected
+            );
+            assert_eq!(checked_read_span(&tag, &q, none.0, none.1).is_ok(), on_q);
+            assert!(checked_read_span(&tag, &q25, none.0, none.1).is_err());
+            assert_eq!(
+                read_count(device, PointCount::Exact(1), PointCount::Exact(1)),
+                PointCount::Unknown
+            );
+        }
+        // LZ is rejected with a specific message, ahead of the L bit prefix.
+        for (text, kind) in [
+            ("LZ0", "i32"),
+            ("LZ0", "bit"),
+            ("LZ", "i32"),
+            ("LZ1", "u16"),
+        ] {
+            assert_eq!(
+                parse_read_address(text, kind, None).unwrap_err(),
+                "LZ long index register needs 0403 random read and is not supported"
+            );
+        }
+        // The names that begin with S or L/Z keep their previous parsing.
+        for (text, kind, device, number) in [
+            ("S10", "bit", Device::S, 10),
+            ("SD10", "u16", Device::SD, 10),
+            ("SW1A", "u16", Device::SW, 0x1a),
+            ("SN3", "u16", Device::SN, 3),
+            ("SB1", "bit", Device::SB, 1),
+            ("SM0", "bit", Device::SM, 0),
+            ("SS0", "bit", Device::SS, 0),
+            ("STS0", "bit", Device::STS, 0),
+            ("ZR10", "u16", Device::ZR, 0x10),
+            ("L5", "bit", Device::L, 5),
+        ] {
+            let (d, n, _) = parse_read_address(text, kind, None).unwrap();
+            assert_eq!((d, n), (device, number), "{text}");
+        }
+        for (text, kind) in [
+            ("S1A", "bit"),
+            ("S", "bit"),
+            ("S10", "u16"),
+            ("Z", "u16"),
+            ("Z1A", "u16"),
+            ("RD1A", "u16"),
+            ("RD", "u16"),
+        ] {
+            assert!(parse_read_address(text, kind, None).is_err(), "{text}");
+        }
+        // string_words is not accepted for S.
+        assert!(parse_read_address("S1", "bit", Some(1)).is_err());
+        let off = |text: &str, kind: &str, n| {
+            <Component as address::Guest>::offset(text.into(), kind.into(), None, n)
+        };
+        assert_eq!(off("S10", "bit", 2).unwrap(), "S12");
+        assert_eq!(off("Z3", "u32", 1).unwrap(), "Z5");
+        assert_eq!(off("RD7", "u16", 3).unwrap(), "RD10");
+        let words = |text: &str| <Component as address::Guest>::offset_words(text.into(), 1);
+        assert_eq!(words("S10").unwrap(), "S11");
+        assert_eq!(words("Z3").unwrap(), "Z4");
+        assert_eq!(words("RD7").unwrap(), "RD8");
+        assert_eq!(words("SD10").unwrap(), "SD11");
+        assert_eq!(words("SW1A").unwrap(), "SW1B");
+        assert_eq!(words("SN3").unwrap(), "SN4");
+        // Writes never reach these devices.
+        for (text, kind, value) in [
+            ("S1", "bit", Value::Bool(true)),
+            ("Z1", "u16", Value::Float(1.0)),
+            ("RD1", "u16", Value::Float(1.0)),
+        ] {
+            let item = write_v1::WriteItem {
+                spec: spec(text, kind),
+                value,
+            };
+            assert!(
+                parse_write_run(&[item], WordOrder::LowHigh).is_err(),
+                "{text}"
+            );
+        }
     }
 
     #[test]
