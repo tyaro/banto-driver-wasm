@@ -1,8 +1,9 @@
-//! Binary 4E SLMP guest for Q/R reads and restricted numeric/bit writes.
+//! Binary 4E or 3E SLMP guest for Q/R reads and restricted numeric/bit writes.
 //! The host owns transport. Each connection owns its discovery evidence.
+//! 3E has no serial number: reads are matched to responses in issue order.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use banto::driver::types::{FatalError, ItemError, TagSpec, Value};
 use banto_register_codec::{
@@ -11,8 +12,8 @@ use banto_register_codec::{
 use banto_slmp_read_core::{
     basic_sd_count, decode_read, decode_type_name, decode_write_ack, encode_bits,
     encode_q25prh_d3010_3013_test_write, encode_q_dw_words, encode_r_dw_words, encode_read,
-    encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, ModelFamily, PointCount,
-    ReadSpan, ResponseError, Route, Series, TypeName, Values,
+    encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, Frame, ModelFamily,
+    PointCount, ReadSpan, ResponseError, Route, Series, TypeName, Values,
 };
 use exports::banto::driver::{address, config, diagnostics_v1, read, session, write_v1};
 mod diagnostics;
@@ -58,6 +59,8 @@ struct SlmpConnection {
     bit_counts: Cell<[PointCount; 4]>, // M, Y, L, B; only same-connection SD evidence.
     diagnostic_bit_counts: Cell<[PointCount; 3]>, // X, SB, F; never a write grant.
     pending: RefCell<BTreeMap<u16, PendingRead>>,
+    /// Pending read keys in issue order. 3E decodes only the front entry.
+    read_order: RefCell<VecDeque<u16>>,
     pending_write: RefCell<Option<PendingWrite>>,
     write_poisoned: Cell<bool>,
     pending_diagnostic: RefCell<Option<diagnostics::PendingDiagnostic>>,
@@ -340,7 +343,7 @@ impl SlmpConnection {
                 d_count,
                 span,
             };
-            Ok(Some(frame_step(send)))
+            Ok(Some(frame_step(route.frame, send)))
         } else {
             *self.phase.borrow_mut() = Phase::Ready {
                 model,
@@ -360,30 +363,30 @@ impl SlmpConnection {
     }
 }
 
-fn frame_step(send: Vec<u8>) -> session::Step {
+fn frame_step(frame: Frame, send: Vec<u8>) -> session::Step {
     session::Step {
         send,
         expect: session::FrameRule::LengthPrefixed(session::PrefixSpec {
-            offset: 11,
+            offset: frame.length_offset() as u32,
             width: 2,
             big_endian: false,
-            adjust: 13,
+            adjust: frame.length_adjust() as i32,
             encoding: session::PrefixEncoding::Binary,
         }),
         max_len: 64,
     }
 }
 
-fn read_step(send: Vec<u8>, span: ReadSpan) -> session::Step {
-    let mut step = frame_step(send);
-    // Binary 4E bit responses pack two points per byte; words use two bytes.
+fn read_step(frame: Frame, send: Vec<u8>, span: ReadSpan) -> session::Step {
+    let mut step = frame_step(frame, send);
+    // Binary bit responses pack two points per byte; words use two bytes.
     // Keep the previous allowance for short PLC refusal frames.
     let body_len = if span.device.is_bit() {
         u32::from(span.count).div_ceil(2)
     } else {
         u32::from(span.count) * 2
     };
-    step.max_len = (15 + body_len).max(64);
+    step.max_len = (frame.response_header_len() as u32 + body_len).max(64);
     step
 }
 
@@ -418,6 +421,7 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
                 | "port"
                 | "transport"
                 | "word_order"
+                | "frame"
                 | "q25prh_d3010_3013_test_write"
                 | MODE_KEY
                 | ALLOWLIST_KEY
@@ -455,6 +459,12 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
         errors.push(config::FieldError {
             key: "word_order".into(),
             message: "word_order must be low_high or high_low".into(),
+        });
+    }
+    if setting(settings, "frame").is_some_and(|value| !matches!(value, "4e" | "3e")) {
+        errors.push(config::FieldError {
+            key: "frame".into(),
+            message: "frame must be 4e or 3e".into(),
         });
     }
     if setting(settings, "q25prh_d3010_3013_test_write")
@@ -960,7 +970,13 @@ impl session::GuestConnection for SlmpConnection {
             return Err(FatalError::InvalidConfig(error.message.clone()));
         }
         Ok(session::Connection::new(Self {
-            base_route: Route::default(),
+            base_route: Route {
+                frame: match setting(&settings, "frame") {
+                    Some("3e") => Frame::E3,
+                    _ => Frame::E4,
+                },
+                ..Route::default()
+            },
             word_order: match setting(&settings, "word_order") {
                 Some("high_low") => WordOrder::HighLow,
                 _ => WordOrder::LowHigh,
@@ -979,6 +995,7 @@ impl session::GuestConnection for SlmpConnection {
             bit_counts: Cell::new([PointCount::Unknown; 4]),
             diagnostic_bit_counts: Cell::new([PointCount::Unknown; 3]),
             pending: RefCell::new(BTreeMap::new()),
+            read_order: RefCell::new(VecDeque::new()),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
             pending_diagnostic: RefCell::new(None),
@@ -1003,7 +1020,7 @@ impl session::GuestConnection for SlmpConnection {
             (Phase::Start, None) => {
                 let route = self.route();
                 *self.phase.borrow_mut() = Phase::AwaitType { route };
-                Ok(Some(frame_step(encode_type_name(route))))
+                Ok(Some(frame_step(route.frame, encode_type_name(route))))
             }
             (Phase::AwaitType { route }, Some(frame)) => {
                 let model = match decode_type_name(route, &frame) {
@@ -1044,7 +1061,7 @@ impl session::GuestConnection for SlmpConnection {
                     model,
                     span,
                 };
-                Ok(Some(frame_step(send)))
+                Ok(Some(frame_step(sd_route.frame, send)))
             }
             (Phase::AwaitSd { route, model, span }, Some(frame)) => {
                 let words = match decode_read(route, span, &frame) {
@@ -1194,6 +1211,13 @@ impl read::Guest for Component {
                 "diagnostic response is pending; reconnect".into(),
             ));
         }
+        if conn.base_route.frame == Frame::E3 && !conn.pending.borrow().is_empty() {
+            // Without a serial number a late answer to an earlier read would be
+            // indistinguishable from the answer to a new one.
+            return Err(FatalError::Protocol(
+                "3E read is pending; responses cannot be matched".into(),
+            ));
+        }
         let phase = conn.phase.borrow();
         let Phase::Ready { model, count } = &*phase else {
             return Err(FatalError::Protocol(
@@ -1293,7 +1317,7 @@ impl read::Guest for Component {
             };
             let send = encode_read(route, series, group.span)
                 .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-            let step = read_step(send, group.span);
+            let step = read_step(route.frame, send, group.span);
             plans.push(read::Planned {
                 step,
                 covers: group.covers.clone(),
@@ -1302,6 +1326,9 @@ impl read::Guest for Component {
             serial = serial.wrapping_add(1);
         }
         drop(pending);
+        conn.read_order
+            .borrow_mut()
+            .extend(new_pending.iter().map(|(serial, _)| *serial));
         conn.pending.borrow_mut().extend(new_pending);
         conn.next_serial.set(serial);
         Ok(plans)
@@ -1325,15 +1352,26 @@ impl read::Guest for Component {
                 "configured range is unresolved".into(),
             ));
         };
-        let serial_bytes: [u8; 2] = p
-            .step
-            .send
-            .get(2..4)
-            .ok_or_else(|| FatalError::Protocol("invalid plan".into()))?
-            .try_into()
-            .map_err(|_| FatalError::Protocol("invalid plan".into()))?;
+        let serial = match conn.base_route.frame {
+            Frame::E4 => {
+                let serial_bytes: [u8; 2] = p
+                    .step
+                    .send
+                    .get(2..4)
+                    .ok_or_else(|| FatalError::Protocol("invalid plan".into()))?
+                    .try_into()
+                    .map_err(|_| FatalError::Protocol("invalid plan".into()))?;
+                u16::from_le_bytes(serial_bytes)
+            }
+            // 3E has no serial on the wire. The Host answers plans one at a
+            // time in plan order, so only the oldest pending read may decode;
+            // its covers and exact bytes are checked below.
+            Frame::E3 => *conn.read_order.borrow().front().ok_or_else(|| {
+                FatalError::Protocol("plan is not pending on this connection".into())
+            })?,
+        };
         let route = Route {
-            serial: u16::from_le_bytes(serial_bytes),
+            serial,
             ..conn.base_route
         };
         let pending = conn
@@ -1382,10 +1420,15 @@ impl read::Guest for Component {
         let series = known_series(model).expect("ready model has series");
         let expected = encode_read(route, series, pending.span)
             .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-        if p.step.send != expected || p.step.max_len != read_step(expected, pending.span).max_len {
+        if p.step.send != expected
+            || p.step.max_len != read_step(route.frame, expected, pending.span).max_len
+        {
             return Err(FatalError::Protocol("plan bytes do not match spec".into()));
         }
         conn.pending.borrow_mut().remove(&route.serial);
+        conn.read_order
+            .borrow_mut()
+            .retain(|serial| *serial != route.serial);
         match decode_read(route, pending.span, &response) {
             Ok(Values::Words(words)) if !pending.span.device.is_bit() => {
                 let mut offset = 0usize;
@@ -1600,7 +1643,7 @@ impl write_v1::Guest for Component {
         };
         *conn.pending_write.borrow_mut() = Some(PendingWrite { route, run });
         Ok(write_v1::WriteProgress::Send(read::Planned {
-            step: frame_step(send),
+            step: frame_step(route.frame, send),
             covers: (0..items.len() as u32).collect(),
         }))
     }
@@ -1886,6 +1929,24 @@ impl config::Guest for Component {
                 ]),
                 required: false,
                 default: Some(SettingValue::Text("low_high".into())),
+                group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "frame".into(),
+                label: "SLMP frame".into(),
+                help: Some("Binary frame header. 4E echoes a serial number in each response. 3E has no serial number, so responses are matched by order and a new read is refused while an earlier one is unanswered.".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption {
+                        value: "4e".into(),
+                        label: "4E binary (serial number)".into(),
+                    },
+                    ChoiceOption {
+                        value: "3e".into(),
+                        label: "3E binary (no serial number)".into(),
+                    },
+                ]),
+                required: false,
+                default: Some(SettingValue::Text("4e".into())),
                 group: FieldGroup::Advanced,
             },
             SettingField {
@@ -2976,6 +3037,52 @@ mod tests {
         assert!(validate_settings(&bad)
             .iter()
             .any(|e| e.key == "word_order"));
+    }
+
+    #[test]
+    fn frame_setting_accepts_4e_or_3e_and_defaults_to_4e() {
+        let mut settings = vec![
+            session::Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            session::Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+            session::Setting {
+                key: "frame".into(),
+                value: "4e".into(),
+            },
+        ];
+        assert!(validate_settings(&settings).is_empty());
+        settings[2].value = "3e".into();
+        assert!(validate_settings(&settings).is_empty());
+        for bad in ["3E", "1e", "ascii", ""] {
+            settings[2].value = bad.into();
+            let errors = validate_settings(&settings);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.key == "frame" && e.message == "frame must be 4e or 3e"),
+                "{bad:?}"
+            );
+        }
+        let schema = <Component as config::Guest>::schema();
+        let field = schema
+            .iter()
+            .find(|field| field.key == "frame")
+            .expect("frame field");
+        assert!(matches!(&field.default, Some(config::SettingValue::Text(value)) if value == "4e"));
+        assert!(!field.required);
+        assert!(matches!(&field.group, config::FieldGroup::Advanced));
+        assert!(matches!(&field.kind, config::FieldKind::Choice(options)
+            if options.iter().map(|option| option.value.as_str()).collect::<Vec<_>>() == ["4e", "3e"]));
+        assert!(field
+            .help
+            .as_deref()
+            .is_some_and(|help| help.contains("by order")));
+        assert_eq!(Route::default().frame, Frame::E4);
     }
 
     #[test]

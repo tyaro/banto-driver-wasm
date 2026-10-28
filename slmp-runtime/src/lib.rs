@@ -21,6 +21,15 @@ mod tests {
         frame
     }
 
+    /// Binary 3E response for the default route: no serial and no reserved bytes.
+    fn response_3e(body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0xd0, 0, 0, 0xff, 0xff, 3, 0];
+        frame.extend_from_slice(&(u16::try_from(body.len() + 2).unwrap()).to_le_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(body);
+        frame
+    }
+
     fn q_sd_data(d_internal: u16, w_internal: u16) -> [u8; 4] {
         let [d0, d1] = d_internal.to_le_bytes();
         let [w0, w1] = w_internal.to_le_bytes();
@@ -3246,6 +3255,337 @@ mod tests {
             pair_value.as_slice(),
             [Ok(Value::Uint(0xabcd_1234))]
         ));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    fn settings_3e() -> Vec<banto::driver::types::Setting> {
+        let mut settings = settings();
+        settings.push(banto::driver::types::Setting {
+            key: "frame".into(),
+            value: "3e".into(),
+        });
+        settings
+    }
+
+    fn model_data(name: &str, code: u16) -> [u8; 18] {
+        let mut data = [b' '; 18];
+        data[0..name.len()].copy_from_slice(name.as_bytes());
+        data[16..18].copy_from_slice(&code.to_le_bytes());
+        data
+    }
+
+    fn ready_q_3e(
+        store: &mut Store<()>,
+        driver: &Driver,
+    ) -> wasmtime::Result<exports::banto::driver::session::Connection> {
+        use exports::banto::driver::session::FrameRule;
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut *store, &settings_3e())?
+            .expect("3E settings");
+        let type_step = driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, None)?
+            .expect("handshake")
+            .expect("0101");
+        assert_eq!(
+            type_step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 6, 0, 0x10, 0, 1, 1, 0, 0]
+        );
+        assert!(matches!(&type_step.expect, FrameRule::LengthPrefixed(spec)
+            if spec.offset == 7 && spec.adjust == 9 && spec.width == 2 && !spec.big_endian));
+        let sd_step = driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(
+                &mut *store,
+                conn,
+                Some(&response_3e(&model_data("Q02UCPU", 0x0263))),
+            )?
+            .expect("3E type decode")
+            .expect("SD302");
+        assert_eq!(
+            sd_step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0x10, 0, 1, 4, 0, 0, 0x2e, 1, 0, 0xa9, 2, 0]
+        );
+        assert!(matches!(&sd_step.expect, FrameRule::LengthPrefixed(spec)
+            if spec.offset == 7 && spec.adjust == 9));
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, Some(&response_3e(&q_sd_data(100, 32))))?
+            .expect("3E SD decode")
+            .is_none());
+        Ok(conn)
+    }
+
+    #[test]
+    fn three_e_reads_decode_in_plan_order_and_refuse_ambiguous_responses() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        use exports::banto::driver::session::FrameRule;
+        let (mut store, driver) = load()?;
+        let specs = d_specs(&[10, 11, 20]);
+
+        let conn = ready_q_3e(&mut store, &driver)?;
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("verified D10-D11 batch and a separate D20 read");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].covers, [0, 1]);
+        assert_eq!(plans[1].covers, [2]);
+        assert_eq!(
+            plans[0].step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0x10, 0, 1, 4, 0, 0, 10, 0, 0, 0xa8, 2, 0]
+        );
+        assert_eq!(
+            plans[1].step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0x10, 0, 1, 4, 0, 0, 20, 0, 0, 0xa8, 1, 0]
+        );
+        for plan in &plans {
+            assert!(matches!(&plan.step.expect, FrameRule::LengthPrefixed(spec)
+                if spec.offset == 7 && spec.adjust == 9 && spec.width == 2 && !spec.big_endian));
+            assert_eq!(plan.step.max_len, 64);
+        }
+        let first = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response_3e(&[0x34, 0x12, 0x78, 0x56]),
+            )?
+            .expect("first 3E response");
+        assert!(matches!(
+            first.as_slice(),
+            [Ok(Value::Uint(0x1234)), Ok(Value::Uint(0x5678))]
+        ));
+        let second = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[1],
+                &specs,
+                &response_3e(&[0xcd, 0xab]),
+            )?
+            .expect("second 3E response");
+        assert!(matches!(second.as_slice(), [Ok(Value::Uint(0xabcd))]));
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    conn,
+                    &plans[1],
+                    &specs,
+                    &response_3e(&[0xcd, 0xab]),
+                )?
+                .is_err(),
+            "a decoded 3E plan cannot be replayed"
+        );
+        conn.resource_drop(&mut store)?;
+
+        let conn = ready_q_3e(&mut store, &driver)?;
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("3E plans");
+        let first = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response_3e(&[0x34, 0x12, 0x78, 0x56]),
+            )?
+            .expect("first 3E response");
+        assert_eq!(first.len(), 2);
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs[2..])?
+                .is_err(),
+            "a new 3E read while one is pending is fatal"
+        );
+        conn.resource_drop(&mut store)?;
+
+        let conn = ready_q_3e(&mut store, &driver)?;
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("3E plans");
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    conn,
+                    &plans[1],
+                    &specs,
+                    &response_3e(&[0xcd, 0xab]),
+                )?
+                .is_err(),
+            "decoding the second 3E plan before the first is fatal"
+        );
+        conn.resource_drop(&mut store)?;
+
+        // Same addresses in two plans: only the covers tell them apart.
+        let duplicate = d_specs(&[5, 5]);
+        let conn = ready_q_3e(&mut store, &driver)?;
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &duplicate)?
+            .expect("duplicate 3E plans");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].step.send, plans[1].step.send);
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    conn,
+                    &plans[1],
+                    &duplicate,
+                    &response_3e(&[0x11, 0x11]),
+                )?
+                .is_err(),
+            "identical bytes cannot mask out-of-order 3E decoding"
+        );
+        conn.resource_drop(&mut store)?;
+
+        let conn = ready_q_3e(&mut store, &driver)?;
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs[2..])?
+            .expect("one 3E plan");
+        assert!(
+            driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    conn,
+                    &plans[0],
+                    &specs[2..],
+                    &response(4, &[0xcd, 0xab]),
+                )?
+                .is_err(),
+            "a 4E response on a 3E connection is fatal"
+        );
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn three_e_allowlisted_w_write_sends_3e_and_accepts_only_a_3e_ack() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::session::FrameRule;
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let settings = [
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+            Setting {
+                key: "frame".into(),
+                value: "3e".into(),
+            },
+            Setting {
+                key: "d_u16_write_mode".into(),
+                value: "enabled".into(),
+            },
+            Setting {
+                key: "d_u16_write_allowlist".into(),
+                value: "D3010-D3013,W1A-W1F".into(),
+            },
+        ];
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .expect("3E write settings");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_3e(&model_data("Q02UCPU", 0x0263))),
+            )?
+            .expect("SD302");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response_3e(&q_sd_data(100, 32))))?
+            .expect("ready")
+            .is_none());
+        let item = |address: &str, value: f64| WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Float(value),
+        };
+        let items = [item("W1A", 1.0), item("W1B", 2.0)];
+        let WriteProgress::Send(plan) = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("3E W write preflight")
+        else {
+            panic!("verified W range should send")
+        };
+        assert_eq!(plan.covers, [0, 1]);
+        assert_eq!(
+            plan.step.send,
+            [
+                0x50, 0, 0, 0xff, 0xff, 3, 0, 16, 0, 0x10, 0, 1, 0x14, 0, 0, 0x1a, 0, 0, 0xb4, 2,
+                0, 1, 0, 2, 0
+            ]
+        );
+        assert!(matches!(&plan.step.expect, FrameRule::LengthPrefixed(spec)
+            if spec.offset == 7 && spec.adjust == 9));
+        let done = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &items, Some(&response_3e(&[])))?
+            .expect("3E ACK");
+        assert!(
+            matches!(done, WriteProgress::Done(results) if results.len() == 2 && results.iter().all(Result::is_ok))
+        );
+        assert!(matches!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("second preflight"),
+            WriteProgress::Send(_)
+        ));
+        assert!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, Some(&response(4, &[])))?
+                .is_err(),
+            "a 4E ACK on a 3E connection is fatal"
+        );
         conn.resource_drop(&mut store)?;
         Ok(())
     }

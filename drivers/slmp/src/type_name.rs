@@ -1,4 +1,4 @@
-//! 0101/0000 Read Type Name (binary 4E). The lookup is deliberately limited
+//! 0101/0000 Read Type Name (binary 4E or 3E). The lookup is deliberately limited
 //! to ordinary Q and iQ-R/EN CPU pairs plus the narrow Q25PRH pair in
 //! the official model-code table.
 use alloc::{string::String, vec::Vec};
@@ -25,14 +25,14 @@ pub struct TypeName {
     pub family: ModelFamily,
 }
 
-/// Build one 4E request for Read Type Name (0101/0000).
+/// Build one 4E or 3E request for Read Type Name (0101/0000).
 pub fn encode_type_name(route: Route) -> Vec<u8> {
     let mut out = request_head(route, 6);
     out.extend_from_slice(&[0x01, 0x01, 0x00, 0x00]);
     out
 }
 
-/// Decode a complete 4E response. A recognized model still needs configured
+/// Decode a complete 4E or 3E response. A recognized model still needs configured
 /// SD counts and route/firmware checks before tag ranges can be asserted.
 pub fn decode_type_name(route: Route, frame: &[u8]) -> Result<TypeName, ResponseError> {
     let data = response_data(route, frame)?;

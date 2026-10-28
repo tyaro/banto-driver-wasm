@@ -446,7 +446,10 @@ impl diagnostics_v1::Guest for Component {
                         span,
                         model,
                     });
-                    return Ok(diagnostics_v1::Progress::Send(frame_step(send)));
+                    return Ok(diagnostics_v1::Progress::Send(frame_step(
+                        route.frame,
+                        send,
+                    )));
                 }
             }
         }
