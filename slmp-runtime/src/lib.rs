@@ -1993,6 +1993,99 @@ mod tests {
     }
 
     #[test]
+    fn q_zr_is_a_read_only_one_request_per_tag_and_absent_on_q00j_q00uj() -> wasmtime::Result<()> {
+        use banto::driver::types::{TagSpec, Value};
+        let numeric = |address: &str, data_type: &str| TagSpec {
+            address: address.into(),
+            data_type: data_type.into(),
+            string_words: None,
+        };
+        let (mut store, driver) = load()?;
+        let q = ready_q(&mut store, &driver, 100)?;
+        let specs = [
+            numeric("ZR10", "u16"),
+            numeric("ZR11", "u16"), // adjacent, but the range is Unknown: not joined
+            numeric("ZR1A", "u32"),
+            numeric("ZRFFFFFF", "u16"),  // last 24-bit Q number
+            numeric("ZRFFFFFF", "u32"),  // spans past 24 bits: uncovered
+            numeric("ZR1000000", "u16"), // 25 bits: uncovered
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, q, &specs)?
+            .expect("Q ZR plans");
+        assert_eq!(
+            plans.len(),
+            4,
+            "one request per ZR tag; 24-bit overflow uncovered"
+        );
+        for (i, (number, points, body)) in [
+            ([0x10u8, 0, 0], 1u8, vec![0x34, 0x12]),
+            ([0x11, 0, 0], 1, vec![0x35, 0x12]),
+            ([0x1a, 0, 0], 2, vec![0x78, 0x56, 0x34, 0x12]),
+            ([0xff, 0xff, 0xff], 1, vec![0xcd, 0xab]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let plan = &plans[i];
+            assert_eq!(plan.covers, [i as u32]);
+            assert_eq!(&plan.step.send[15..17], &[0x01, 0x04], "0401");
+            assert_eq!(&plan.step.send[17..19], &[0, 0], "Q word subcommand 0000");
+            assert_eq!(&plan.step.send[19..22], &number);
+            assert_eq!(plan.step.send[22], 0xb0);
+            assert_eq!(plan.step.send[23], points);
+            let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+            let values = driver
+                .banto_driver_read()
+                .call_decode(&mut store, q, plan, &specs, &response(serial, &body))?
+                .expect("Q ZR decode");
+            let expected = [0x1234u64, 0x1235, 0x1234_5678, 0xabcd][i];
+            assert!(
+                matches!(values.as_slice(), [Ok(Value::Uint(v))] if *v == expected),
+                "{values:?}"
+            );
+        }
+        q.resource_drop(&mut store)?;
+
+        // Q00JCPU and Q00UJCPU have no file register: their ZR tags stay uncovered.
+        for (name, code) in [("Q00JCPU", 0x0250u16), ("Q00UJCPU", 0x0260)] {
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings())?
+                .expect("settings");
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .expect("0101")
+                .is_some());
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&model_response(name, code)))?
+                .expect("SD302")
+                .is_some());
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
+                .expect("ready")
+                .is_none());
+            let specs = [numeric("ZR10", "u16"), numeric("D0", "u16")];
+            let plans = driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs)?
+                .expect("plans");
+            assert_eq!(plans.len(), 1, "{name}: only D0 is planned");
+            assert_eq!(plans[0].covers, [1], "{name}");
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mxyb_bits_use_separate_q_requests_and_typed_boolean_values() -> wasmtime::Result<()> {
         use banto::driver::types::{ItemError, Value};
         let (mut store, driver) = load()?;
