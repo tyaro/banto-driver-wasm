@@ -406,6 +406,95 @@ fn setting<'a>(settings: &'a [session::Setting], key: &str) -> Option<&'a str> {
         .map(|item| item.value.as_str())
 }
 
+/// Strict decimal parse for route numbers: ASCII digits only, no sign,
+/// spaces or leading zeros (except "0" itself).
+fn parse_route_number(text: &str, min: u8, max: u8) -> Option<u8> {
+    if text.is_empty()
+        || !text.bytes().all(|b| b.is_ascii_digit())
+        || (text.len() > 1 && text.starts_with('0'))
+    {
+        return None;
+    }
+    text.parse::<u8>()
+        .ok()
+        .filter(|value| (min..=max).contains(value))
+}
+
+fn target_cpu_io(value: &str) -> Option<u16> {
+    match value {
+        "own" => Some(0x03FF),
+        "cpu1" => Some(0x03E0),
+        "cpu2" => Some(0x03E1),
+        "cpu3" => Some(0x03E2),
+        "cpu4" => Some(0x03E3),
+        _ => None,
+    }
+}
+
+/// Request destination (network, station-as-`pc`, module I/O) from validated
+/// settings. The own station (network 0) uses station FFH.
+fn route_fields(settings: &[session::Setting]) -> (u8, u8, u16) {
+    let network = setting(settings, "network_no")
+        .and_then(|value| parse_route_number(value, 0, 239))
+        .unwrap_or(0);
+    let pc = if network == 0 {
+        0xFF
+    } else {
+        setting(settings, "station_no")
+            .and_then(|value| parse_route_number(value, 1, 120))
+            .unwrap_or(0xFF)
+    };
+    let io = setting(settings, "target_cpu")
+        .and_then(target_cpu_io)
+        .unwrap_or(0x03FF);
+    (network, pc, io)
+}
+
+fn validate_route_settings(settings: &[session::Setting], errors: &mut Vec<config::FieldError>) {
+    let mut push = |key: &str, message: &str| {
+        errors.push(config::FieldError {
+            key: key.into(),
+            message: message.into(),
+        });
+    };
+    let network = setting(settings, "network_no");
+    let station = setting(settings, "station_no");
+    let network_ok = network.map(|value| parse_route_number(value, 0, 239));
+    let station_ok = station.map(|value| parse_route_number(value, 1, 120));
+    if network_ok == Some(None) {
+        push(
+            "network_no",
+            "network_no must be a decimal number from 0 to 239",
+        );
+    }
+    if station_ok == Some(None) {
+        push(
+            "station_no",
+            "station_no must be a decimal number from 1 to 120",
+        );
+    }
+    if network_ok != Some(None) && station_ok != Some(None) {
+        let routed = network_ok.flatten().is_some_and(|value| value != 0);
+        if routed && station.is_none() {
+            push(
+                "station_no",
+                "station_no is required when network_no is not 0",
+            );
+        } else if !routed && station.is_some() {
+            push(
+                "station_no",
+                "station_no must be omitted for the connected station (network_no 0)",
+            );
+        }
+    }
+    if setting(settings, "target_cpu").is_some_and(|value| target_cpu_io(value).is_none()) {
+        push(
+            "target_cpu",
+            "target_cpu must be own, cpu1, cpu2, cpu3 or cpu4",
+        );
+    }
+}
+
 fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
     let mut errors = Vec::new();
     for (i, item) in settings.iter().enumerate() {
@@ -422,6 +511,9 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
                 | "transport"
                 | "word_order"
                 | "frame"
+                | "network_no"
+                | "station_no"
+                | "target_cpu"
                 | "q25prh_d3010_3013_test_write"
                 | MODE_KEY
                 | ALLOWLIST_KEY
@@ -467,6 +559,7 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
             message: "frame must be 4e or 3e".into(),
         });
     }
+    validate_route_settings(settings, &mut errors);
     if setting(settings, "q25prh_d3010_3013_test_write")
         .is_some_and(|value| !matches!(value, "disabled" | "enabled"))
     {
@@ -969,12 +1062,16 @@ impl session::GuestConnection for SlmpConnection {
         if let Some(error) = validate_settings(&settings).first() {
             return Err(FatalError::InvalidConfig(error.message.clone()));
         }
+        let (network, pc, io) = route_fields(&settings);
         Ok(session::Connection::new(Self {
             base_route: Route {
                 frame: match setting(&settings, "frame") {
                     Some("3e") => Frame::E3,
                     _ => Frame::E4,
                 },
+                network,
+                pc,
+                io,
                 ..Route::default()
             },
             word_order: match setting(&settings, "word_order") {
@@ -1947,6 +2044,60 @@ impl config::Guest for Component {
                 ]),
                 required: false,
                 default: Some(SettingValue::Text("4e".into())),
+                group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "network_no".into(),
+                label: "Request destination network No.".into(),
+                help: Some("SLMP request destination network No. 0 is the connected station. 1-239 routes through a relay to another station; station_no is then required. Ranges are proven by the destination's own 0101 model and SD counts read over this same route.".into()),
+                kind: FieldKind::Integer(IntegerSpec {
+                    min: Some(0),
+                    max: Some(239),
+                }),
+                required: false,
+                default: Some(SettingValue::Integer(0)),
+                group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "station_no".into(),
+                label: "Request destination station No.".into(),
+                help: Some("Station No. 1-120 of the other station on network_no. Required when network_no is not 0 and must be omitted otherwise. Extension-station (7CH) and control/master station (7DH/7EH) destinations are not supported.".into()),
+                kind: FieldKind::Integer(IntegerSpec {
+                    min: Some(1),
+                    max: Some(120),
+                }),
+                required: false,
+                default: None,
+                group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "target_cpu".into(),
+                label: "Request destination CPU".into(),
+                help: Some("Request destination CPU. own is the connected station's (control) CPU; cpu1-cpu4 address multiple CPU No.1-4. Redundant system, multidrop, and control/master station (7DH/7EH) destinations are not supported.".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption {
+                        value: "own".into(),
+                        label: "Own (control CPU)".into(),
+                    },
+                    ChoiceOption {
+                        value: "cpu1".into(),
+                        label: "Multiple CPU No.1".into(),
+                    },
+                    ChoiceOption {
+                        value: "cpu2".into(),
+                        label: "Multiple CPU No.2".into(),
+                    },
+                    ChoiceOption {
+                        value: "cpu3".into(),
+                        label: "Multiple CPU No.3".into(),
+                    },
+                    ChoiceOption {
+                        value: "cpu4".into(),
+                        label: "Multiple CPU No.4".into(),
+                    },
+                ]),
+                required: false,
+                default: Some(SettingValue::Text("own".into())),
                 group: FieldGroup::Advanced,
             },
             SettingField {
@@ -3083,6 +3234,191 @@ mod tests {
             .as_deref()
             .is_some_and(|help| help.contains("by order")));
         assert_eq!(Route::default().frame, Frame::E4);
+    }
+
+    fn route_settings(extra: &[(&str, &str)]) -> Vec<session::Setting> {
+        let mut settings = vec![
+            session::Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            session::Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+        ];
+        settings.extend(extra.iter().map(|(key, value)| session::Setting {
+            key: (*key).into(),
+            value: (*value).into(),
+        }));
+        settings
+    }
+
+    fn route_messages(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        validate_settings(&route_settings(extra))
+            .into_iter()
+            .map(|e| (e.key, e.message))
+            .collect()
+    }
+
+    #[test]
+    fn route_settings_accept_valid_combinations() {
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("network_no", "0")],
+            &[("network_no", "1"), ("station_no", "1")],
+            &[("network_no", "239"), ("station_no", "120")],
+            &[("target_cpu", "own")],
+            &[("target_cpu", "cpu1")],
+            &[("target_cpu", "cpu2")],
+            &[("target_cpu", "cpu3")],
+            &[("target_cpu", "cpu4")],
+            &[
+                ("network_no", "2"),
+                ("station_no", "5"),
+                ("target_cpu", "cpu4"),
+            ],
+            &[("network_no", "0"), ("target_cpu", "cpu1")],
+        ];
+        for case in cases {
+            assert!(route_messages(case).is_empty(), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn route_settings_reject_invalid_values_with_exact_messages() {
+        const NETWORK: &str = "network_no must be a decimal number from 0 to 239";
+        const STATION: &str = "station_no must be a decimal number from 1 to 120";
+        for bad in ["240", "-1", "+1", "01", " 1", "1 ", "", "abc", "256", "1.0"] {
+            assert_eq!(
+                route_messages(&[("network_no", bad)]),
+                [("network_no".to_string(), NETWORK.to_string())],
+                "{bad:?}"
+            );
+        }
+        for bad in ["0", "121", "125", "126", "255", "-1", "01", " 1", "", "abc"] {
+            assert_eq!(
+                route_messages(&[("network_no", "1"), ("station_no", bad)]),
+                [("station_no".to_string(), STATION.to_string())],
+                "{bad:?}"
+            );
+        }
+        for bad in ["03E0", "CPU1", "standby", "", "cpu5", "cpu0"] {
+            assert_eq!(
+                route_messages(&[("target_cpu", bad)]),
+                [(
+                    "target_cpu".to_string(),
+                    "target_cpu must be own, cpu1, cpu2, cpu3 or cpu4".to_string()
+                )],
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_settings_cross_field_rules() {
+        assert_eq!(
+            route_messages(&[("network_no", "3")]),
+            [(
+                "station_no".to_string(),
+                "station_no is required when network_no is not 0".to_string()
+            )]
+        );
+        let omitted = "station_no must be omitted for the connected station (network_no 0)";
+        for extra in [
+            &[("station_no", "5")][..],
+            &[("network_no", "0"), ("station_no", "5")][..],
+        ] {
+            assert_eq!(
+                route_messages(extra),
+                [("station_no".to_string(), omitted.to_string())]
+            );
+        }
+        // Cross-field errors are suppressed when a value is itself invalid.
+        assert_eq!(
+            route_messages(&[("network_no", "x"), ("station_no", "5")]).len(),
+            1
+        );
+        assert_eq!(
+            route_messages(&[("network_no", "3"), ("station_no", "0")]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn route_settings_schema_declares_keys() {
+        let schema = <Component as config::Guest>::schema();
+        let find = |key: &str| {
+            schema
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("{key} field"))
+        };
+        let network = find("network_no");
+        assert!(matches!(
+            &network.kind,
+            config::FieldKind::Integer(spec) if spec.min == Some(0) && spec.max == Some(239)
+        ));
+        assert!(matches!(
+            &network.default,
+            Some(config::SettingValue::Integer(0))
+        ));
+        assert!(!network.required);
+        let station = find("station_no");
+        assert!(matches!(
+            &station.kind,
+            config::FieldKind::Integer(spec) if spec.min == Some(1) && spec.max == Some(120)
+        ));
+        assert!(station.default.is_none());
+        assert!(!station.required);
+        let cpu = find("target_cpu");
+        assert!(matches!(&cpu.kind, config::FieldKind::Choice(options)
+            if options.iter().map(|option| option.value.as_str()).collect::<Vec<_>>()
+                == ["own", "cpu1", "cpu2", "cpu3", "cpu4"]));
+        assert!(matches!(&cpu.default, Some(config::SettingValue::Text(value)) if value == "own"));
+        for field in [network, station, cpu] {
+            assert!(matches!(&field.group, config::FieldGroup::Advanced));
+        }
+    }
+
+    #[test]
+    fn route_fields_follow_settings_and_default_to_own_station() {
+        assert_eq!(route_fields(&route_settings(&[])), (0, 0xFF, 0x03FF));
+        assert_eq!(
+            route_fields(&route_settings(&[("target_cpu", "cpu1")])),
+            (0, 0xFF, 0x03E0)
+        );
+        assert_eq!(
+            route_fields(&route_settings(&[
+                ("network_no", "2"),
+                ("station_no", "5"),
+                ("target_cpu", "cpu2"),
+            ])),
+            (2, 5, 0x03E1)
+        );
+        assert_eq!(
+            route_fields(&route_settings(&[
+                ("network_no", "239"),
+                ("station_no", "120"),
+                ("target_cpu", "cpu4"),
+            ])),
+            (239, 120, 0x03E3)
+        );
+    }
+
+    #[test]
+    fn create_refuses_invalid_route() {
+        for extra in [
+            &[("network_no", "240")][..],
+            &[("network_no", "2")][..],
+            &[("station_no", "5")][..],
+            &[("target_cpu", "standby")][..],
+        ] {
+            assert!(matches!(
+                <SlmpConnection as session::GuestConnection>::create(route_settings(extra)),
+                Err(FatalError::InvalidConfig(_))
+            ));
+        }
     }
 
     #[test]

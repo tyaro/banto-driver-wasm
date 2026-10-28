@@ -11,10 +11,27 @@ mod tests {
         wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-write-v1" });
     }
 
-    fn response(serial: u16, body: &[u8]) -> Vec<u8> {
+    /// Route bytes as echoed in a response: network, station, module I/O (LE), multidrop.
+    const OWN_ROUTE: [u8; 5] = [0, 0xff, 0xff, 3, 0];
+
+    fn response_with_route(serial: u16, route: [u8; 5], body: &[u8]) -> Vec<u8> {
         let mut frame = vec![0xd4, 0];
         frame.extend_from_slice(&serial.to_le_bytes());
-        frame.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 3, 0]);
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&route);
+        frame.extend_from_slice(&(u16::try_from(body.len() + 2).unwrap()).to_le_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn response(serial: u16, body: &[u8]) -> Vec<u8> {
+        response_with_route(serial, OWN_ROUTE, body)
+    }
+
+    fn response_3e_with_route(route: [u8; 5], body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0xd0, 0];
+        frame.extend_from_slice(&route);
         frame.extend_from_slice(&(u16::try_from(body.len() + 2).unwrap()).to_le_bytes());
         frame.extend_from_slice(&[0, 0]);
         frame.extend_from_slice(body);
@@ -23,11 +40,7 @@ mod tests {
 
     /// Binary 3E response for the default route: no serial and no reserved bytes.
     fn response_3e(body: &[u8]) -> Vec<u8> {
-        let mut frame = vec![0xd0, 0, 0, 0xff, 0xff, 3, 0];
-        frame.extend_from_slice(&(u16::try_from(body.len() + 2).unwrap()).to_le_bytes());
-        frame.extend_from_slice(&[0, 0]);
-        frame.extend_from_slice(body);
-        frame
+        response_3e_with_route(OWN_ROUTE, body)
     }
 
     fn q_sd_data(d_internal: u16, w_internal: u16) -> [u8; 4] {
@@ -4297,6 +4310,275 @@ mod tests {
             vec![&[0][..], &[1][..]]
         );
         conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    fn routed_settings(frame: &str) -> Vec<banto::driver::types::Setting> {
+        let mut settings = settings();
+        for (key, value) in [
+            ("frame", frame),
+            ("network_no", "2"),
+            ("station_no", "5"),
+            ("target_cpu", "cpu2"),
+        ] {
+            settings.push(banto::driver::types::Setting {
+                key: key.into(),
+                value: value.into(),
+            });
+        }
+        settings
+    }
+
+    /// Network 2, station 5, module I/O 03E1H (CPU No.2), multidrop 0.
+    const ROUTED: [u8; 5] = [2, 5, 0xe1, 3, 0];
+
+    #[test]
+    fn routed_4e_requests_carry_the_route_and_prove_ranges_over_it() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let session = driver.banto_driver_session().connection();
+        let conn = session
+            .call_create(&mut store, &routed_settings("4e"))?
+            .expect("routed settings");
+        let type_step = session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .expect("0101");
+        assert_eq!(type_step.send[6..11], ROUTED);
+        let sd_step = session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_with_route(
+                    1,
+                    ROUTED,
+                    &model_data("Q02UCPU", 0x0263),
+                )),
+            )?
+            .expect("routed 0101 decode")
+            .expect("SD302");
+        assert_eq!(sd_step.send[6..11], ROUTED);
+        assert!(session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_with_route(2, ROUTED, &q_sd_data(100, 32))),
+            )?
+            .expect("routed SD decode")
+            .is_none());
+        let specs = d_specs(&[10]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("D10 is inside the SD302 range proven over the route");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].step.send[6..11], ROUTED);
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response_with_route(3, ROUTED, &[0x34, 0x12]),
+            )?
+            .expect("routed tag response");
+        assert!(matches!(values.as_slice(), [Ok(Value::Uint(0x1234))]));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn routed_3e_requests_carry_the_route_and_prove_ranges_over_it() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let session = driver.banto_driver_session().connection();
+        let conn = session
+            .call_create(&mut store, &routed_settings("3e"))?
+            .expect("routed 3E settings");
+        let type_step = session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .expect("0101");
+        assert_eq!(type_step.send[2..7], ROUTED);
+        let sd_step = session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_3e_with_route(
+                    ROUTED,
+                    &model_data("Q02UCPU", 0x0263),
+                )),
+            )?
+            .expect("routed 0101 decode")
+            .expect("SD302");
+        assert_eq!(sd_step.send[2..7], ROUTED);
+        assert!(session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_3e_with_route(ROUTED, &q_sd_data(100, 32))),
+            )?
+            .expect("routed SD decode")
+            .is_none());
+        let specs = d_specs(&[10]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("D10 is inside the SD302 range proven over the route");
+        assert_eq!(plans[0].step.send[2..7], ROUTED);
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response_3e_with_route(ROUTED, &[0x34, 0x12]),
+            )?
+            .expect("routed tag response");
+        assert!(matches!(values.as_slice(), [Ok(Value::Uint(0x1234))]));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn routed_connection_rejects_responses_echoing_the_own_station_route() -> wasmtime::Result<()> {
+        use banto::driver::types::FatalError;
+        let (mut store, driver) = load()?;
+        let session = driver.banto_driver_session().connection();
+        // 4E handshake answer, 4E tag answer and 3E handshake answer.
+        let conn = session
+            .call_create(&mut store, &routed_settings("4e"))?
+            .expect("routed settings");
+        assert!(session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .is_some());
+        let error = session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(1, &model_data("Q02UCPU", 0x0263))),
+            )?
+            .expect_err("own-station echo on a routed 0101");
+        assert!(matches!(error, FatalError::Framing(_)));
+        conn.resource_drop(&mut store)?;
+
+        let conn = session
+            .call_create(&mut store, &routed_settings("3e"))?
+            .expect("routed 3E settings");
+        assert!(session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .is_some());
+        let error = session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_3e(&model_data("Q02UCPU", 0x0263))),
+            )?
+            .expect_err("own-station echo on a routed 3E 0101");
+        assert!(matches!(error, FatalError::Framing(_)));
+        conn.resource_drop(&mut store)?;
+
+        // A tag answer echoing the own-station route after a routed handshake.
+        let conn = session
+            .call_create(&mut store, &routed_settings("4e"))?
+            .expect("routed settings");
+        session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start");
+        session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_with_route(
+                    1,
+                    ROUTED,
+                    &model_data("Q02UCPU", 0x0263),
+                )),
+            )?
+            .expect("0101");
+        session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_with_route(2, ROUTED, &q_sd_data(100, 32))),
+            )?
+            .expect("SD");
+        let specs = d_specs(&[10]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plan");
+        let error = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(3, &[0x34, 0x12]),
+            )?
+            .expect_err("own-station echo on a routed tag read");
+        assert!(matches!(error, FatalError::Framing(_)));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn routed_rcpu_0360_fallback_leaves_model_unknown_and_sends_no_sd_or_tag_read(
+    ) -> wasmtime::Result<()> {
+        let (mut store, driver) = load()?;
+        let session = driver.banto_driver_session().connection();
+        let conn = session
+            .call_create(&mut store, &routed_settings("4e"))?
+            .expect("routed settings");
+        assert!(session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .is_some());
+        assert!(session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_with_route(1, ROUTED, &model_data("RCPU", 0x0360))),
+            )?
+            .expect("valid but unknown model")
+            .is_none());
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &d_specs(&[0]))?
+            .is_err());
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_route_settings_are_refused_by_create() -> wasmtime::Result<()> {
+        use banto::driver::types::{FatalError, Setting};
+        let (mut store, driver) = load()?;
+        for (key, value) in [
+            ("network_no", "240"),
+            ("network_no", "2"),
+            ("station_no", "5"),
+            ("target_cpu", "standby"),
+        ] {
+            let mut bad = settings();
+            bad.push(Setting {
+                key: key.into(),
+                value: value.into(),
+            });
+            let result = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &bad)?;
+            assert!(
+                matches!(result, Err(FatalError::InvalidConfig(_))),
+                "{key}={value}"
+            );
+        }
         Ok(())
     }
 }
