@@ -158,10 +158,10 @@ fn check_settings(settings: &[banto::driver::types::Setting]) -> Vec<config::Fie
         }
     }
     if let Some(probe) = setting(settings, "probe_address") {
-        if parse_holding(probe, "u16", None).is_err() {
+        if let Err(message) = parse_probe(probe) {
             errors.push(config::FieldError {
                 key: "probe_address".into(),
-                message: "probe_address requires one FC3/FC4 register".into(),
+                message,
             });
         }
     }
@@ -371,6 +371,19 @@ fn parse_tag(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16, Ta
     }
 }
 
+/// The handshake probe is one coil (FC1), discrete input (FC2), input
+/// register (FC4) or holding register (FC3). Register bits are not probes.
+fn parse_probe(text: &str) -> Result<(u16, TagKind), String> {
+    let data_type = if matches!(text.trim().as_bytes().first(), Some(b'0' | b'1')) {
+        "bool"
+    } else {
+        "u16"
+    };
+    parse_tag(text, data_type, None).map_err(|_| {
+        "probe_address requires one 0xxxx coil, 1xxxx discrete input, 3xxxx input or 4xxxx holding register".into()
+    })
+}
+
 fn area(kind: TagKind) -> Area {
     match kind {
         TagKind::Bit(BitFunction::Coil) => Area::Coil,
@@ -438,6 +451,76 @@ fn request_bytes(
     }
     .request_with_function(function)
     .expect("validated numeric start offset")
+}
+
+/// The one-tag read request for any tag kind.
+fn read_request(
+    conn: &ModbusConnection,
+    transaction_id: u16,
+    offset: u16,
+    kind: TagKind,
+) -> [u8; 12] {
+    match kind {
+        TagKind::Numeric(kind, function) => {
+            request_bytes(conn, transaction_id, offset, kind, function)
+        }
+        TagKind::Bit(function) => ReadBit {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            function,
+        }
+        .request(),
+        TagKind::RegisterBit(function, bit) => ReadRegisterBit {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            bit,
+            function,
+        }
+        .request(),
+    }
+}
+
+fn decode_read(
+    conn: &ModbusConnection,
+    transaction_id: u16,
+    offset: u16,
+    kind: TagKind,
+    response: &[u8],
+) -> Result<Value, ReadError> {
+    match kind {
+        TagKind::Numeric(kind, function) => ReadHoldingNumeric {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            kind: kind.core_kind(),
+            word_order: conn.word_order,
+        }
+        .decode_with_function(response, function)
+        .map(|value| match value {
+            NumericValue::Int(value) => Value::Int(value),
+            NumericValue::Uint(value) => Value::Uint(value),
+            NumericValue::Float(value) => Value::Float(value),
+        }),
+        TagKind::Bit(function) => ReadBit {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            function,
+        }
+        .decode(response)
+        .map(Value::Bool),
+        TagKind::RegisterBit(function, bit) => ReadRegisterBit {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            bit,
+            function,
+        }
+        .decode(response)
+        .map(Value::Bool),
+    }
 }
 
 fn step(send: [u8; 12]) -> session::Step {
@@ -640,28 +723,8 @@ fn planned_read(conn: &ModbusConnection, specs: &[TagSpec]) -> Vec<read::Planned
                 parse_tag(&spec.address, &spec.data_type, spec.string_words).ok()?;
             let transaction_id = conn.next_transaction_id.get();
             conn.next_transaction_id.set(transaction_id.wrapping_add(1));
-            let send = match kind {
-                TagKind::Numeric(kind, function) => {
-                    request_bytes(conn, transaction_id, offset, kind, function)
-                }
-                TagKind::Bit(function) => ReadBit {
-                    transaction_id,
-                    unit_id: conn.unit_id,
-                    offset,
-                    function,
-                }
-                .request(),
-                TagKind::RegisterBit(function, bit) => ReadRegisterBit {
-                    transaction_id,
-                    unit_id: conn.unit_id,
-                    offset,
-                    bit,
-                    function,
-                }
-                .request(),
-            };
             Some(read::Planned {
-                step: step(send),
+                step: step(read_request(conn, transaction_id, offset, kind)),
                 covers: vec![index as u32],
             })
         })
@@ -689,64 +752,12 @@ fn decode_planned(
         .try_into()
         .map_err(|_| FatalError::Protocol("FC3 要求長が不正です".into()))?;
     let transaction_id = u16::from_be_bytes([send[0], send[1]]);
-    let expected = match kind {
-        TagKind::Numeric(kind, function) => {
-            request_bytes(conn, transaction_id, offset, kind, function)
-        }
-        TagKind::Bit(function) => ReadBit {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-            function,
-        }
-        .request(),
-        TagKind::RegisterBit(function, bit) => ReadRegisterBit {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-            bit,
-            function,
-        }
-        .request(),
-    };
-    if send != expected {
+    if send != read_request(conn, transaction_id, offset, kind) {
         return Err(FatalError::Protocol(
             "計画と要求バイトが一致しません".into(),
         ));
     }
-    let decoded = match kind {
-        TagKind::Numeric(kind, function) => ReadHoldingNumeric {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-            kind: kind.core_kind(),
-            word_order: conn.word_order,
-        }
-        .decode_with_function(response, function)
-        .map(|value| match value {
-            NumericValue::Int(value) => Value::Int(value),
-            NumericValue::Uint(value) => Value::Uint(value),
-            NumericValue::Float(value) => Value::Float(value),
-        }),
-        TagKind::Bit(function) => ReadBit {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-            function,
-        }
-        .decode(response)
-        .map(Value::Bool),
-        TagKind::RegisterBit(function, bit) => ReadRegisterBit {
-            transaction_id,
-            unit_id: conn.unit_id,
-            offset,
-            bit,
-            function,
-        }
-        .decode(response)
-        .map(Value::Bool),
-    };
-    let value = match decoded {
+    let value = match decode_read(conn, transaction_id, offset, kind, response) {
         Ok(value) => Ok(value),
         Err(ReadError::Device(code)) => Err(ItemError::Device(banto::driver::types::DeviceError {
             code: u32::from(code),
@@ -822,19 +833,10 @@ impl session::GuestConnection for ModbusConnection {
                 return Err(FatalError::Protocol("unsolicited probe response".into()));
             }
             self.probe_poisoned.set(true);
-            let (offset, kind) = parse_holding(&self.probe_address, "u16", None)
-                .map_err(FatalError::InvalidConfig)?;
-            let function = register_function(&self.probe_address);
+            let (offset, kind) =
+                parse_probe(&self.probe_address).map_err(FatalError::InvalidConfig)?;
             let transaction_id = self.next_transaction_id.get().wrapping_sub(1);
-            let result = ReadHoldingNumeric {
-                transaction_id,
-                unit_id: self.unit_id,
-                offset,
-                kind: kind.core_kind(),
-                word_order: self.word_order,
-            }
-            .decode_with_function(&response, function);
-            match result {
+            match decode_read(self, transaction_id, offset, kind, &response) {
                 Ok(_) => {
                     self.probe_poisoned.set(false);
                     self.handshake_done.set(true);
@@ -855,18 +857,12 @@ impl session::GuestConnection for ModbusConnection {
         } else if self.handshake_pending.get() {
             Err(FatalError::Protocol("probe response is pending".into()))
         } else {
-            let (offset, kind) = parse_holding(&self.probe_address, "u16", None)
-                .map_err(FatalError::InvalidConfig)?;
+            let (offset, kind) =
+                parse_probe(&self.probe_address).map_err(FatalError::InvalidConfig)?;
             let transaction_id = self.next_transaction_id.get();
             self.next_transaction_id.set(transaction_id.wrapping_add(1));
             self.handshake_pending.set(true);
-            Ok(Some(step(request_bytes(
-                self,
-                transaction_id,
-                offset,
-                kind,
-                register_function(&self.probe_address),
-            ))))
+            Ok(Some(step(read_request(self, transaction_id, offset, kind))))
         }
     }
 
@@ -1085,7 +1081,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write unless register_bit_write=disabled declares a device without FC22; 3xxxx.N is read-only. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
+        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write unless register_bit_write=disabled declares a device without FC22; 3xxxx.N is read-only. Connection probe defaults to 40001; probe_address may select one 0xxxx coil, 1xxxx discrete input or 3xxxx input register instead. Writes require write_mode=enabled and write_allowlist."
             .into()
     }
 
@@ -1180,8 +1176,8 @@ impl config::Guest for Component {
                 group: FieldGroup::Advanced,
             },
             SettingField {
-                key: "probe_address".into(), label: "Probe register".into(),
-                help: Some("One accessible 4xxxx holding or 3xxxx input register for connection verification".into()),
+                key: "probe_address".into(), label: "Probe address".into(),
+                help: Some("One accessible 4xxxx holding, 3xxxx input register, 0xxxx coil or 1xxxx discrete input for connection verification".into()),
                 kind: FieldKind::Text(config::TextSpec { max_len: Some(6), placeholder: Some("40001".into()) }),
                 required: false, default: Some(SettingValue::Text("40001".into())), group: FieldGroup::Advanced,
             },
@@ -1923,6 +1919,63 @@ mod tests {
     }
 
     #[test]
+    fn fc1_fc2_connection_probe_reads_one_configured_bit() {
+        for (address, function, offset) in [("00001", 1, 0u8), ("165536", 2, 0xFF)] {
+            let mut probe_conn = conn();
+            probe_conn.probe_address = address.into();
+            let first =
+                <ModbusConnection as session::GuestConnection>::handshake_next(&probe_conn, None)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                first.send,
+                [0, 0, 0, 0, 0, 6, 1, function, offset, offset, 0, 1],
+                "{address}"
+            );
+            assert!(
+                <ModbusConnection as session::GuestConnection>::handshake_next(
+                    &probe_conn,
+                    Some(vec![0, 0, 0, 0, 0, 4, 1, function, 1, 0])
+                )
+                .unwrap()
+                .is_none(),
+                "{address}"
+            );
+            assert!(probe_conn.handshake_done.get());
+            assert!(!probe_conn.probe_poisoned.get());
+        }
+
+        // A register-shaped reply, an exception and a stale transaction ID
+        // all fail the handshake and leave the probe outcome uncertain.
+        for response in [
+            vec![0, 0, 0, 0, 0, 5, 1, 1, 2, 0, 1],
+            vec![0, 0, 0, 0, 0, 3, 1, 0x81, 2],
+            vec![0, 1, 0, 0, 0, 4, 1, 1, 1, 1],
+            vec![0, 0, 0, 0, 0, 4, 1, 2, 1, 1],
+            vec![0, 0, 0, 0, 0, 4, 1, 1, 1, 2],
+        ] {
+            let mut probe_conn = conn();
+            probe_conn.probe_address = "00001".into();
+            <ModbusConnection as session::GuestConnection>::handshake_next(&probe_conn, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                <ModbusConnection as session::GuestConnection>::handshake_next(
+                    &probe_conn,
+                    Some(response.clone())
+                )
+                .is_err(),
+                "{response:?}"
+            );
+            assert!(probe_conn.probe_poisoned.get());
+            assert!(
+                <ModbusConnection as session::GuestConnection>::handshake_next(&probe_conn, None)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn fc4_connection_probe_uses_configured_input_register() {
         let mut probe_conn = conn();
         probe_conn.probe_address = "30001".into();
@@ -2118,8 +2171,11 @@ mod tests {
             Ok(write_v1::WriteProgress::Done(_))
         ));
         for (key, value) in [
-            ("probe_address", "10001"),
             ("probe_address", "40001.3"),
+            ("probe_address", "30001.0"),
+            ("probe_address", "00000"),
+            ("probe_address", "165537"),
+            ("probe_address", "200001"),
             ("write_mode", "yes"),
             ("register_bit_write", "no"),
             ("write_allowlist", "300001-300002"),

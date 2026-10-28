@@ -175,7 +175,7 @@ mod tests {
         let valid: JsonValue =
             serde_json::from_str(include_str!("../../component/manifest.json")).unwrap();
         assert_eq!(manifest_settings_version(&valid), Ok(1));
-        assert_eq!(valid["version"], "0.6.0");
+        assert_eq!(valid["version"], "0.7.0");
         assert_eq!(valid["hubApi"], "1");
         assert_eq!(
             valid["displayName"],
@@ -371,6 +371,110 @@ mod tests {
                 matches!(driver.banto_driver_read().call_decode(&mut store, conn, &plan[0], &specs, &response)?, Ok(v) if matches!(v.as_slice(), [Ok(Value::Bool(true))]))
             );
         }
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn real_component_fc1_fc2_only_handshake_probes_one_bit() -> wasmtime::Result<()> {
+        use banto::driver::types::{Setting, TagSpec, Value};
+        let path = std::env::var("BANTO_COMPONENT_WASM")?;
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+        for (probe_address, function) in [("00001", 1), ("10001", 2)] {
+            let mut store = wasmtime::Store::new(&engine, ());
+            let driver = Driver::instantiate(&mut store, &component, &linker)?;
+            let settings = [
+                Setting {
+                    key: "host".into(),
+                    value: "fixture.invalid".into(),
+                },
+                Setting {
+                    key: "port".into(),
+                    value: "502".into(),
+                },
+                Setting {
+                    key: "probe_address".into(),
+                    value: probe_address.into(),
+                },
+            ];
+            assert!(driver
+                .banto_driver_config()
+                .call_validate(&mut store, &settings)?
+                .is_empty());
+            let conn = driver
+                .banto_driver_session()
+                .connection()
+                .call_create(&mut store, &settings)?
+                .unwrap();
+            let probe = driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, None)?
+                .unwrap()
+                .unwrap();
+            assert_eq!(probe.send, [0, 0, 0, 0, 0, 6, 1, function, 0, 0, 0, 1]);
+            assert!(driver
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(
+                    &mut store,
+                    conn,
+                    Some(&[0, 0, 0, 0, 0, 4, 1, function, 1, 1])
+                )?
+                .unwrap()
+                .is_none());
+            let specs = [TagSpec {
+                address: "00002".into(),
+                data_type: "bool".into(),
+                string_words: None,
+            }];
+            let plan = driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs)?
+                .unwrap();
+            assert_eq!(plan[0].step.send, [0, 1, 0, 0, 0, 6, 1, 1, 0, 1, 0, 1]);
+            let response = [0, 1, 0, 0, 0, 4, 1, 1, 1, 0];
+            assert!(
+                matches!(driver.banto_driver_read().call_decode(&mut store, conn, &plan[0], &specs, &response)?, Ok(v) if matches!(v.as_slice(), [Ok(Value::Bool(false))]))
+            );
+            conn.resource_drop(&mut store)?;
+        }
+
+        // A register-shaped reply to a bit probe fails the handshake.
+        let mut store = wasmtime::Store::new(&engine, ());
+        let driver = Driver::instantiate(&mut store, &component, &linker)?;
+        let settings = [
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "502".into(),
+            },
+            Setting {
+                key: "probe_address".into(),
+                value: "00001".into(),
+            },
+        ];
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .unwrap();
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .unwrap()
+            .unwrap();
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&[0, 0, 0, 0, 0, 5, 1, 1, 2, 0, 1]))?
+            .is_err());
         conn.resource_drop(&mut store)?;
         Ok(())
     }
