@@ -101,14 +101,16 @@ impl Fixture {
                 assert!(bit_sd.is_none(), "{}: bit SD was not requested", model.0);
                 report
             }
-            Progress::Send(_) => {
+            Progress::Send(step) => {
                 let reply = bit_sd.expect("unexpected bit SD request");
+                // The serial follows whatever the handshake already used.
+                let serial = u16::from_le_bytes([step.send[2], step.send[3]]);
                 let Progress::Done(report) = diagnostics
                     .call_diagnose_next(
                         &mut self.store,
                         conn,
                         specs,
-                        Some(&words_response(3, reply)),
+                        Some(&words_response(serial, reply)),
                     )?
                     .expect("bit SD result")
                 else {
@@ -149,10 +151,21 @@ impl Fixture {
             )?
             .expect("D/W SD request")
             .expect("D/W SD step");
-        assert!(session
+        let next = session
             .call_handshake_next(&mut self.store, conn, Some(&words_response(2, dw_sd)))?
-            .expect("ready")
-            .is_none());
+            .expect("ready");
+        if let Some(step) = next {
+            // A QnU reads SD310-311 once after SD302-303; a total of 0 is below any count, so it is ignored.
+            assert_eq!(&step.send[19..25], &[0x36, 1, 0, 0xa9, 2, 0]);
+            assert!(session
+                .call_handshake_next(
+                    &mut self.store,
+                    conn,
+                    Some(&words_response(3, Some(&[0, 0])))
+                )?
+                .expect("SD310")
+                .is_none());
+        }
         Ok(conn)
     }
 

@@ -31,6 +31,11 @@ fn response(serial: u16, body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// SD310-311 reply of a QnU (total 0 is below any count, so it is ignored).
+fn sd310_response(serial: u16) -> Vec<u8> {
+    response(serial, &[0, 0, 0, 0])
+}
+
 fn model_response(name: &str, code: u16) -> Vec<u8> {
     let mut data = [b' '; 18];
     data[..name.len()].copy_from_slice(name.as_bytes());
@@ -225,7 +230,14 @@ fn q_internal_prefix_does_not_invent_an_extended_upper_limit() -> wasmtime::Resu
         .banto_driver_session()
         .connection()
         .call_handshake_next(&mut store, conn, Some(&response(2, &sd)))?
-        .expect("ready");
+        .expect("SD310 request");
+    // QnU reads SD310-311 once after SD302-303; the value is not used here.
+    assert!(guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, Some(&sd310_response(3)))?
+        .expect("SD310")
+        .is_none());
     let specs = vec![
         spec("D32767", "u16"),
         spec("D32767", "u32"),
@@ -431,7 +443,14 @@ fn q_exact_bit_boundary_and_saturated_m_prefix_are_distinct() -> wasmtime::Resul
         .banto_driver_session()
         .connection()
         .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))?
-        .expect("ready");
+        .expect("SD310 request");
+    // QnU reads SD310-311 once after SD302-303; the value is not used here.
+    assert!(guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, Some(&sd310_response(3)))?
+        .expect("SD310")
+        .is_none());
     let specs = vec![
         spec("YF", "bit"),
         spec("Y10", "bit"),
@@ -449,7 +468,7 @@ fn q_exact_bit_boundary_and_saturated_m_prefix_are_distinct() -> wasmtime::Resul
     }
     let result = guest
         .banto_driver_diagnostics_v1()
-        .call_diagnose_next(&mut store, conn, &specs, Some(&response(3, &bit_sd)))?
+        .call_diagnose_next(&mut store, conn, &specs, Some(&response(4, &bit_sd)))?
         .expect("bit SD result");
     let Progress::Done(report) = result else {
         panic!("one Q bit SD request expected");
@@ -507,7 +526,14 @@ fn q_x_exact_count_uses_the_existing_five_word_request() -> wasmtime::Result<()>
         .banto_driver_session()
         .connection()
         .call_handshake_next(&mut store, conn, Some(&response(2, &[100, 0, 100, 0])))?
-        .expect("ready");
+        .expect("SD310 request");
+    // QnU reads SD310-311 once after SD302-303; the value is not used here.
+    assert!(guest
+        .banto_driver_session()
+        .connection()
+        .call_handshake_next(&mut store, conn, Some(&sd310_response(3)))?
+        .expect("SD310")
+        .is_none());
     let specs = vec![spec("X7FFF", "bit"), spec("X8000", "bit")];
     let Progress::Send(step) = guest
         .banto_driver_diagnostics_v1()
@@ -523,7 +549,7 @@ fn q_x_exact_count_uses_the_existing_five_word_request() -> wasmtime::Result<()>
     }
     let Progress::Done(report) = guest
         .banto_driver_diagnostics_v1()
-        .call_diagnose_next(&mut store, conn, &specs, Some(&response(3, &words)))?
+        .call_diagnose_next(&mut store, conn, &specs, Some(&response(4, &words)))?
         .expect("done")
     else {
         panic!("one request")
@@ -791,12 +817,25 @@ fn handshake_acquired_bit_sd_is_reused_for_new_diagnostic_areas() -> wasmtime::R
         } else {
             vec![100, 0, 0, 0, 0, 0, 0, 0]
         };
-        let step = guest
+        let mut step = guest
             .banto_driver_session()
             .connection()
             .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))?
             .expect("bit SD")
             .expect("step");
+        let bit_serial = if q {
+            // QnU reads SD310-311 (serial 3) before the bit counts.
+            assert_eq!(&step.send[19..22], &[0x36, 1, 0]);
+            step = guest
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&sd310_response(3)))?
+                .expect("bit SD")
+                .expect("step");
+            4
+        } else {
+            3
+        };
         assert_eq!(
             &step.send[19..22],
             if q { &[0x22, 1, 0] } else { &[6, 1, 0] }
@@ -814,7 +853,7 @@ fn handshake_acquired_bit_sd_is_reused_for_new_diagnostic_areas() -> wasmtime::R
         assert!(guest
             .banto_driver_session()
             .connection()
-            .call_handshake_next(&mut store, conn, Some(&response(3, &data)))??
+            .call_handshake_next(&mut store, conn, Some(&response(bit_serial, &data)))??
             .is_none());
         let specs = if q {
             vec![spec("X7", "bit"), spec("X8", "bit")]
@@ -915,11 +954,21 @@ fn inapplicable_and_unrecognized_models_do_not_request_bit_sd() -> wasmtime::Res
             .expect("model");
         if let Some(dw) = dw {
             assert!(step.is_some());
-            assert!(guest
+            let after_dw = guest
                 .banto_driver_session()
                 .connection()
-                .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))??
-                .is_none());
+                .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))??;
+            if name == "Q02UCPU" {
+                // QnU still reads SD310-311, but no bit SD follows for these tags.
+                assert!(after_dw.is_some());
+                assert!(guest
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(&mut store, conn, Some(&sd310_response(3)))??
+                    .is_none());
+            } else {
+                assert!(after_dw.is_none());
+            }
         } else {
             assert!(step.is_none());
         }
@@ -1045,12 +1094,22 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
                 refused
             }
         };
-        assert!(guest
+        let after_sd = guest
             .banto_driver_session()
             .connection()
             .call_handshake_next(&mut store, conn, Some(&reply))?
-            .expect("ready")
-            .is_none());
+            .expect("ready");
+        if name == "Q02UCPU" && sd.is_some() {
+            assert!(after_sd.is_some(), "QnU reads SD310-311");
+            assert!(guest
+                .banto_driver_session()
+                .connection()
+                .call_handshake_next(&mut store, conn, Some(&sd310_response(3)))?
+                .expect("SD310")
+                .is_none());
+        } else {
+            assert!(after_sd.is_none());
+        }
         let Progress::Done(report) = guest
             .banto_driver_diagnostics_v1()
             .call_diagnose_next(&mut store, conn, &specs, None)?

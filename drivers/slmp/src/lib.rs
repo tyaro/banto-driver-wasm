@@ -17,7 +17,8 @@ pub use q_zr::{decode_q_zr_count, plan_q_zr, QZrEvidence};
 
 mod q_extension;
 pub use q_extension::{
-    decode_q_extension_count, plan_q_extension, QExtensionArea, QExtensionEvidence,
+    decode_q_extension_count, decode_q_w_total, plan_q_extension, plan_q_w_total, QExtensionArea,
+    QExtensionEvidence,
 };
 
 /// Wire layout only. The actual CPU model and its supported devices are checked later.
