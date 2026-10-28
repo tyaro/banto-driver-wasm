@@ -7,7 +7,7 @@
 | 対象 | 現在のゲスト能力 | 制限 |
 | --- | --- | --- |
 | Modbus TCP | FC1/FC2 の Bool、FC3/FC4 の `i16/u16/i32/u32/i64/u64/f32/f64`、3xxxx/4xxxx の `.0`–`.15` register-bit Bool を読取る。FC3/FC4 の設定済み 1 レジスタ probe を接続 handshake で実行する | 3xxxx.N（入力レジスタ）の bit は読取り専用 |
-| Modbus TCP 書込み | 任意の `write-v1` world で FC5 単一 coil、FC16 連続 holding words、または FC22 マスク書込みによる 4xxxx.N 単一 bit | 初期値 `write_mode=disabled`。`enabled` と要求全体を含む明示 `write_allowlist` の両方が必要。Hub の保存済み運用ポリシー・権限・監査は独立した第二ゲート。tyaro/banto-industrial#881 の模擬結合試験で FC5/FC16 と拒否経路を確認済み。FC22 の register-bit write は tyaro/banto-industrial#896 で模擬 Hub 受入れ済み。FC22 非対応機器が例外応答を返せば項目単位の `Device` エラー、応答しなければバッチが `Timeout` になり接続を切る。実機は作者による adapter 層での手動確認のみ |
+| Modbus TCP 書込み | 任意の `write-v1` world で FC5 単一 coil、FC16 連続 holding words、または FC22 マスク書込みによる 4xxxx.N 単一 bit | 初期値 `write_mode=disabled`。`enabled` と要求全体を含む明示 `write_allowlist` の両方が必要。Hub の保存済み運用ポリシー・権限・監査は独立した第二ゲート。tyaro/banto-industrial#881 の模擬結合試験で FC5/FC16 と拒否経路を確認済み。FC22 の register-bit write は tyaro/banto-industrial#896 で模擬 Hub 受入れ済み。FC22 非対応機器が例外応答を返せば項目単位の `Device` エラー、応答しなければバッチが `Timeout` になり接続を切る。FC22 非対応と分かっている機器は `register_bit_write=disabled`（既定 `fc22`）で、4xxxx.N 書込みを送信前に `Rejected` にできる。実機は作者による adapter 層での手動確認のみ |
 | SLMP | 既知 Q/R 系列の明示タグについて、D/W 等の数値 8 型、対応 bit エリアの Bool、機種別に実装した timer/counter・ZR・D word-bit を読取る。任意の diagnostics-v1 は標準 Q X、標準 R SB/F の点数を報告する | `Unknown` は範囲の保証ではない。既知 wire 系列の範囲不明タグは明示的な単独読取りに限り、未知の型式・経路や確定範囲外を推測して読まない。診断点数は読書き許可を広げない |
 | SLMP 書込み | ゲスト内の既定無効ポリシーで D/W 数値・M/Y/L/B Bool を検証する制御試作 | 明示 allowlist、同一接続の SD 根拠、Hub の独立運用ゲートが必要。tyaro/banto-industrial#885 は #34 固定の模擬受入れで既存ポリシーを回帰確認。SLMP の Hub の CI の固定は tyaro/banto-industrial#887 で #35 `b3d944f5` に、tyaro/banto-industrial#895 で #44 `c9c3d83` に更新。V edge relay は周期収集タグから意図的に除外する |
 

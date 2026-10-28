@@ -24,6 +24,9 @@ struct ModbusConnection {
     handshake_done: Cell<bool>,
     probe_poisoned: Cell<bool>,
     write_enabled: bool,
+    /// False when the device is declared without FC22: register-bit writes
+    /// are refused before send instead of timing out the batch.
+    register_bit_write: bool,
     write_allowlist: Vec<WriteRange>,
     pending_write: RefCell<Option<PendingWrite>>,
     write_poisoned: Cell<bool>,
@@ -167,6 +170,14 @@ fn check_settings(settings: &[banto::driver::types::Setting]) -> Vec<config::Fie
             errors.push(config::FieldError {
                 key: "write_mode".into(),
                 message: "write_mode must be disabled or enabled".into(),
+            });
+        }
+    }
+    if let Some(mode) = setting(settings, "register_bit_write") {
+        if !matches!(mode, "fc22" | "disabled") {
+            errors.push(config::FieldError {
+                key: "register_bit_write".into(),
+                message: "register_bit_write must be fc22 or disabled".into(),
             });
         }
     }
@@ -591,6 +602,11 @@ fn preflight_register_bit_write(
     if function != RegisterFunction::Holding {
         return Err("input-only area is not writable".into());
     }
+    if !conn.register_bit_write {
+        return Err(
+            "register-bit writes are disabled for this device (register_bit_write=disabled)".into(),
+        );
+    }
     let Value::Bool(value) = item.value else {
         return Err("register-bit write requires a Bool value".into());
     };
@@ -782,6 +798,7 @@ impl session::GuestConnection for ModbusConnection {
             handshake_done: Cell::new(false),
             probe_poisoned: Cell::new(false),
             write_enabled: setting(&settings, "write_mode") == Some("enabled"),
+            register_bit_write: setting(&settings, "register_bit_write") != Some("disabled"),
             write_allowlist: parse_write_allowlist(
                 setting(&settings, "write_allowlist").unwrap_or(""),
             )
@@ -1068,7 +1085,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write; 3xxxx.N is read-only. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
+        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write unless register_bit_write=disabled declares a device without FC22; 3xxxx.N is read-only. Connection probe defaults to 40001; probe_address may select a 3xxxx input register. Writes require write_mode=enabled and write_allowlist."
             .into()
     }
 
@@ -1176,6 +1193,15 @@ impl config::Guest for Component {
                     ChoiceOption { value: "enabled".into(), label: "enabled".into() },
                 ]),
                 required: false, default: Some(SettingValue::Text("disabled".into())), group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: "register_bit_write".into(), label: "Register-bit write".into(),
+                help: Some("fc22 writes one 4xxxx.N bit with FC22 mask write; disabled refuses register-bit writes before send for devices without FC22".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption { value: "fc22".into(), label: "fc22".into() },
+                    ChoiceOption { value: "disabled".into(), label: "disabled".into() },
+                ]),
+                required: false, default: Some(SettingValue::Text("fc22".into())), group: FieldGroup::Advanced,
             },
             SettingField {
                 key: "write_allowlist".into(), label: "Write address ranges".into(),
@@ -1399,6 +1425,62 @@ mod tests {
     }
 
     #[test]
+    fn register_bit_write_disabled_refuses_fc22_before_send_and_keeps_other_writes() {
+        use banto::driver::types::Setting;
+        let settings = |mode: &str| {
+            [
+                ("host", "fixture.invalid"),
+                ("port", "502"),
+                ("write_mode", "enabled"),
+                ("write_allowlist", "400001-400010,000001-000010"),
+                ("register_bit_write", mode),
+            ]
+            .map(|(key, value)| Setting {
+                key: key.into(),
+                value: value.into(),
+            })
+        };
+        assert!(check_settings(&settings("fc22")).is_empty());
+        assert!(check_settings(&settings("disabled")).is_empty());
+        for invalid in ["", "enabled", "FC22", "rmw"] {
+            assert!(
+                check_settings(&settings(invalid))
+                    .iter()
+                    .any(|error| error.key == "register_bit_write"),
+                "{invalid:?}"
+            );
+        }
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.register_bit_write = false;
+        conn.write_allowlist = parse_write_allowlist("400001-400010,000001-000010").unwrap();
+        for value in [true, false] {
+            let items = vec![write_item("40001.3", "bool", Value::Bool(value))];
+            assert!(matches!(
+                write_next_impl(&conn, items, None),
+                Ok(write_v1::WriteProgress::Done(results))
+                    if matches!(results.as_slice(), [Err(ItemError::Rejected(message))]
+                        if message.contains("register_bit_write=disabled"))
+            ));
+            assert_eq!(conn.next_transaction_id.get(), 0);
+            assert!(conn.pending_write.borrow().is_none());
+            assert!(!conn.write_poisoned.get());
+        }
+        // Input register bits keep their input-only refusal.
+        assert!(matches!(
+            preflight_write(&conn, &[write_item("30001.3", "bool", Value::Bool(true))], 0),
+            Err(message) if message == "input-only area is not writable"
+        ));
+        // Word and coil writes are unaffected.
+        for (item, function) in [
+            (write_item("40001", "u16", Value::Uint(7)), 16),
+            (write_item("00001", "bool", Value::Bool(true)), 5),
+        ] {
+            assert_eq!(preflight_write(&conn, &[item], 0).unwrap().0, function);
+        }
+    }
+
+    #[test]
     fn register_bit_writes_outside_one_allowed_holding_point_are_rejected_before_send() {
         for enabled in [false, true] {
             let mut conn = conn();
@@ -1442,6 +1524,7 @@ mod tests {
             handshake_done: Cell::new(false),
             probe_poisoned: Cell::new(false),
             write_enabled: false,
+            register_bit_write: true,
             write_allowlist: Vec::new(),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
@@ -1501,6 +1584,7 @@ mod tests {
             handshake_done: Cell::new(false),
             probe_poisoned: Cell::new(false),
             write_enabled: false,
+            register_bit_write: true,
             write_allowlist: Vec::new(),
             pending_write: RefCell::new(None),
             write_poisoned: Cell::new(false),
@@ -2037,6 +2121,7 @@ mod tests {
             ("probe_address", "10001"),
             ("probe_address", "40001.3"),
             ("write_mode", "yes"),
+            ("register_bit_write", "no"),
             ("write_allowlist", "300001-300002"),
             ("write_allowlist", "000001-400001"),
             ("write_allowlist", "400001-400004,400004-400005"),
