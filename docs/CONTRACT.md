@@ -19,6 +19,8 @@ Current main `c9c3d83` includes merged #32 basic Modbus, #33 register-bit reads 
 
 The numeric types are `i16/u16/i32/u32/i64/u64/f32/f64`. Each tag occupies one, two or four registers. `low_high` and `high_low` are supported. An FC16 run is capped at 123 words. FC22 uses AND mask `!(1 << N)` and OR mask `1 << N` (set) or `0` (clear), and its acknowledgement must echo the address and both masks. A device without FC22 that answers with an exception yields an item-level `Device` error; a device that does not answer at all times out the batch and drops the connection. `write_mode` defaults to `disabled`, and an enabled mode requires `write_allowlist`. All items must pass type, width, value, area and span checks before a frame is sent. An uncertain response poisons that connection. No automatic address scan was performed. Apart from the author's manual adapter-layer FC22 check described above, no physical PLC write was performed. Hub integration was verified only in the pinned tyaro/banto-industrial#881 / tyaro/banto-industrial#884 / tyaro/banto-industrial#896 simulated adapter and loopback paths described above.
 
+`item-error.verification-failed` means the read-back after a write was sent does not match the written value, so the write may have taken effect on the PLC; `item-error.rejected` is limited to refusals before anything is sent. The current guest does not return `verification-failed`; the host follows in tyaro/banto-industrial#902.
+
 The table below is historical comparison context for the originally pinned FC3/U16 Hub adapter, before tyaro/banto-industrial#881 / tyaro/banto-industrial#884. It does not describe current simulated Hub coverage or imply a deployment or live PLC validation.
 
 # API と WIT の照合
