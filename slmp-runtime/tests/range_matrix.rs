@@ -16,6 +16,8 @@ const OUTSIDE: &str = "complete-configured-count";
 const UNPROVEN: &str = "configured-range-unproven";
 const NO_PATH: &str = "guest-read-path-unavailable; range-not-proven";
 const Q_W_PREFIX: &str = "internal-w-prefix-unproven; guest-read-path-unavailable";
+// LZ is not allowed in 0401 batch read; 0403 random read is a later stage.
+const LZ_0403: &str = "LZ long index register needs 0403 random read and is not supported";
 const Q25PRH: &str = "q25prh-general-range-unconfirmed";
 
 /// (address, data type, verdict kind, reason)
@@ -308,6 +310,11 @@ fn standard_r_exact_counts_bound_every_unit_radix_and_span() -> wasmtime::Result
             ("LTS0", "bit", "unknown", UNPROVEN),
             ("LCN0", "i32", "unknown", UNPROVEN),
             ("LCS0", "bit", "unknown", UNPROVEN),
+            // Read-only S/Z/LZ/RD never acquire range evidence.
+            ("S0", "bit", "unknown", UNPROVEN),
+            ("Z0", "u16", "unknown", UNPROVEN),
+            ("LZ0", "i32", "invalid", LZ_0403),
+            ("RD0", "u32", "unknown", UNPROVEN),
             // Q-only retentive timer names have no R read path.
             ("SN0", "u16", "unsupported", NO_PATH),
         ],
@@ -388,6 +395,10 @@ fn standard_q_exact_bit_counts_and_internal_dw_prefixes() -> wasmtime::Result<()
             ("LTN0", "i32", "unsupported", NO_PATH),
             ("LCS0", "bit", "unsupported", NO_PATH),
             ("ZR0", "u16", "unsupported", NO_PATH),
+            ("S0", "bit", "unknown", UNPROVEN),
+            ("Z0", "u16", "unknown", UNPROVEN),
+            ("LZ0", "i32", "invalid", LZ_0403),
+            ("RD0", "u32", "unsupported", NO_PATH),
         ],
     )
 }
@@ -444,6 +455,10 @@ fn q25prh_keeps_general_ranges_unknown_beside_its_internal_w_prefix() -> wasmtim
             ("X0", "bit", "unknown", Q25PRH),
             ("TN0", "u16", "unsupported", NO_PATH),
             ("ZR0", "u16", "unsupported", NO_PATH),
+            ("S0", "bit", "unsupported", NO_PATH),
+            ("Z0", "u16", "unsupported", NO_PATH),
+            ("LZ0", "i32", "invalid", LZ_0403),
+            ("RD0", "u32", "unsupported", NO_PATH),
         ],
     )
 }

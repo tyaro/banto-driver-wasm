@@ -64,6 +64,10 @@ pub enum Device {
     LCS,
     LCC,
     ZR,
+    /// Read-only in the guest: step relay (bit), index registers and refresh data.
+    S,
+    Z,
+    RD,
 }
 
 impl Device {
@@ -100,6 +104,9 @@ impl Device {
             Self::LCS => 0x55,
             Self::LCC => 0x54,
             Self::ZR => 0xb0,
+            Self::S => 0x98,
+            Self::Z => 0xcc,
+            Self::RD => 0x2c,
         }
     }
 
@@ -125,6 +132,7 @@ impl Device {
                 | Self::CC
                 | Self::LCS
                 | Self::LCC
+                | Self::S
         )
     }
 }

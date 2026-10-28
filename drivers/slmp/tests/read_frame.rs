@@ -270,3 +270,36 @@ fn invalid_bit_nibbles_and_odd_padding_are_rejected() {
         Err(ResponseError::Framing)
     );
 }
+
+#[test]
+fn read_only_s_z_rd_use_their_codes_and_units() {
+    // S: bit unit, decimal number; Q 3-byte number, R 4-byte number.
+    let q = encode_read(Route::default(), Series::Q, span(Device::S, 10, 1)).unwrap();
+    let r = encode_read(Route::default(), Series::R, span(Device::S, 10, 1)).unwrap();
+    assert_eq!(&q[17..25], &[1, 0, 10, 0, 0, 0x98, 1, 0]);
+    assert_eq!(&r[17..27], &[3, 0, 10, 0, 0, 0, 0x98, 0, 1, 0]);
+    assert_eq!(
+        decode_read(
+            Route::default(),
+            span(Device::S, 10, 1),
+            &[0xd4, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 3, 0, 0, 0, 0x10]
+        ),
+        Ok(Values::Bits(vec![true]))
+    );
+    // Z: word unit on both series.
+    let q = encode_read(Route::default(), Series::Q, span(Device::Z, 3, 2)).unwrap();
+    let r = encode_read(Route::default(), Series::R, span(Device::Z, 3, 2)).unwrap();
+    assert_eq!(&q[17..25], &[0, 0, 3, 0, 0, 0xcc, 2, 0]);
+    assert_eq!(&r[17..27], &[2, 0, 3, 0, 0, 0, 0xcc, 0, 2, 0]);
+    assert_eq!(
+        decode_read(Route::default(), span(Device::Z, 3, 2), &D100_RESPONSE),
+        Ok(Values::Words(vec![0x1234, 0xbeef]))
+    );
+    // RD: word unit (R only).
+    let r = encode_read(Route::default(), Series::R, span(Device::RD, 7, 2)).unwrap();
+    assert_eq!(&r[17..27], &[2, 0, 7, 0, 0, 0, 0x2c, 0, 2, 0]);
+    assert_eq!(
+        decode_read(Route::default(), span(Device::RD, 7, 2), &D100_RESPONSE),
+        Ok(Values::Words(vec![0x1234, 0xbeef]))
+    );
+}
