@@ -10,10 +10,10 @@ use banto_register_codec::{
     decode_f32, decode_f64, decode_i16, decode_i32, decode_i64, decode_u32, decode_u64, WordOrder,
 };
 use banto_slmp_read_core::{
-    basic_sd_count, decode_read, decode_type_name, decode_write_ack, encode_bits,
+    basic_sd_count, decode_q_w_total, decode_read, decode_type_name, decode_write_ack, encode_bits,
     encode_q25prh_d3010_3013_test_write, encode_q_dw_words, encode_r_dw_words, encode_read,
-    encode_type_name, plan_basic_sd, BasicArea, BasicEvidence, Device, Frame, ModelFamily,
-    PointCount, ReadSpan, ResponseError, Route, Series, TypeName, Values,
+    encode_type_name, plan_basic_sd, plan_q_w_total, BasicArea, BasicEvidence, Device, Frame,
+    ModelFamily, PointCount, ReadSpan, ResponseError, Route, Series, TypeName, Values,
 };
 use exports::banto::driver::{address, config, diagnostics_v1, read, session, write_v1};
 mod diagnostics;
@@ -32,6 +32,13 @@ enum Phase {
     AwaitSd {
         route: Route,
         model: TypeName,
+        span: ReadSpan,
+    },
+    /// QnU only: SD310-311, read once after a successful SD302-303.
+    AwaitWTotal {
+        route: Route,
+        model: TypeName,
+        d_count: PointCount,
         span: ReadSpan,
     },
     AwaitBitSd {
@@ -56,6 +63,8 @@ struct SlmpConnection {
     next_serial: Cell<u16>,
     phase: RefCell<Phase>,
     w_count: Cell<PointCount>,
+    /// SD310-311 internal + extended W total. Read path only; never a write grant.
+    q_w_total: Cell<Option<u32>>,
     bit_counts: Cell<[PointCount; 4]>, // M, Y, L, B; only same-connection SD evidence.
     diagnostic_bit_counts: Cell<[PointCount; 3]>, // X, SB, F; never a write grant.
     pending: RefCell<BTreeMap<u16, PendingRead>>,
@@ -895,6 +904,80 @@ fn assess_d_span(model: &TypeName, count: PointCount, number: u32, words: u16) -
     }
 }
 
+/// Where a Q W span lies when SD310-311 is usable. Internal and extended W
+/// have no physical continuity, so a request never covers both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QWRegion {
+    Internal,
+    Extended,
+    Outside,
+    /// Crosses the internal/extended boundary or reaches W10000H.
+    Unsupported,
+}
+
+/// Extended W is considered only when SD303 is exact (WC) and SD310-311 (T) is
+/// not below it. `None` keeps the internal-prefix rules. Outside (last >= T)
+/// takes precedence over the unsupported cases.
+fn classify_q_w(
+    w_count: PointCount,
+    w_total: Option<u32>,
+    number: u32,
+    words: u16,
+) -> Option<QWRegion> {
+    let (PointCount::Exact(wc), Some(total)) = (w_count, w_total) else {
+        return None;
+    };
+    if total < wc {
+        return None;
+    }
+    let Some(last) = number.checked_add(u32::from(words - 1)) else {
+        return Some(QWRegion::Outside);
+    };
+    Some(if last >= total {
+        QWRegion::Outside
+    } else if last < wc {
+        QWRegion::Internal
+    } else if number < wc || last >= 0x10000 {
+        QWRegion::Unsupported
+    } else {
+        QWRegion::Extended
+    })
+}
+
+/// Region of a read span on a target Q W area; `None` for every other case.
+fn q_w_region(
+    model: &TypeName,
+    device: Device,
+    w_count: PointCount,
+    w_total: Option<u32>,
+    number: u32,
+    words: u16,
+) -> Option<QWRegion> {
+    if device != Device::W || model.family != ModelFamily::StandardQ {
+        return None;
+    }
+    classify_q_w(w_count, w_total, number, words)
+}
+
+/// Range verdict for a read span. Only Q W with a usable SD310-311 differs
+/// from `assess_d_span`.
+fn assess_read_span(
+    model: &TypeName,
+    device: Device,
+    d_count: PointCount,
+    w_count: PointCount,
+    w_total: Option<u32>,
+    number: u32,
+    words: u16,
+) -> RangeAssessment {
+    match q_w_region(model, device, w_count, w_total, number, words) {
+        Some(QWRegion::Internal | QWRegion::Extended) => RangeAssessment::VerifiedInside,
+        Some(QWRegion::Outside) => RangeAssessment::VerifiedOutside,
+        Some(QWRegion::Unsupported) => RangeAssessment::Unknown,
+        None => assess_d_span(model, read_count(device, d_count, w_count), number, words),
+    }
+}
+
 fn count_guarantees_span(count: PointCount, number: u32, words: u16) -> bool {
     let Some(end_exclusive) = number.checked_add(u32::from(words)) else {
         return false;
@@ -979,6 +1062,17 @@ fn checked_read_span(
     d_count: PointCount,
     w_count: PointCount,
 ) -> Result<ReadSpan, FatalError> {
+    checked_read_span_ext(spec, model, d_count, w_count, None)
+}
+
+/// `checked_read_span` plus the SD310-311 total for QnU extended W reads.
+fn checked_read_span_ext(
+    spec: &TagSpec,
+    model: &TypeName,
+    d_count: PointCount,
+    w_count: PointCount,
+    w_total: Option<u32>,
+) -> Result<ReadSpan, FatalError> {
     let (device, number, kind) =
         parse_read_address(&spec.address, &spec.data_type, spec.string_words)
             .map_err(FatalError::InvalidConfig)?;
@@ -1031,6 +1125,19 @@ fn checked_read_span(
     if device == Device::W {
         match model.family {
             ModelFamily::StandardR => {}
+            ModelFamily::StandardQ
+                if matches!(
+                    classify_q_w(w_count, w_total, number, kind.points()),
+                    Some(QWRegion::Internal | QWRegion::Extended)
+                ) => {}
+            ModelFamily::StandardQ
+                if classify_q_w(w_count, w_total, number, kind.points())
+                    == Some(QWRegion::Outside) =>
+            {
+                return Err(FatalError::InvalidConfig(
+                    "address exceeds verified configured count".into(),
+                ));
+            }
             ModelFamily::Q25PrhWireOnly
                 if count_guarantees_span(w_count, number, kind.points()) => {}
             ModelFamily::StandardQ
@@ -1044,8 +1151,16 @@ fn checked_read_span(
             }
         }
     }
-    let count = read_count(device, d_count, w_count);
-    if assess_d_span(model, count, number, kind.points()) == RangeAssessment::VerifiedOutside {
+    if assess_read_span(
+        model,
+        device,
+        d_count,
+        w_count,
+        w_total,
+        number,
+        kind.points(),
+    ) == RangeAssessment::VerifiedOutside
+    {
         return Err(FatalError::InvalidConfig(
             "address exceeds verified configured count".into(),
         ));
@@ -1089,6 +1204,7 @@ impl session::GuestConnection for SlmpConnection {
             next_serial: Cell::new(1),
             phase: RefCell::new(Phase::Start),
             w_count: Cell::new(PointCount::Unknown),
+            q_w_total: Cell::new(None),
             bit_counts: Cell::new([PointCount::Unknown; 4]),
             diagnostic_bit_counts: Cell::new([PointCount::Unknown; 3]),
             pending: RefCell::new(BTreeMap::new()),
@@ -1225,10 +1341,44 @@ impl session::GuestConnection for SlmpConnection {
                         model,
                         count: PointCount::Unknown,
                     };
+                } else if let Some(span) = plan_q_w_total(&model) {
+                    let route = self.route();
+                    let send = encode_read(route, Series::Q, span)
+                        .map_err(|_| FatalError::Protocol("invalid W total SD span".into()))?;
+                    *self.phase.borrow_mut() = Phase::AwaitWTotal {
+                        route,
+                        model,
+                        d_count: count,
+                        span,
+                    };
+                    return Ok(Some(frame_step(route.frame, send)));
                 } else {
                     return self.finish_dw_discovery(model, count);
                 }
                 Ok(None)
+            }
+            (
+                Phase::AwaitWTotal {
+                    route,
+                    model,
+                    d_count,
+                    span,
+                },
+                Some(frame),
+            ) => {
+                match decode_read(route, span, &frame) {
+                    Ok(Values::Words(words)) => {
+                        self.q_w_total.set(decode_q_w_total(&model, Some(&words)));
+                    }
+                    // A refusal only leaves extended W closed; the internal
+                    // prefix rules and the rest of discovery are unchanged.
+                    Err(ResponseError::EndCode(_)) => {}
+                    Err(error) => return Err(response_error(error)),
+                    Ok(Values::Bits(_)) => {
+                        return Err(FatalError::Protocol("SD read returned bits".into()));
+                    }
+                }
+                self.finish_dw_discovery(model, d_count)
             }
             (
                 Phase::AwaitBitSd {
@@ -1328,7 +1478,14 @@ impl read::Guest for Component {
             .iter()
             .enumerate()
             .filter_map(|(index, spec)| {
-                let span = checked_read_span(spec, model, *count, conn.w_count.get()).ok()?;
+                let span = checked_read_span_ext(
+                    spec,
+                    model,
+                    *count,
+                    conn.w_count.get(),
+                    conn.q_w_total.get(),
+                )
+                .ok()?;
                 if diagnostics::bit_span_outside(conn, model, span) {
                     return None;
                 }
@@ -1336,9 +1493,12 @@ impl read::Guest for Component {
                 Some((
                     u32::try_from(index).ok()?,
                     span,
-                    assess_d_span(
+                    assess_read_span(
                         model,
-                        read_count(span.device, *count, conn.w_count.get()),
+                        span.device,
+                        *count,
+                        conn.w_count.get(),
+                        conn.q_w_total.get(),
                         span.start,
                         span.count,
                     ) == RangeAssessment::VerifiedInside,
@@ -1352,13 +1512,30 @@ impl read::Guest for Component {
             let joined = if verified {
                 groups.last_mut().is_some_and(|last| {
                     if last.span.device != span.device
-                        || assess_d_span(
+                        || assess_read_span(
                             model,
-                            read_count(span.device, *count, conn.w_count.get()),
+                            span.device,
+                            *count,
+                            conn.w_count.get(),
+                            conn.q_w_total.get(),
                             last.span.start,
                             last.span.count,
                         ) != RangeAssessment::VerifiedInside
                     {
+                        return false;
+                    }
+                    // Never merge across the internal/extended W boundary.
+                    let region = |span: ReadSpan| {
+                        q_w_region(
+                            model,
+                            span.device,
+                            conn.w_count.get(),
+                            conn.q_w_total.get(),
+                            span.start,
+                            span.count,
+                        )
+                    };
+                    if region(last.span) != region(span) {
                         return false;
                     }
                     let Some(next_cover) = last.covers.last().and_then(|n| n.checked_add(1)) else {
@@ -1483,11 +1660,29 @@ impl read::Guest for Component {
             ));
         }
         let mut word_offset = 0u16;
-        for cover in &p.covers {
+        let mut first_region = None;
+        for (position, cover) in p.covers.iter().enumerate() {
             let spec = specs
                 .get(*cover as usize)
                 .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
-            let tag = checked_read_span(spec, model, *count, conn.w_count.get())?;
+            let tag = checked_read_span_ext(
+                spec,
+                model,
+                *count,
+                conn.w_count.get(),
+                conn.q_w_total.get(),
+            )?;
+            let region = q_w_region(
+                model,
+                tag.device,
+                conn.w_count.get(),
+                conn.q_w_total.get(),
+                tag.start,
+                tag.count,
+            );
+            if position == 0 {
+                first_region = region;
+            }
             let expected_d = pending
                 .span
                 .start
@@ -1496,12 +1691,16 @@ impl read::Guest for Component {
             if tag.device != pending.span.device
                 || tag.start != expected_d
                 || (p.covers.len() > 1
-                    && assess_d_span(
+                    && (assess_read_span(
                         model,
-                        read_count(tag.device, *count, conn.w_count.get()),
+                        tag.device,
+                        *count,
+                        conn.w_count.get(),
+                        conn.q_w_total.get(),
                         tag.start,
                         tag.count,
-                    ) != RangeAssessment::VerifiedInside)
+                    ) != RangeAssessment::VerifiedInside
+                        || region != first_region))
             {
                 return Err(FatalError::Protocol("plan does not match specs".into()));
             }
@@ -2969,6 +3168,166 @@ mod tests {
                 value: Value::Bool(true),
             }],
             WordOrder::LowHigh
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn q_w_region_follows_the_internal_count_the_total_and_w10000() {
+        use QWRegion::{Extended, Internal, Outside, Unsupported};
+        let exact = PointCount::Exact(0x2000);
+        let cases = [
+            // (number, words, region) with WC = 0x2000 and T = 0x3000.
+            (0x1fff, 1, Internal),
+            (0x1ffe, 2, Internal),
+            (0x2000, 1, Extended),
+            (0x2fff, 1, Extended),
+            (0x2ffe, 2, Extended),
+            (0x2ffc, 4, Extended),
+            (0x1fff, 2, Unsupported),
+            (0x1ffd, 4, Unsupported),
+            (0x2fff, 2, Outside),
+            (0x3000, 1, Outside),
+            (0xffff_ffff, 2, Outside),
+        ];
+        for (number, words, region) in cases {
+            assert_eq!(
+                classify_q_w(exact, Some(0x3000), number, words),
+                Some(region),
+                "W{number:X} x{words}"
+            );
+        }
+        // T above W10000H: outside (last >= T) wins over unsupported.
+        for (number, words, region) in [
+            (0xfffe, 2, Extended),
+            (0xffff, 1, Extended),
+            (0xffff, 2, Unsupported),
+            (0x10000, 1, Unsupported),
+            (0x11fff, 1, Unsupported),
+            (0x11fff, 2, Outside),
+            (0x12000, 1, Outside),
+        ] {
+            assert_eq!(
+                classify_q_w(exact, Some(0x12000), number, words),
+                Some(region),
+                "W{number:X} x{words}"
+            );
+        }
+        // T == WC has no extended area: tags reaching WC are outside.
+        assert_eq!(classify_q_w(exact, Some(0x2000), 0x1fff, 1), Some(Internal));
+        assert_eq!(classify_q_w(exact, Some(0x2000), 0x1fff, 2), Some(Outside));
+        assert_eq!(classify_q_w(exact, Some(0x2000), 0x2000, 1), Some(Outside));
+        // Unusable totals keep the internal-prefix rules.
+        for (count, total) in [
+            (exact, Some(0x1fff)),
+            (exact, Some(0)),
+            (exact, None),
+            (PointCount::AtLeast(32768), Some(0xa000)),
+            (PointCount::Unknown, Some(0xa000)),
+        ] {
+            assert_eq!(classify_q_w(count, total, 0x2000, 1), None);
+        }
+    }
+
+    #[test]
+    fn extended_q_w_reads_verify_inside_and_error_for_outside_and_unsupported() {
+        let q = TypeName {
+            name: "Q02UCPU".into(),
+            code: 0x0263,
+            ..model(ModelFamily::StandardQ)
+        };
+        let tag = |address: &str, data_type: &str| TagSpec {
+            address: address.into(),
+            data_type: data_type.into(),
+            string_words: None,
+        };
+        let read = |spec: &TagSpec, total: Option<u32>| {
+            checked_read_span_ext(
+                spec,
+                &q,
+                PointCount::Unknown,
+                PointCount::Exact(0x2000),
+                total,
+            )
+        };
+        let outside = "address exceeds verified configured count";
+        let unsupported =
+            "W reads require a confirmed iQ-R count or a verified standard Q internal W span";
+        let message = |result: Result<ReadSpan, FatalError>| match result {
+            Err(FatalError::InvalidConfig(message)) => message,
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        };
+        for (address, data_type, start, count) in [
+            ("W1FFF", "u16", 0x1fff, 1),
+            ("W2000", "u16", 0x2000, 1),
+            ("W2FFF", "u16", 0x2fff, 1),
+            ("W2FFE", "u32", 0x2ffe, 2),
+            ("W2FFC", "f64", 0x2ffc, 4),
+        ] {
+            assert_eq!(
+                read(&tag(address, data_type), Some(0x3000)).unwrap(),
+                ReadSpan {
+                    device: Device::W,
+                    start,
+                    count,
+                },
+                "{address}"
+            );
+        }
+        for (address, data_type) in [("W1FFF", "u32"), ("W1FFD", "u64")] {
+            assert_eq!(
+                message(read(&tag(address, data_type), Some(0x3000))),
+                unsupported,
+                "{address} crosses WC"
+            );
+        }
+        for (address, data_type) in [("W2FFF", "u32"), ("W3000", "u16"), ("W4000", "u16")] {
+            assert_eq!(
+                message(read(&tag(address, data_type), Some(0x3000))),
+                outside,
+                "{address}"
+            );
+        }
+        // Without a usable total the old rule applies: W2000 is unsupported.
+        for total in [None, Some(0x1000)] {
+            assert_eq!(message(read(&tag("W2000", "u16"), total)), unsupported);
+        }
+        assert_eq!(
+            message(read(&tag("W2000", "u16"), Some(0x2000))),
+            outside,
+            "T == WC leaves no extended area"
+        );
+        // T above W10000H.
+        assert!(read(&tag("WFFFF", "u16"), Some(0x12000)).is_ok());
+        for address in ["W10000", "W11FFF"] {
+            assert_eq!(
+                message(read(&tag(address, "u16"), Some(0x12000))),
+                unsupported,
+                "{address}"
+            );
+        }
+        assert_eq!(
+            message(read(&tag("WFFFF", "u32"), Some(0x12000))),
+            unsupported
+        );
+        assert_eq!(message(read(&tag("W12000", "u16"), Some(0x12000))), outside);
+        // Non-Q models never use the total.
+        let r = model(ModelFamily::StandardR);
+        assert!(checked_read_span_ext(
+            &tag("W2FFF", "u16"),
+            &r,
+            PointCount::Unknown,
+            PointCount::Unknown,
+            Some(0x3000)
+        )
+        .is_ok());
+        let q25 = model(ModelFamily::Q25PrhWireOnly);
+        assert!(checked_read_span_ext(
+            &tag("W2000", "u16"),
+            &q25,
+            PointCount::Unknown,
+            PointCount::Exact(0x2000),
+            Some(0x3000)
         )
         .is_err());
     }

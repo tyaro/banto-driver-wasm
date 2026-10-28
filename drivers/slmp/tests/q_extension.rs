@@ -1,6 +1,6 @@
 use banto_slmp_read_core::{
-    decode_q_extension_count, decode_type_name, encode_read, plan_q_extension, PointCount,
-    QExtensionArea as A, QExtensionEvidence, Route, Series, TypeName,
+    decode_q_extension_count, decode_q_w_total, decode_type_name, encode_read, plan_q_extension,
+    plan_q_w_total, PointCount, QExtensionArea as A, QExtensionEvidence, Route, Series, TypeName,
 };
 
 // Independent 0101 response fixture; QCPU Appendix 3 supplies the SD pairs.
@@ -144,4 +144,57 @@ fn exact_pair_is_required_and_no_d_w_total_or_basic_limit_is_inferred() {
         decode_q_extension_count(&q, A::FastDInternal, evidence(), Some(&[0xffff, 1])),
         PointCount::Exact(0x1ffff)
     );
+}
+
+#[test]
+fn sd310_w_total_is_planned_for_classified_qnu_except_q00uj() {
+    for (name, code) in [
+        ("Q00UCPU", 0x0261),
+        ("Q01UCPU", 0x0262),
+        ("Q02UCPU", 0x0263),
+        ("Q10UDHCPU", 0x0266),
+        ("Q20UDEHCPU", 0x0267),
+        ("Q03UDECPU", 0x0268),
+        ("Q04UDHCPU", 0x0269),
+        ("Q06UDEHCPU", 0x026a),
+        ("Q13UDHCPU", 0x026b),
+        ("Q26UDEHCPU", 0x026c),
+        ("Q50UDEHCPU", 0x026d),
+        ("Q100UDEHCPU", 0x026e),
+        ("Q03UDVCPU", 0x0366),
+        ("Q04UDVCPU", 0x0367),
+        ("Q06UDVCPU", 0x0368),
+        ("Q13UDVCPU", 0x036a),
+        ("Q26UDVCPU", 0x036c),
+    ] {
+        let q = model(name, code);
+        let span = plan_q_w_total(&q).unwrap();
+        assert_eq!((span.start, span.count), (310, 2));
+        let request = encode_read(Route::default(), Series::Q, span).unwrap();
+        assert_eq!(&request[17..25], &[0, 0, 0x36, 0x01, 0, 0xa9, 2, 0]);
+        // Low word first.
+        assert_eq!(decode_q_w_total(&q, Some(&[0x3000, 1])), Some(0x13000));
+        assert_eq!(decode_q_w_total(&q, Some(&[0x3000])), None);
+        assert_eq!(decode_q_w_total(&q, Some(&[1, 2, 3])), None);
+        assert_eq!(decode_q_w_total(&q, None), None);
+    }
+}
+
+#[test]
+fn sd310_w_total_is_not_planned_for_other_models() {
+    for (name, code) in [
+        ("Q00UJCPU", 0x0260),
+        ("Q00JCPU", 0x0250),
+        ("Q00CPU", 0x0251),
+        ("Q06HCPU", 0x0042),
+        ("Q25HCPU", 0x0044),
+        ("Q25PRHCPU", 0x004c),
+        ("R04CPU", 0x4800),
+        ("Q03UDVCPU", 0x0367),
+        ("RCPU", 0x0360),
+    ] {
+        let q = model(name, code);
+        assert_eq!(plan_q_w_total(&q), None, "{name}");
+        assert_eq!(decode_q_w_total(&q, Some(&[0x3000, 0])), None, "{name}");
+    }
 }

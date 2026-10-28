@@ -49,6 +49,25 @@ mod tests {
         [d0, d1, w0, w1]
     }
 
+    /// SD310-311 (internal + extended W total), low word first.
+    fn q_w_total_data(total: u32) -> [u8; 4] {
+        total.to_le_bytes()
+    }
+
+    /// Feed one handshake response and return the next step.
+    fn feed(
+        store: &mut Store<()>,
+        driver: &Driver,
+        conn: exports::banto::driver::session::Connection,
+        reply: &[u8],
+    ) -> wasmtime::Result<Option<exports::banto::driver::session::Step>> {
+        Ok(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, Some(reply))?
+            .expect("handshake"))
+    }
+
     fn model_response(name: &str, code: u16) -> Vec<u8> {
         let mut data = [b' '; 18];
         data[0..name.len()].copy_from_slice(name.as_bytes());
@@ -691,6 +710,14 @@ mod tests {
                 .connection()
                 .call_handshake_next(&mut store, conn, Some(&response(2, &sd)))?
                 .expect("ready");
+            if name == "Q02UCPU" {
+                // QnU reads SD310-311 once; T == WC leaves no extended W.
+                driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(&mut store, conn, Some(&response(3, &q_w_total_data(32))))?
+                    .expect("SD310");
+            }
             let send = driver
                 .banto_driver_write_v1()
                 .call_write_next(&mut store, conn, &items, None)?
@@ -701,10 +728,11 @@ mod tests {
             assert_eq!(plan.covers, [0, 1]);
             assert_eq!(&plan.step.send[17..19], &subcommand);
             assert_eq!(plan.step.send[code_offset], 0xb4);
-            assert_eq!(&plan.step.send[2..4], &[3, 0]);
+            let write_serial: u16 = if name == "Q02UCPU" { 4 } else { 3 };
+            assert_eq!(&plan.step.send[2..4], &write_serial.to_le_bytes());
             let done = driver
                 .banto_driver_write_v1()
-                .call_write_next(&mut store, conn, &items, Some(&response(3, &[])))?
+                .call_write_next(&mut store, conn, &items, Some(&response(write_serial, &[])))?
                 .expect("ACK");
             assert!(
                 matches!(done, WriteProgress::Done(results) if results.len() == 2 && results.iter().all(Result::is_ok))
@@ -1305,6 +1333,19 @@ mod tests {
                             matches!(other, Discovery::SdBroken),
                             "{label}: only a malformed SD reply is fatal"
                         );
+                        if name == "Q02UCPU" && matches!(other, Discovery::Counts(_)) {
+                            // QnU reads SD310-311 once after a successful SD302-303.
+                            assert!(ready?.is_some(), "{label}: SD310 request");
+                            driver
+                                .banto_driver_session()
+                                .connection()
+                                .call_handshake_next(
+                                    &mut store,
+                                    conn,
+                                    Some(&response(3, &q_w_total_data(32))),
+                                )?
+                                .expect("SD310");
+                        }
                     }
                 }
                 let outcome = driver
@@ -1384,14 +1425,30 @@ mod tests {
             } else {
                 vec![100, 0, 100, 0]
             };
-            let bit_step = driver
+            let after_dw = driver
                 .banto_driver_session()
                 .connection()
                 .call_handshake_next(&mut store, conn, Some(&response(2, &dw)))?
-                .expect("bit SD")
-                .expect("bit SD send");
+                .expect("next SD")
+                .expect("next SD send");
+            // QnU reads SD310-311 once between the D/W pair and the bit counts.
+            let bit_serial = if is_r { 3 } else { 4 };
+            let bit_step = if is_r {
+                after_dw
+            } else {
+                assert_eq!(&after_dw.send[17..25], &[0, 0, 0x36, 1, 0, 0xa9, 2, 0]);
+                driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(&mut store, conn, Some(&response(3, &q_w_total_data(32))))?
+                    .expect("bit SD")
+                    .expect("bit SD send")
+            };
             assert_eq!(&bit_step.send[15..19], &[1, 4, if is_r { 2 } else { 0 }, 0]);
-            assert_eq!(u16::from_le_bytes([bit_step.send[2], bit_step.send[3]]), 3);
+            assert_eq!(
+                u16::from_le_bytes([bit_step.send[2], bit_step.send[3]]),
+                bit_serial
+            );
             let mut sd_words = vec![0u16; if is_r { 14 } else { 5 }];
             sd_words[2] = 128; // R SD264 pair / Q SD292.
             if is_r {
@@ -1407,7 +1464,7 @@ mod tests {
             assert!(driver
                 .banto_driver_session()
                 .connection()
-                .call_handshake_next(&mut store, conn, Some(&response(3, &bit_sd)))?
+                .call_handshake_next(&mut store, conn, Some(&response(bit_serial, &bit_sd)))?
                 .expect("bit counts ready")
                 .is_none());
             let items: Vec<WriteItem> = [true, false, true]
@@ -1437,7 +1494,12 @@ mod tests {
             assert_eq!(&plan.step.send[plan.step.send.len() - 2..], &[0x10, 0x10]);
             let done = driver
                 .banto_driver_write_v1()
-                .call_write_next(&mut store, conn, &items, Some(&response(4, &[])))?
+                .call_write_next(
+                    &mut store,
+                    conn,
+                    &items,
+                    Some(&response(bit_serial + 1, &[])),
+                )?
                 .expect("ACK");
             assert!(
                 matches!(done, WriteProgress::Done(results) if results.len() == 3 && results.iter().all(Result::is_ok))
@@ -1452,9 +1514,11 @@ mod tests {
             assert!(
                 matches!(driver.banto_driver_write_v1().call_write_next(&mut store, conn, &outside, None)?.expect("outside"), WriteProgress::Done(results) if matches!(results.as_slice(), [Err(_)]))
             );
-            for (serial, address, device_code) in
-                [(5, "Y1A", 0x9d), (6, "L12", 0x92), (7, "B2F", 0xa0)]
-            {
+            for (serial, address, device_code) in [
+                (bit_serial + 2, "Y1A", 0x9d),
+                (bit_serial + 3, "L12", 0x92),
+                (bit_serial + 4, "B2F", 0xa0),
+            ] {
                 let one = [WriteItem {
                     spec: TagSpec {
                         address: address.into(),
@@ -1498,8 +1562,19 @@ mod tests {
                 .banto_driver_session()
                 .connection()
                 .call_handshake_next(&mut store, unknown, Some(&response(2, &dw)))?
-                .expect("bit SD");
-            let mut rejected = response(3, &[]);
+                .expect("next SD");
+            if !is_r {
+                driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(
+                        &mut store,
+                        unknown,
+                        Some(&response(3, &q_w_total_data(32))),
+                    )?
+                    .expect("bit SD");
+            }
+            let mut rejected = response(bit_serial, &[]);
             rejected[13..15].copy_from_slice(&0xc051u16.to_le_bytes());
             assert!(driver
                 .banto_driver_session()
@@ -1675,6 +1750,12 @@ mod tests {
             .connection()
             .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("ready")
+            .is_some());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response(3, &q_w_total_data(32))))?
+            .expect("SD310")
             .is_none());
         let items = [
             WriteItem {
@@ -1713,7 +1794,7 @@ mod tests {
         assert_eq!(&plan.step.send[25..], expected);
         let done = driver
             .banto_driver_write_v1()
-            .call_write_next(&mut store, conn, &items, Some(&response(3, &[])))?
+            .call_write_next(&mut store, conn, &items, Some(&response(4, &[])))?
             .expect("ACK");
         assert!(
             matches!(done, WriteProgress::Done(results) if matches!(results.as_slice(), [Ok(()), Ok(())]))
@@ -2230,12 +2311,20 @@ mod tests {
                 .expect("SD request")
                 .is_some());
             let sd_bytes: Vec<u8> = sd_words.into_iter().flat_map(u16::to_le_bytes).collect();
-            assert!(driver
-                .banto_driver_session()
-                .connection()
-                .call_handshake_next(&mut store, conn, Some(&response(2, &sd_bytes)))?
-                .expect("ready")
-                .is_none());
+            assert!(
+                driver
+                    .banto_driver_session()
+                    .connection()
+                    .call_handshake_next(&mut store, conn, Some(&response(2, &sd_bytes)))?
+                    .expect("ready")
+                    .is_some()
+                    == (name == "Q02UCPU")
+            );
+            if name == "Q02UCPU" {
+                assert!(
+                    feed(&mut store, &driver, conn, &response(3, &q_w_total_data(32)))?.is_none()
+                );
+            }
             let mut specs = ["L10", "F11", "V12", "SB1A", "SM13"].map(bit_spec).to_vec();
             specs.extend(
                 [("SW1A", "u32"), ("SD290", "u16")].map(|(address, data_type)| TagSpec {
@@ -2460,8 +2549,9 @@ mod tests {
             .banto_driver_session()
             .connection()
             .call_handshake_next(&mut *store, conn, Some(&response(2, &q_sd_data(count, 32))))?
-            .expect("ready")
-            .is_none());
+            .expect("SD310")
+            .is_some());
+        assert!(feed(store, driver, conn, &response(3, &q_w_total_data(32)))?.is_none());
         Ok(conn)
     }
 
@@ -2632,7 +2722,7 @@ mod tests {
         let data: Vec<u8> = words.into_iter().flat_map(u16::to_le_bytes).collect();
         let values = driver
             .banto_driver_read()
-            .call_decode(&mut store, conn, &plans[0], &specs, &response(3, &data))?
+            .call_decode(&mut store, conn, &plans[0], &specs, &response(4, &data))?
             .expect("values");
         assert!(matches!(
             values.as_slice(),
@@ -2651,7 +2741,7 @@ mod tests {
             .banto_driver_read()
             .call_plan(&mut store, conn, &specs)?
             .expect("new plan");
-        let mut refused = response(4, &[]);
+        let mut refused = response(5, &[]);
         refused[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
         let errors = driver
             .banto_driver_read()
@@ -2677,7 +2767,7 @@ mod tests {
                 conn,
                 &nan_plan[0],
                 &nan,
-                &response(5, &[0, 0, 0xc0, 0x7f]),
+                &response(6, &[0, 0, 0xc0, 0x7f]),
             )?
             .expect("nan value");
         assert!(matches!(nan_values.as_slice(), [Ok(Value::Float(value))] if value.is_nan()));
@@ -2716,7 +2806,7 @@ mod tests {
                 conn,
                 &high_plan[0],
                 &high_specs,
-                &response(3, &data),
+                &response(4, &data),
             )?
             .expect("high-low values");
         assert!(matches!(
@@ -3004,7 +3094,7 @@ mod tests {
                 conn,
                 &plans[0],
                 &specs,
-                &response(3, &[0x11, 0, 0x22, 0]),
+                &response(4, &[0x11, 0, 0x22, 0]),
             )?
             .expect("batch");
         assert!(matches!(
@@ -3018,11 +3108,11 @@ mod tests {
                 conn,
                 &plans[1],
                 &specs,
-                &response(4, &[0x33, 0]),
+                &response(5, &[0x33, 0]),
             )?
             .expect("unknown explicit read");
         assert!(matches!(unknown.as_slice(), [Ok(Value::Uint(0x33))]));
-        let mut refusal = response(6, &[]);
+        let mut refusal = response(7, &[]);
         refusal[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
         let refused = driver
             .banto_driver_read()
@@ -3038,7 +3128,7 @@ mod tests {
                 conn,
                 &plans[4],
                 &specs,
-                &response(7, &[0x44, 0, 0x55, 0]),
+                &response(8, &[0x44, 0, 0x55, 0]),
             )?
             .expect("new run after duplicate");
         assert!(matches!(
@@ -3081,7 +3171,7 @@ mod tests {
         body[1918..1920].copy_from_slice(&0x5678u16.to_le_bytes());
         let values = driver
             .banto_driver_read()
-            .call_decode(&mut store, conn, &plans[0], &specs, &response(3, &body))?
+            .call_decode(&mut store, conn, &plans[0], &specs, &response(4, &body))?
             .expect("full 960-word response");
         assert_eq!(values.len(), 960);
         assert!(matches!(values[0], Ok(Value::Uint(0x1234))));
@@ -3098,7 +3188,7 @@ mod tests {
                     conn,
                     &retry[0],
                     &d_specs(&[0, 1]),
-                    &response(5, &[1, 0])
+                    &response(6, &[1, 0])
                 )?
                 .is_err(),
             "short batch response is fatal; no partial tag values"
@@ -3331,7 +3421,8 @@ mod tests {
             .connection()
             .call_handshake_next(&mut *store, conn, Some(&response_3e(&q_sd_data(100, 32))))?
             .expect("3E SD decode")
-            .is_none());
+            .is_some());
+        assert!(feed(store, driver, conn, &response_3e(&q_w_total_data(32)))?.is_none());
         Ok(conn)
     }
 
@@ -3550,7 +3641,13 @@ mod tests {
             .banto_driver_session()
             .connection()
             .call_handshake_next(&mut store, conn, Some(&response_3e(&q_sd_data(100, 32))))?
-            .expect("ready")
+            .expect("SD310")
+            .is_some());
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, Some(&response_3e(&q_w_total_data(32))))?
+            .expect("SD310")
             .is_none());
         let item = |address: &str, value: f64| WriteItem {
             spec: TagSpec {
@@ -3643,7 +3740,8 @@ mod tests {
             .connection()
             .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD decode")
-            .is_none());
+            .is_some());
+        assert!(feed(&mut store, &driver, conn, &response(3, &q_w_total_data(32)))?.is_none());
 
         let specs = [TagSpec {
             address: "D99".into(),
@@ -3656,7 +3754,7 @@ mod tests {
             .expect("known D range");
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].covers, [0]);
-        assert_eq!(&plans[0].step.send[2..4], &[3, 0]);
+        assert_eq!(&plans[0].step.send[2..4], &[4, 0]);
         assert_eq!(&plans[0].step.send[17..25], &[0, 0, 99, 0, 0, 0xa8, 1, 0]);
         let decoded = driver
             .banto_driver_read()
@@ -3665,7 +3763,7 @@ mod tests {
                 conn,
                 &plans[0],
                 &specs,
-                &response(3, &[0x34, 0x12]),
+                &response(4, &[0x34, 0x12]),
             )?
             .expect("D response");
         assert!(matches!(decoded.as_slice(), [Ok(Value::Uint(0x1234))]));
@@ -3677,7 +3775,7 @@ mod tests {
                     conn,
                     &plans[0],
                     &specs,
-                    &response(3, &[0x34, 0x12])
+                    &response(4, &[0x34, 0x12])
                 )?
                 .is_err(),
             "a decoded plan cannot be replayed on the resource"
@@ -3698,7 +3796,7 @@ mod tests {
                 conn,
                 &outside_plan[0],
                 &outside,
-                &response(4, &[0x78, 0x56]),
+                &response(5, &[0x78, 0x56]),
             )?
             .expect("explicit unknown-range read");
         assert!(matches!(
@@ -3743,7 +3841,8 @@ mod tests {
             .connection()
             .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD302")
-            .is_none());
+            .is_some());
+        assert!(feed(&mut store, &driver, conn, &response(3, &q_w_total_data(32)))?.is_none());
 
         let specs = ["D5", "D100", "D7", "D5"].map(|address| TagSpec {
             address: address.into(),
@@ -3757,7 +3856,7 @@ mod tests {
         assert_eq!(plans.len(), specs.len());
         for (index, plan) in plans.iter().enumerate() {
             assert_eq!(plan.covers, [index as u32]);
-            assert_eq!(&plan.step.send[2..4], &((index as u16) + 3).to_le_bytes());
+            assert_eq!(&plan.step.send[2..4], &((index as u16) + 4).to_le_bytes());
             assert_eq!(&plan.step.send[17..19], &[0, 0]); // 0401 word read
             assert_eq!(plan.step.send[19], [5, 100, 7, 5][index]);
             assert_eq!(plan.step.send[23], 1); // one D word, no combined batch
@@ -3769,7 +3868,7 @@ mod tests {
                 conn,
                 &plans[2],
                 &specs,
-                &response(5, &[0x33, 0x33]),
+                &response(6, &[0x33, 0x33]),
             )?
             .expect("third tag");
         assert!(matches!(third.as_slice(), [Ok(Value::Uint(0x3333))]));
@@ -3780,11 +3879,11 @@ mod tests {
                 conn,
                 &plans[0],
                 &specs,
-                &response(3, &[0x11, 0x11]),
+                &response(4, &[0x11, 0x11]),
             )?
             .expect("first tag");
         assert!(matches!(first.as_slice(), [Ok(Value::Uint(0x1111))]));
-        let mut refusal = response(4, &[]);
+        let mut refusal = response(5, &[]);
         refusal[13..15].copy_from_slice(&0xc05bu16.to_le_bytes());
         let second = driver
             .banto_driver_read()
@@ -3798,7 +3897,7 @@ mod tests {
                 conn,
                 &plans[3],
                 &specs,
-                &response(6, &[0x44, 0x44]),
+                &response(7, &[0x44, 0x44]),
             )?
             .expect("last tag still decodes after the individual refusal");
         assert!(matches!(fourth.as_slice(), [Ok(Value::Uint(0x4444))]));
@@ -3945,7 +4044,8 @@ mod tests {
             .connection()
             .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD302")
-            .is_none());
+            .is_some());
+        assert!(feed(&mut store, &driver, conn, &response(3, &q_w_total_data(32)))?.is_none());
         let plans = driver
             .banto_driver_read()
             .call_plan(&mut store, conn, &specs)?
@@ -3960,7 +4060,7 @@ mod tests {
                     conn,
                     &swapped,
                     &specs,
-                    &response(4, &[0x11, 0x11]),
+                    &response(5, &[0x11, 0x11]),
                 )?
                 .is_err(),
             "same address cannot mask a swapped cover"
@@ -3989,7 +4089,14 @@ mod tests {
             .connection()
             .call_handshake_next(&mut store, fresh, Some(&response(2, &q_sd_data(100, 32))))?
             .expect("SD302")
-            .is_none());
+            .is_some());
+        assert!(feed(
+            &mut store,
+            &driver,
+            fresh,
+            &response(3, &q_w_total_data(32))
+        )?
+        .is_none());
         let one = driver
             .banto_driver_read()
             .call_plan(&mut store, fresh, &specs[..1])?
@@ -4002,7 +4109,7 @@ mod tests {
                     fresh,
                     &one[0],
                     &specs[..1],
-                    &response(9, &[0x22, 0x22]),
+                    &response(10, &[0x22, 0x22]),
                 )?
                 .is_err(),
             "wrong response serial is fatal"
@@ -4015,7 +4122,7 @@ mod tests {
                     fresh,
                     &one[0],
                     &specs[..1],
-                    &response(3, &[0x22, 0x22]),
+                    &response(4, &[0x22, 0x22]),
                 )?
                 .is_err(),
             "late response must not replay a consumed plan"
@@ -4365,6 +4472,14 @@ mod tests {
                 Some(&response_with_route(2, ROUTED, &q_sd_data(100, 32))),
             )?
             .expect("routed SD decode")
+            .is_some());
+        assert!(session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_with_route(3, ROUTED, &q_w_total_data(32))),
+            )?
+            .expect("routed SD310 decode")
             .is_none());
         let specs = d_specs(&[10]);
         let plans = driver
@@ -4380,7 +4495,7 @@ mod tests {
                 conn,
                 &plans[0],
                 &specs,
-                &response_with_route(3, ROUTED, &[0x34, 0x12]),
+                &response_with_route(4, ROUTED, &[0x34, 0x12]),
             )?
             .expect("routed tag response");
         assert!(matches!(values.as_slice(), [Ok(Value::Uint(0x1234))]));
@@ -4420,6 +4535,14 @@ mod tests {
                 Some(&response_3e_with_route(ROUTED, &q_sd_data(100, 32))),
             )?
             .expect("routed SD decode")
+            .is_some());
+        assert!(session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_3e_with_route(ROUTED, &q_w_total_data(32))),
+            )?
+            .expect("routed SD310 decode")
             .is_none());
         let specs = d_specs(&[10]);
         let plans = driver
@@ -4507,6 +4630,13 @@ mod tests {
                 Some(&response_with_route(2, ROUTED, &q_sd_data(100, 32))),
             )?
             .expect("SD");
+        session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_with_route(3, ROUTED, &q_w_total_data(32))),
+            )?
+            .expect("SD310");
         let specs = d_specs(&[10]);
         let plans = driver
             .banto_driver_read()
@@ -4579,6 +4709,519 @@ mod tests {
                 "{key}={value}"
             );
         }
+        Ok(())
+    }
+
+    // D3: Q extended W reads. SD303 is the internal W count (WC); SD310-311 is the
+    // internal + extended total (T). Fixtures use fake PLC bytes only.
+
+    type SessionConnection = exports::banto::driver::session::Connection;
+    type SessionStep = exports::banto::driver::session::Step;
+
+    /// Frame and route of one fixture connection.
+    #[derive(Clone, Copy)]
+    struct Wire {
+        three_e: bool,
+        route: [u8; 5],
+    }
+
+    const WIRE_4E: Wire = Wire {
+        three_e: false,
+        route: OWN_ROUTE,
+    };
+
+    impl Wire {
+        fn reply(self, serial: u16, body: &[u8]) -> Vec<u8> {
+            if self.three_e {
+                response_3e_with_route(self.route, body)
+            } else {
+                response_with_route(serial, self.route, body)
+            }
+        }
+
+        fn refusal(self, serial: u16) -> Vec<u8> {
+            let mut reply = self.reply(serial, &[]);
+            let at = if self.three_e { 9 } else { 13 };
+            reply[at..at + 2].copy_from_slice(&0xc05bu16.to_le_bytes());
+            reply
+        }
+
+        fn settings(self) -> Vec<banto::driver::types::Setting> {
+            match (self.route == OWN_ROUTE, self.three_e) {
+                (true, false) => settings(),
+                (true, true) => settings_3e(),
+                (false, three_e) => routed_settings(if three_e { "3e" } else { "4e" }),
+            }
+        }
+
+        /// Offset of the 0401 command in a request.
+        fn command_at(self) -> usize {
+            if self.three_e {
+                11
+            } else {
+                15
+            }
+        }
+
+        fn request_route(self, send: &[u8]) -> [u8; 5] {
+            let at = if self.three_e { 2 } else { 6 };
+            send[at..at + 5].try_into().unwrap()
+        }
+    }
+
+    enum Sd310 {
+        Total(u32),
+        Refused,
+        /// One word where SD310-311 needs two.
+        Short,
+    }
+
+    /// Run 0101 and the SD302-303 reply; returns the connection and the next step
+    /// (the SD310-311 request on a QnU, `None` when the handshake is complete).
+    fn handshake_to_sd310(
+        store: &mut Store<()>,
+        driver: &Driver,
+        wire: Wire,
+        (name, code): (&str, u16),
+        sd302: &[u8],
+    ) -> wasmtime::Result<(SessionConnection, Option<SessionStep>)> {
+        let session = driver.banto_driver_session().connection();
+        let conn = session
+            .call_create(&mut *store, &wire.settings())?
+            .expect("settings");
+        session
+            .call_handshake_next(&mut *store, conn, None)?
+            .expect("start")
+            .expect("0101");
+        session
+            .call_handshake_next(
+                &mut *store,
+                conn,
+                Some(&wire.reply(1, &model_data(name, code))),
+            )?
+            .expect("0101 decode")
+            .expect("SD302");
+        let next = session
+            .call_handshake_next(&mut *store, conn, Some(&wire.reply(2, sd302)))?
+            .expect("SD302-303 decode");
+        Ok((conn, next))
+    }
+
+    fn answer_sd310(
+        store: &mut Store<()>,
+        driver: &Driver,
+        wire: Wire,
+        conn: SessionConnection,
+        sd310: Sd310,
+    ) -> wasmtime::Result<Result<Option<SessionStep>, banto::driver::types::FatalError>> {
+        let reply = match sd310 {
+            Sd310::Total(total) => wire.reply(3, &total.to_le_bytes()),
+            Sd310::Refused => wire.refusal(3),
+            Sd310::Short => wire.reply(3, &[0x00, 0x30]),
+        };
+        driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, Some(&reply))
+    }
+
+    /// A ready QnU connection with SD303 = `wc` and SD310-311 = `total`.
+    fn ready_qnu_w(
+        store: &mut Store<()>,
+        driver: &Driver,
+        wire: Wire,
+        wc: u16,
+        total: u32,
+    ) -> wasmtime::Result<SessionConnection> {
+        let (conn, next) = handshake_to_sd310(
+            store,
+            driver,
+            wire,
+            ("Q02UCPU", 0x0263),
+            &q_sd_data(100, wc),
+        )?;
+        let step = next.expect("SD310-311 request");
+        let at = wire.command_at();
+        assert_eq!(
+            &step.send[at..at + 10],
+            &[1, 4, 0, 0, 0x36, 1, 0, 0xa9, 2, 0]
+        );
+        assert_eq!(wire.request_route(&step.send), wire.route);
+        assert!(
+            answer_sd310(store, driver, wire, conn, Sd310::Total(total))?
+                .expect("SD310 decode")
+                .is_none()
+        );
+        Ok(conn)
+    }
+
+    fn w_specs(tags: &[(&str, &str)]) -> Vec<banto::driver::types::TagSpec> {
+        tags.iter()
+            .map(|(address, data_type)| banto::driver::types::TagSpec {
+                address: (*address).into(),
+                data_type: (*data_type).into(),
+                string_words: None,
+            })
+            .collect()
+    }
+
+    /// Request tail of a word read: subcommand, 3-byte number, device code, points.
+    fn read_tail(plan: &exports::banto::driver::read::Planned) -> Vec<u8> {
+        plan.step.send[plan.step.send.len() - 8..].to_vec()
+    }
+
+    fn plan_covers(
+        store: &mut Store<()>,
+        driver: &Driver,
+        conn: SessionConnection,
+        specs: &[banto::driver::types::TagSpec],
+    ) -> wasmtime::Result<Vec<Vec<u32>>> {
+        Ok(driver
+            .banto_driver_read()
+            .call_plan(&mut *store, conn, specs)?
+            .expect("plan")
+            .into_iter()
+            .map(|plan| plan.covers)
+            .collect())
+    }
+
+    #[test]
+    fn qnu_extended_w_reads_use_device_w_and_never_merge_across_the_internal_boundary(
+    ) -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        // WC = 0x2000 (internal), T = 0x3000 (internal + extended).
+        let conn = ready_qnu_w(&mut store, &driver, WIRE_4E, 0x2000, 0x3000)?;
+        let specs = w_specs(&[
+            ("W1FFE", "u16"),
+            ("W1FFF", "u16"),
+            ("W2000", "u16"),
+            ("W2001", "u16"),
+        ]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("adjacent W tags straddling WC");
+        assert_eq!(plans.len(), 2, "one request below WC, one at and above it");
+        assert_eq!(plans[0].covers, [0, 1]);
+        assert_eq!(plans[1].covers, [2, 3]);
+        assert_eq!(read_tail(&plans[0]), [0, 0, 0xfe, 0x1f, 0, 0xb4, 2, 0]);
+        assert_eq!(read_tail(&plans[1]), [0, 0, 0x00, 0x20, 0, 0xb4, 2, 0]);
+        for (plan, body, expected) in [
+            (&plans[0], [0x11, 0, 0x22, 0], [0x11, 0x22]),
+            (&plans[1], [0x33, 0, 0x44, 0], [0x33, 0x44]),
+        ] {
+            let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+            let values = driver
+                .banto_driver_read()
+                .call_decode(&mut store, conn, plan, &specs, &response(serial, &body))?
+                .expect("decode");
+            assert!(
+                matches!(values.as_slice(), [Ok(Value::Uint(a)), Ok(Value::Uint(b))]
+                    if [*a, *b] == expected),
+                "{values:?}"
+            );
+        }
+
+        // Crossing WC, last word at T, and past T stay uncovered; T-1 and wide
+        // tags wholly inside one area are read.
+        let specs = w_specs(&[
+            ("W1FFF", "u32"), // 1FFF..2000 crosses WC
+            ("W1FFD", "u64"), // 1FFD..2000 crosses WC
+            ("W2FFF", "u16"), // T-1
+            ("W2FFF", "u32"), // reaches T
+            ("W3000", "u16"), // T
+            ("W2FFE", "u32"), // 2FFE..2FFF
+            ("W2FFC", "f64"), // 2FFC..2FFF
+            ("W1FFC", "f64"), // 1FFC..1FFF
+            ("W2000", "u16"), // WC
+            ("W1FFF", "u16"), // WC-1
+        ]);
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("boundary plan");
+        let covers: Vec<_> = plans.iter().map(|plan| plan.covers.clone()).collect();
+        assert_eq!(
+            covers,
+            [vec![2], vec![5], vec![6], vec![7], vec![8], vec![9]]
+        );
+        assert_eq!(read_tail(&plans[0]), [0, 0, 0xff, 0x2f, 0, 0xb4, 1, 0]);
+        assert_eq!(read_tail(&plans[1]), [0, 0, 0xfe, 0x2f, 0, 0xb4, 2, 0]);
+        assert_eq!(read_tail(&plans[2]), [0, 0, 0xfc, 0x2f, 0, 0xb4, 4, 0]);
+        let serial = u16::from_le_bytes([plans[1].step.send[2], plans[1].step.send[3]]);
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[1],
+                &specs,
+                &response(serial, &[0x34, 0x12, 0xcd, 0xab]),
+            )?
+            .expect("extended u32");
+        assert!(matches!(values.as_slice(), [Ok(Value::Uint(0xabcd_1234))]));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn qnu_extended_w_works_over_3e_and_e2_routes_with_the_same_sd310_request(
+    ) -> wasmtime::Result<()> {
+        let (mut store, driver) = load()?;
+        for wire in [
+            Wire {
+                three_e: true,
+                route: OWN_ROUTE,
+            },
+            Wire {
+                three_e: false,
+                route: ROUTED,
+            },
+            Wire {
+                three_e: true,
+                route: ROUTED,
+            },
+        ] {
+            // ready_qnu_w checks the SD310-311 bytes and route of this wire.
+            let conn = ready_qnu_w(&mut store, &driver, wire, 0x2000, 0x3000)?;
+            let specs = w_specs(&[("W1FFF", "u16"), ("W2000", "u16"), ("W3000", "u16")]);
+            let plans = driver
+                .banto_driver_read()
+                .call_plan(&mut store, conn, &specs)?
+                .expect("plan");
+            assert_eq!(plans.len(), 2, "three_e={}", wire.three_e);
+            assert_eq!(plans[0].covers, [0]);
+            assert_eq!(plans[1].covers, [1]);
+            assert_eq!(wire.request_route(&plans[1].step.send), wire.route);
+            assert_eq!(read_tail(&plans[1]), [0, 0, 0x00, 0x20, 0, 0xb4, 1, 0]);
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q_w_total_is_used_only_with_an_exact_sd303_and_a_total_not_below_it() -> wasmtime::Result<()>
+    {
+        let (mut store, driver) = load()?;
+        // (SD303, SD310 answer, tags, covered indices)
+        let tags = [("W1FFF", "u16"), ("W2000", "u16"), ("W7FFF", "u16")];
+        for (label, wc, sd310, expected) in [
+            ("T == WC", 0x2000u16, Sd310::Total(0x2000), vec![0]),
+            ("T < WC", 0x2000, Sd310::Total(0x1000), vec![0]),
+            ("T = 0", 0x2000, Sd310::Total(0), vec![0]),
+            ("T above WC", 0x2000, Sd310::Total(0x3000), vec![0, 1]),
+            // SD303 saturated at 32768: the boundary is unknown, so no extension.
+            (
+                "SD303 saturated",
+                0x8000,
+                Sd310::Total(0xa000),
+                vec![0, 1, 2],
+            ),
+            ("SD310 refused", 0x2000, Sd310::Refused, vec![0]),
+        ] {
+            let (conn, next) = handshake_to_sd310(
+                &mut store,
+                &driver,
+                WIRE_4E,
+                ("Q02UCPU", 0x0263),
+                &q_sd_data(100, wc),
+            )?;
+            assert!(next.is_some(), "{label}: SD310 is always requested");
+            assert!(answer_sd310(&mut store, &driver, WIRE_4E, conn, sd310)?
+                .expect("SD310 does not fail the connection")
+                .is_none());
+            let covers = plan_covers(&mut store, &driver, conn, &w_specs(&tags))?;
+            let covered: Vec<u32> = covers.into_iter().flatten().collect();
+            assert_eq!(covered, expected, "{label}");
+            conn.resource_drop(&mut store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn short_sd310_response_is_fatal_while_an_end_code_refusal_keeps_the_prefix(
+    ) -> wasmtime::Result<()> {
+        use banto::driver::types::FatalError;
+        let (mut store, driver) = load()?;
+        let (conn, next) = handshake_to_sd310(
+            &mut store,
+            &driver,
+            WIRE_4E,
+            ("Q02UCPU", 0x0263),
+            &q_sd_data(100, 0x2000),
+        )?;
+        assert!(next.is_some());
+        let error = answer_sd310(&mut store, &driver, WIRE_4E, conn, Sd310::Short)?
+            .expect_err("a malformed SD310-311 payload is not a PLC refusal");
+        assert!(matches!(error, FatalError::Framing(_)), "{error:?}");
+        conn.resource_drop(&mut store)?;
+
+        // A PLC end-code refusal only leaves extended W closed.
+        let (conn, next) = handshake_to_sd310(
+            &mut store,
+            &driver,
+            WIRE_4E,
+            ("Q02UCPU", 0x0263),
+            &q_sd_data(100, 0x2000),
+        )?;
+        assert!(next.is_some());
+        assert!(
+            answer_sd310(&mut store, &driver, WIRE_4E, conn, Sd310::Refused)?
+                .expect("refusal continues")
+                .is_none()
+        );
+        let covers = plan_covers(
+            &mut store,
+            &driver,
+            conn,
+            &w_specs(&[("W1FFF", "u16"), ("W2000", "u16")]),
+        )?;
+        assert_eq!(covers, [vec![0]]);
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn qnu_w_at_or_past_w10000_is_unsupported_and_past_the_total_is_outside() -> wasmtime::Result<()>
+    {
+        let (mut store, driver) = load()?;
+        // T = 0x12000: low word 0x2000, high word 1.
+        let conn = ready_qnu_w(&mut store, &driver, WIRE_4E, 0x2000, 0x12000)?;
+        let specs = w_specs(&[
+            ("WFFFF", "u16"),  // last word below W10000H: read
+            ("WFFFF", "u32"),  // reaches W10000H: unsupported
+            ("W10000", "u16"), // below T but not addressable here
+            ("W11FFF", "u16"), // T-1, still W10000H or later
+            ("W12000", "u16"), // T: outside
+        ]);
+        let covers = plan_covers(&mut store, &driver, conn, &specs)?;
+        assert_eq!(covers, [vec![0]]);
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn only_qnu_except_q00uj_reads_sd310_and_other_models_keep_their_handshake(
+    ) -> wasmtime::Result<()> {
+        let (mut store, driver) = load()?;
+        for (name, code, sd) in [
+            ("Q00UJCPU", 0x0260u16, q_sd_data(100, 32).to_vec()),
+            ("Q00JCPU", 0x0250, q_sd_data(100, 32).to_vec()),
+            ("Q06HCPU", 0x0042, q_sd_data(100, 32).to_vec()),
+            ("Q25PRHCPU", 0x004c, q_sd_data(100, 32).to_vec()),
+            ("R04CPU", 0x4800, [100, 0, 0, 0, 32, 0, 0, 0].to_vec()),
+        ] {
+            for wire in [
+                WIRE_4E,
+                Wire {
+                    three_e: true,
+                    route: OWN_ROUTE,
+                },
+                Wire {
+                    three_e: false,
+                    route: ROUTED,
+                },
+            ] {
+                let (conn, next) =
+                    handshake_to_sd310(&mut store, &driver, wire, (name, code), &sd)?;
+                assert!(next.is_none(), "{name}: no SD310-311 request");
+                conn.resource_drop(&mut store)?;
+            }
+        }
+        // Q03UDVCPU is a QnU: the request is sent.
+        let (conn, next) = handshake_to_sd310(
+            &mut store,
+            &driver,
+            WIRE_4E,
+            ("Q03UDVCPU", 0x0366),
+            &q_sd_data(100, 32),
+        )?;
+        assert!(next.is_some());
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extended_w_write_is_still_rejected_and_sends_nothing() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let settings = vec![
+            Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+            Setting {
+                key: "d_u16_write_mode".into(),
+                value: "enabled".into(),
+            },
+            Setting {
+                key: "d_u16_write_allowlist".into(),
+                value: "W1E-W21".into(),
+            },
+        ];
+        let session = driver.banto_driver_session().connection();
+        let conn = session
+            .call_create(&mut store, &settings)?
+            .expect("settings");
+        session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        session
+            .call_handshake_next(&mut store, conn, Some(&model_response("Q02UCPU", 0x0263)))?
+            .expect("SD302-303");
+        // WC = 0x20, T = 0x40.
+        assert!(session
+            .call_handshake_next(&mut store, conn, Some(&response(2, &q_sd_data(100, 0x20))))?
+            .expect("SD310 request")
+            .is_some());
+        assert!(session
+            .call_handshake_next(&mut store, conn, Some(&response(3, &q_w_total_data(0x40))))?
+            .expect("SD310")
+            .is_none());
+        let item = |address: &str| WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Float(1.0),
+        };
+        for (label, items) in [
+            ("extended only", vec![item("W20"), item("W21")]),
+            ("crossing WC", vec![item("W1F"), item("W20")]),
+        ] {
+            let outcome = driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &items, None)?
+                .expect("preflight");
+            assert!(
+                matches!(&outcome, WriteProgress::Done(results)
+                    if results.len() == 2 && results.iter().all(Result::is_err)),
+                "{label}: {outcome:?}"
+            );
+        }
+        // The internal prefix is still writable and used the next serial (4).
+        let internal = [item("W1E"), item("W1F")];
+        let WriteProgress::Send(plan) = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &internal, None)?
+            .expect("internal preflight")
+        else {
+            panic!("internal W span must still send")
+        };
+        assert_eq!(&plan.step.send[2..4], &[4, 0], "rejections used no serial");
+        conn.resource_drop(&mut store)?;
         Ok(())
     }
 }

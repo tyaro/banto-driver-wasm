@@ -1,5 +1,6 @@
 //! Conditional Q SD282-289 reads. M/B pairs give complete configured counts;
 //! fast D/W pairs give internal counts only. No totals are synthesized.
+//! SD310-311 (internal + extended W total) has its own plan/decode pair.
 use crate::{Device, ModelFamily, PointCount, ReadSpan, TypeName};
 use banto_register_codec::{decode_u32, WordOrder};
 
@@ -79,6 +80,34 @@ pub fn decode_q_extension_count(
     match words {
         Some([low, high]) => PointCount::Exact(decode_u32([*low, *high], WordOrder::LowHigh)),
         _ => PointCount::Unknown,
+    }
+}
+
+/// Plan the SD310-311 read (internal + extended W total) for the QnU models
+/// that document it: every classified QnU except Q00UJCPU (0x0260). Other Q,
+/// Q25PRH, R, and unknown models get no plan. The CPU serial (09042 or later
+/// for extended W) cannot be read over SLMP, so the value is only a candidate:
+/// the caller decides whether it is usable.
+pub fn plan_q_w_total(model: &TypeName) -> Option<ReadSpan> {
+    if model.family != ModelFamily::StandardQ
+        || !matches!(model.code, 0x0261..=0x0263 | 0x0266..=0x026e | 0x0366..=0x0368 | 0x036a | 0x036c)
+    {
+        return None;
+    }
+    Some(ReadSpan {
+        device: Device::SD,
+        start: 310,
+        count: 2,
+    })
+}
+
+/// Decode SD310-311 as a low/high 32-bit total. A missing or partial response
+/// stays unknown, as does any model without a plan.
+pub fn decode_q_w_total(model: &TypeName, words: Option<&[u16]>) -> Option<u32> {
+    plan_q_w_total(model)?;
+    match words {
+        Some([low, high]) => Some(decode_u32([*low, *high], WordOrder::LowHigh)),
+        _ => None,
     }
 }
 
