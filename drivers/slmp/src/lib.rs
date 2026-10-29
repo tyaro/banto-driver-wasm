@@ -70,6 +70,9 @@ pub enum Device {
     S,
     Z,
     RD,
+    /// Unit/CPU buffer memory (`U<h>\G<n>`), read through the 0401 device
+    /// extension. Its module number is not part of `ReadSpan`; use `UnitBufferSpan`.
+    UG,
 }
 
 impl Device {
@@ -109,6 +112,7 @@ impl Device {
             Self::S => 0x98,
             Self::Z => 0xcc,
             Self::RD => 0x2c,
+            Self::UG => 0xab,
         }
     }
 
@@ -206,6 +210,29 @@ impl Default for Route {
     }
 }
 
+/// A word read of unit or CPU buffer memory. `module` is the upper three hex
+/// digits of the unit's first I/O number (`U<h>`): 0..=0xFF on Q and R, plus
+/// 0x3E0..=0x3E3 (CPU buffer memory of CPU 1-4) on R only. `start` is the
+/// decimal buffer address, `count` the number of words.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnitBufferSpan {
+    pub module: u16,
+    pub start: u32,
+    pub count: u16,
+}
+
+impl UnitBufferSpan {
+    /// The response layout is that of a normal word read, so decoding can use
+    /// `decode_read` with this span.
+    pub const fn read_span(self) -> ReadSpan {
+        ReadSpan {
+            device: Device::UG,
+            start: self.start,
+            count: self.count,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestError {
     Count,
@@ -228,6 +255,10 @@ pub enum Values {
 }
 
 fn check_span(series: Series, span: ReadSpan) -> Result<(), RequestError> {
+    if span.device == Device::UG {
+        // Buffer memory needs a module; use encode_read_unit_buffer.
+        return Err(RequestError::DeviceNumber);
+    }
     let max_count = if span.device.is_bit() { 7168 } else { 960 };
     if span.count == 0 || span.count > max_count {
         return Err(RequestError::Count);
@@ -279,6 +310,54 @@ pub fn encode_read(route: Route, series: Series, span: ReadSpan) -> Result<Vec<u
     if series == Series::R {
         out.push(0);
     }
+    out.extend_from_slice(&span.count.to_le_bytes());
+    Ok(out)
+}
+
+/// Build one binary 4E or 3E batch word read of unit/CPU buffer memory
+/// (command 0401, device-extension subcommand 0080 on Q and 0082 on R).
+pub fn encode_read_unit_buffer(
+    route: Route,
+    series: Series,
+    span: UnitBufferSpan,
+) -> Result<Vec<u8>, RequestError> {
+    if span.count == 0 || span.count > 960 {
+        return Err(RequestError::Count);
+    }
+    let cpu_buffer = matches!(span.module, 0x3e0..=0x3e3);
+    let module_ok = match series {
+        Series::Q => span.module <= 0xff,
+        Series::R => span.module <= 0xff || cpu_buffer,
+    };
+    let last = span
+        .start
+        .checked_add(u32::from(span.count - 1))
+        .ok_or(RequestError::DeviceNumber)?;
+    if !module_ok || (series == Series::Q && last > 0x00ff_ffff) {
+        return Err(RequestError::DeviceNumber);
+    }
+    // Timer, command and subcommand, then the extended device specification.
+    let mut out = request_head(route, if series == Series::Q { 19 } else { 21 });
+    out.extend_from_slice(&0x0401u16.to_le_bytes());
+    out.extend_from_slice(
+        &(if series == Series::Q {
+            0x0080u16
+        } else {
+            0x0082
+        })
+        .to_le_bytes(),
+    );
+    out.extend_from_slice(&[0, 0]);
+    let number = span.start.to_le_bytes();
+    out.extend_from_slice(&number[..if series == Series::Q { 3 } else { 4 }]);
+    out.push(Device::UG.code());
+    if series == Series::R {
+        out.push(0);
+    }
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&span.module.to_le_bytes());
+    // FAH marks the iQ-R CPU buffer memory; every unit module uses F8H.
+    out.push(if cpu_buffer { 0xfa } else { 0xf8 });
     out.extend_from_slice(&span.count.to_le_bytes());
     Ok(out)
 }
