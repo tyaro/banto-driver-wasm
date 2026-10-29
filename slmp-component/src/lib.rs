@@ -1,5 +1,6 @@
 //! Binary 4E or 3E SLMP guest for Q/R reads and restricted numeric/bit writes.
-//! The host owns transport. Each connection owns its discovery evidence.
+//! The host owns transport (`transport` tcp or udp; frames are identical).
+//! Each connection owns its discovery evidence.
 //! 3E has no serial number: reads are matched to responses in issue order.
 //! A D/W word-bit write is a three-step read-modify-write (0401 read, 1401
 //! write-back of `(current & !(set | clear)) | set`, 0401 confirm read). It is
@@ -641,10 +642,10 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
             message: "port must be 1..65535".into(),
         });
     }
-    if setting(settings, "transport").is_some_and(|value| value != "tcp") {
+    if setting(settings, "transport").is_some_and(|value| !matches!(value, "tcp" | "udp")) {
         errors.push(config::FieldError {
             key: "transport".into(),
-            message: "only tcp is supported".into(),
+            message: "transport must be tcp or udp".into(),
         });
     }
     if setting(settings, "word_order")
@@ -2514,6 +2515,24 @@ impl config::Guest for Component {
                 group: FieldGroup::Basic,
             },
             SettingField {
+                key: "transport".into(),
+                label: "Transport".into(),
+                help: Some("TCP or UDP to the PLC's SLMP port. UDP does not retransmit: a lost response fails the request (a lost write response is reported as uncertain). With the 3E frame there is no serial number, so a duplicated or delayed UDP datagram can be taken as the answer to a later read and yield a stale value; prefer 4E over UDP.".into()),
+                kind: FieldKind::Choice(vec![
+                    ChoiceOption {
+                        value: "tcp".into(),
+                        label: "TCP".into(),
+                    },
+                    ChoiceOption {
+                        value: "udp".into(),
+                        label: "UDP".into(),
+                    },
+                ]),
+                required: false,
+                default: Some(SettingValue::Text("tcp".into())),
+                group: FieldGroup::Advanced,
+            },
+            SettingField {
                 key: "word_order".into(),
                 label: "Word order".into(),
                 help: Some("16-bit word order within one numeric value".into()),
@@ -2534,7 +2553,7 @@ impl config::Guest for Component {
             SettingField {
                 key: "frame".into(),
                 label: "SLMP frame".into(),
-                help: Some("Binary frame header. 4E echoes a serial number in each response. 3E has no serial number, so responses are matched by order and a new read is refused while an earlier one is unanswered.".into()),
+                help: Some("Binary frame header. 4E echoes a serial number in each response. 3E has no serial number, so responses are matched by order and a new read is refused while an earlier one is unanswered. Over UDP, 3E can take a duplicated or delayed datagram as a later answer and yield a stale value; prefer 4E over UDP.".into()),
                 kind: FieldKind::Choice(vec![
                     ChoiceOption {
                         value: "4e".into(),
@@ -3856,6 +3875,54 @@ mod tests {
         assert!(validate_settings(&bad)
             .iter()
             .any(|e| e.key == "word_order"));
+    }
+
+    #[test]
+    fn transport_setting_accepts_tcp_or_udp_and_defaults_to_tcp() {
+        let mut settings = vec![
+            session::Setting {
+                key: "host".into(),
+                value: "fixture.invalid".into(),
+            },
+            session::Setting {
+                key: "port".into(),
+                value: "5000".into(),
+            },
+        ];
+        assert!(validate_settings(&settings).is_empty());
+        settings.push(session::Setting {
+            key: "transport".into(),
+            value: "tcp".into(),
+        });
+        assert!(validate_settings(&settings).is_empty());
+        settings[2].value = "udp".into();
+        assert!(validate_settings(&settings).is_empty());
+        for bad in ["UDP", "serial", "serial_over_tcp", ""] {
+            settings[2].value = bad.into();
+            let errors = validate_settings(&settings);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.key == "transport" && e.message == "transport must be tcp or udp"),
+                "{bad:?}"
+            );
+        }
+        let schema = <Component as config::Guest>::schema();
+        let field = schema
+            .iter()
+            .find(|field| field.key == "transport")
+            .expect("transport field");
+        assert!(
+            matches!(&field.default, Some(config::SettingValue::Text(value)) if value == "tcp")
+        );
+        assert!(!field.required);
+        assert!(matches!(&field.group, config::FieldGroup::Advanced));
+        assert!(matches!(&field.kind, config::FieldKind::Choice(options)
+            if options.iter().map(|option| option.value.as_str()).collect::<Vec<_>>() == ["tcp", "udp"]));
+        let help = field.help.as_deref().expect("help");
+        assert!(help.contains("3E") && help.contains("stale") && help.contains("4E"));
+        let frame = schema.iter().find(|f| f.key == "frame").expect("frame");
+        assert!(frame.help.as_deref().is_some_and(|h| h.contains("UDP")));
     }
 
     #[test]

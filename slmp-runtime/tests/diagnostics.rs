@@ -1225,3 +1225,41 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
     }
     Ok(())
 }
+
+#[test]
+fn validate_accepts_transport_udp_and_rejects_other_values() -> wasmtime::Result<()> {
+    use combined_host::banto::driver::types::Setting;
+
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest = combined_host::DriverWithWriteAndDiagnosticsV1::instantiate(
+        &mut store, &component, &linker,
+    )?;
+    let mut settings = vec![
+        Setting {
+            key: "host".into(),
+            value: "fixture.invalid".into(),
+        },
+        Setting {
+            key: "port".into(),
+            value: "5000".into(),
+        },
+        Setting {
+            key: "transport".into(),
+            value: "udp".into(),
+        },
+    ];
+    let errors = guest
+        .banto_driver_config()
+        .call_validate(&mut store, &settings)?;
+    assert!(errors.is_empty());
+    settings[2].value = "serial".into();
+    let errors = guest
+        .banto_driver_config()
+        .call_validate(&mut store, &settings)?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].key, "transport");
+    assert_eq!(errors[0].message, "transport must be tcp or udp");
+    Ok(())
+}
