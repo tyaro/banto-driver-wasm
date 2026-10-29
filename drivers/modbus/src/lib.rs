@@ -1,6 +1,7 @@
 //! A small, transport-free Modbus TCP core.
 //!
-//! This core frames FC1-FC4 reads and FC5/FC6/FC15/FC16/FC22 writes. It is not a
+//! This core frames FC1-FC4 reads (one tag, or a raw FC3/FC4 register span
+//! for string tags) and FC5/FC6/FC15/FC16/FC22 writes. It is not a
 //! `FrameDriver` or a WIT component. The Hub still owns I/O and the
 //! production Modbus driver.
 //! The shape is checked against the native implementation at
@@ -530,6 +531,54 @@ impl ReadHoldingNumeric {
             NumericKind::F32 => NumericValue::Float(f64::from(decode_f32(pair, order))),
             NumericKind::F64 => NumericValue::Float(decode_f64(words, order)),
         })
+    }
+}
+
+/// The largest FC3/FC4 quantity in one request (Modbus application protocol).
+pub const MAX_READ_REGISTERS: u16 = 125;
+
+/// One FC3/FC4 read of `count` contiguous registers whose data bytes are
+/// returned exactly as on the wire (each register high byte first), with no
+/// interpretation. String tags use it; their contract cap is the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadRegisterSpan {
+    pub transaction_id: u16,
+    pub unit_id: u8,
+    pub offset: u16,
+    pub count: u16,
+    pub function: RegisterFunction,
+}
+
+impl ReadRegisterSpan {
+    pub fn request(self) -> Result<[u8; 12], RequestError> {
+        if self.count == 0 || self.count > MAX_READ_REGISTERS {
+            return Err(RequestError::Count);
+        }
+        self.offset
+            .checked_add(self.count - 1)
+            .ok_or(RequestError::AddressRange)?;
+        Ok(request_function(
+            self.transaction_id,
+            self.unit_id,
+            self.offset,
+            self.count,
+            self.function.code(),
+        ))
+    }
+
+    /// The response data, exactly `2 * count` bytes, under the same strict
+    /// checks as the numeric reads.
+    pub fn decode(self, response: &[u8]) -> Result<&[u8], ReadError> {
+        if self.count == 0 || self.count > MAX_READ_REGISTERS {
+            return Err(ReadError::Protocol);
+        }
+        decode_function(
+            response,
+            self.transaction_id,
+            self.unit_id,
+            usize::from(self.count) * 2,
+            self.function.code(),
+        )
     }
 }
 
@@ -1260,5 +1309,63 @@ mod tests {
             read.request(),
             Ok([0x12, 0x34, 0, 0, 0, 6, 1, 3, 0xff, 0xff, 0, 1])
         );
+    }
+
+    #[test]
+    fn register_span_returns_wire_bytes_for_fc3_and_fc4() {
+        for (function, code) in [(RegisterFunction::Holding, 3), (RegisterFunction::Input, 4)] {
+            let read = ReadRegisterSpan {
+                transaction_id: 0x1234,
+                unit_id: 1,
+                offset: 9,
+                count: 2,
+                function,
+            };
+            assert_eq!(
+                read.request(),
+                Ok([0x12, 0x34, 0, 0, 0, 6, 1, code, 0, 9, 0, 2])
+            );
+            // Bytes are returned as on the wire: no NUL cut, no decoding.
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 7, 1, code, 4, b'A', 0, 0xff, b'B']),
+                Ok(&[b'A', 0, 0xff, b'B'][..])
+            );
+            assert_eq!(
+                read.decode(&[0x12, 0x34, 0, 0, 0, 3, 1, code | 0x80, 2]),
+                Err(ReadError::Device(2))
+            );
+            // Short, long or wrong-function replies are framing errors.
+            for response in [
+                &[0x12, 0x34, 0, 0, 0, 5, 1, code, 2, 0, 0][..],
+                &[0x12, 0x34, 0, 0, 0, 9, 1, code, 6, 0, 0, 0, 0, 0, 0],
+                &[0x12, 0x34, 0, 0, 0, 7, 1, 7 - code, 4, 0, 0, 0, 0],
+            ] {
+                assert_eq!(read.decode(response), Err(ReadError::Framing));
+            }
+            assert_eq!(
+                read.decode(&[0x12, 0x35, 0, 0, 0, 7, 1, code, 4, 0, 0, 0, 0]),
+                Err(ReadError::Protocol)
+            );
+            let max = ReadRegisterSpan {
+                count: MAX_READ_REGISTERS,
+                offset: (65_536 - u32::from(MAX_READ_REGISTERS)) as u16,
+                ..read
+            };
+            assert!(max.request().is_ok());
+            assert_eq!(
+                ReadRegisterSpan {
+                    offset: max.offset + 1,
+                    ..max
+                }
+                .request(),
+                Err(RequestError::AddressRange)
+            );
+            for count in [0, MAX_READ_REGISTERS + 1] {
+                assert_eq!(
+                    ReadRegisterSpan { count, ..read }.request(),
+                    Err(RequestError::Count)
+                );
+            }
+        }
     }
 }

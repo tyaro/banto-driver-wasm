@@ -1,5 +1,18 @@
 //! Modbus TCP component with optional write-v1 support.
 //! The host owns sockets, timeouts, retries, and connection policy.
+//!
+//! String tags (stage C1): `data-type "string"` with `string-words = n`
+//! (1..=123, one request) on a holding `4xxxx` or input `3xxxx` register
+//! span. A read is one FC3/FC4 of the n words and returns `value::bytes` of
+//! exactly `2 n` bytes in character order; Modbus packs each register high
+//! byte first (author decision), so these are the register data bytes as on
+//! the wire, never decoded, NUL-cut or encoding-checked. A write is one
+//! string item alone whose `value::bytes` is exactly `2 n` bytes (encoded and
+//! 0-padded by the Hub) and is sent as one FC16 over the whole span inside one
+//! holding allowlist interval; the guest neither truncates nor pads. Under
+//! `register_write=fc6` a one-word string is one FC6 and a wider one is
+//! refused before send, as for numerics. Like every write, only the
+//! acknowledgement echo is checked; there is no read-back.
 
 use std::cell::{Cell, RefCell};
 
@@ -8,7 +21,7 @@ use banto_modbus_read_core::{
     decode_write_ack, mask_write_register_request, register_bit_masks, write_coil_request,
     write_coils_request, write_registers_request, write_single_register_request, BitFunction,
     NumericKind, NumericValue, ReadBit, ReadError, ReadHoldingNumeric, ReadRegisterBit,
-    RegisterFunction, WordOrder, MAX_RESPONSE_LEN,
+    ReadRegisterSpan, RegisterFunction, WordOrder, MAX_RESPONSE_LEN,
 };
 use exports::banto::driver::{address, config, read, session, write_v1};
 
@@ -64,7 +77,12 @@ enum TagKind {
     Numeric(Kind, RegisterFunction),
     Bit(BitFunction),
     RegisterBit(RegisterFunction, u8),
+    /// A string of `n` contiguous registers (1..=123).
+    String(RegisterFunction, u16),
 }
+
+/// One FC3/FC4/FC16 request carries a string tag (CONTRACT C1).
+const MAX_STRING_WORDS: u32 = 123;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -314,6 +332,22 @@ fn parse_holding(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16
     Ok((offset, kind))
 }
 
+/// A string spans `n` whole registers of one holding or input table, with
+/// the same reference and canonical form as a numeric tag at its start.
+fn parse_string(text: &str, words: Option<u32>) -> Result<(u16, TagKind), String> {
+    let words = words
+        .filter(|words| (1..=MAX_STRING_WORDS).contains(words))
+        .ok_or("string tags require string_words 1..=123 (one request)")?;
+    let (offset, _) = parse_holding(text, "u16", None)?;
+    if u32::from(offset) + words > u32::from(u16::MAX) + 1 {
+        return Err("string tag exceeds register address space".into());
+    }
+    Ok((
+        offset,
+        TagKind::String(register_function(text), words as u16),
+    ))
+}
+
 fn parse_bit(
     text: &str,
     data_type: &str,
@@ -378,6 +412,7 @@ fn parse_tag(text: &str, data_type: &str, words: Option<u32>) -> Result<(u16, Ta
         Some(b'3' | b'4') if text.trim().contains('.') => {
             parse_register_bit(text, data_type, words)
         }
+        _ if data_type == "string" => parse_string(text, words),
         _ => parse_holding(text, data_type, words)
             .map(|(offset, kind)| (offset, TagKind::Numeric(kind, register_function(text)))),
     }
@@ -404,6 +439,8 @@ fn area(kind: TagKind) -> Area {
         TagKind::RegisterBit(RegisterFunction::Holding, _) => Area::Holding,
         TagKind::Numeric(_, RegisterFunction::Input) => Area::Input,
         TagKind::Numeric(_, RegisterFunction::Holding) => Area::Holding,
+        TagKind::String(RegisterFunction::Input, _) => Area::Input,
+        TagKind::String(RegisterFunction::Holding, _) => Area::Holding,
     }
 }
 
@@ -412,6 +449,7 @@ fn tag_width(kind: TagKind) -> u32 {
         TagKind::Numeric(kind, _) => kind.word_count(),
         TagKind::Bit(_) => 1,
         TagKind::RegisterBit(_, _) => 1,
+        TagKind::String(_, words) => u32::from(words),
     }
 }
 
@@ -422,7 +460,9 @@ fn canonical_tag(offset: u16, kind: TagKind) -> String {
         TagKind::RegisterBit(function, bit) => {
             format!("{}.{bit}", canonical_register(offset, function))
         }
-        TagKind::Numeric(_, function) => canonical_register(offset, function),
+        TagKind::Numeric(_, function) | TagKind::String(function, _) => {
+            canonical_register(offset, function)
+        }
     }
 }
 
@@ -491,6 +531,15 @@ fn read_request(
             function,
         }
         .request(),
+        TagKind::String(function, words) => ReadRegisterSpan {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            count: words,
+            function,
+        }
+        .request()
+        .expect("validated string span"),
     }
 }
 
@@ -532,6 +581,16 @@ fn decode_read(
         }
         .decode(response)
         .map(Value::Bool),
+        // Character order is the wire order: each register high byte first.
+        TagKind::String(function, words) => ReadRegisterSpan {
+            transaction_id,
+            unit_id: conn.unit_id,
+            offset,
+            count: words,
+            function,
+        }
+        .decode(response)
+        .map(|data| Value::Bytes(data.to_vec())),
     }
 }
 
@@ -602,6 +661,9 @@ fn preflight_write(
     if items.is_empty() || items.len() > 123 {
         return Err("write requires 1..123 items".into());
     }
+    if let Some(request) = preflight_string_write(conn, items, transaction_id)? {
+        return Ok(request);
+    }
     if let Some(request) = preflight_register_bit_write(conn, items, transaction_id)? {
         return Ok(request);
     }
@@ -643,6 +705,7 @@ fn preflight_write(
             TagKind::RegisterBit(_, _) => {
                 return Err("register-bit writes require one point per request".into())
             }
+            TagKind::String(_, _) => return Err("a string tag must be written alone".into()),
             _ => return Err("input-only area is not writable".into()),
         }
     }
@@ -681,6 +744,68 @@ fn preflight_write(
         echo.extend_from_slice(&(words.len() as u16).to_be_bytes());
         Ok((16, frame, echo))
     }
+}
+
+/// A string tag is written alone as its whole span in one request: the
+/// Hub's `2 n` bytes in character order become n registers, high byte first,
+/// inside one holding allowlist interval. Nothing is truncated or padded.
+fn preflight_string_write(
+    conn: &ModbusConnection,
+    items: &[write_v1::WriteItem],
+    transaction_id: u16,
+) -> Result<Option<WriteRequest>, String> {
+    if !items.iter().any(|item| item.spec.data_type == "string") {
+        return Ok(None);
+    }
+    let [item] = items else {
+        return Err("a string tag must be written alone".into());
+    };
+    let (offset, kind) = parse_tag(
+        &item.spec.address,
+        &item.spec.data_type,
+        item.spec.string_words,
+    )?;
+    let TagKind::String(function, words) = kind else {
+        return Err("string tags require a holding register span".into());
+    };
+    if function != RegisterFunction::Holding {
+        return Err("input-only area is not writable".into());
+    }
+    let Value::Bytes(bytes) = &item.value else {
+        return Err("string write requires a bytes value".into());
+    };
+    if bytes.len() != usize::from(words) * 2 {
+        return Err("string write requires exactly 2 * string_words bytes".into());
+    }
+    let last = offset + (words - 1);
+    if !conn
+        .write_allowlist
+        .iter()
+        .any(|range| range.area == Area::Holding && range.first <= offset && last <= range.last)
+    {
+        return Err("write span is outside the enabled allowlist".into());
+    }
+    let registers: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .collect();
+    if conn.register_write_fc6 {
+        // FC6 writes one register: like numerics, only a one-word span fits.
+        let [word] = registers[..] else {
+            return Err(
+                "register_write=fc6 allows only one holding register per request; this string needs FC16".into(),
+            );
+        };
+        let frame = write_single_register_request(transaction_id, conn.unit_id, offset, word);
+        return Ok(Some((6, frame.to_vec(), frame[8..12].to_vec())));
+    }
+    let frame = write_registers_request(transaction_id, conn.unit_id, offset, &registers)
+        .map_err(|_| "register write exceeds the FC16 count or address limit")?;
+    let mut echo = offset.to_be_bytes().to_vec();
+    echo.extend_from_slice(&words.to_be_bytes());
+    Ok(Some((16, frame, echo)))
 }
 
 /// A holding register bit is written alone with FC22, so the device changes
@@ -789,6 +914,8 @@ fn decode_planned(
                     TagKind::Numeric(_, RegisterFunction::Input) => 4,
                     TagKind::RegisterBit(RegisterFunction::Holding, _) => 3,
                     TagKind::RegisterBit(RegisterFunction::Input, _) => 4,
+                    TagKind::String(RegisterFunction::Holding, _) => 3,
+                    TagKind::String(RegisterFunction::Input, _) => 4,
                 }
             ),
         })),
@@ -1078,7 +1205,7 @@ impl address::Guest for Component {
 
     fn supported_kinds() -> Vec<String> {
         [
-            "bool", "u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64",
+            "bool", "u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64", "string",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1101,7 +1228,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write unless register_bit_write=disabled declares a device without FC22; 3xxxx.N is read-only. Coils are written with FC5 (one point) or FC15 (a contiguous run); holding words with FC16, or one i16/u16 with FC6 when register_write=fc6. Connection probe defaults to 40001; probe_address may select one 0xxxx coil, 1xxxx discrete input or 3xxxx input register instead. Writes require write_mode=enabled and write_allowlist."
+        "FC1 coils (0) and FC2 discrete inputs (1): bool; FC3 holding (4) and FC4 input (3): eight numeric types or register-bit bool (for example 40001.3). A 4xxxx.N bit is written alone with FC22 mask write unless register_bit_write=disabled declares a device without FC22; 3xxxx.N is read-only. Coils are written with FC5 (one point) or FC15 (a contiguous run); holding words with FC16, or one i16/u16 with FC6 when register_write=fc6. Connection probe defaults to 40001; probe_address may select one 0xxxx coil, 1xxxx discrete input or 3xxxx input register instead. Strings: 4xxxx or 3xxxx with string_words 1..=123, read as raw bytes high byte first per register; a 4xxxx string is written alone as one FC16 over the whole span (FC6 only for one word under register_write=fc6). Writes require write_mode=enabled and write_allowlist."
             .into()
     }
 
@@ -2563,5 +2690,337 @@ mod tests {
                 });
             }
         }
+    }
+
+    fn string_spec(address: &str, words: Option<u32>) -> TagSpec {
+        TagSpec {
+            address: address.into(),
+            data_type: "string".into(),
+            string_words: words,
+        }
+    }
+
+    fn string_item(address: &str, words: u32, bytes: &[u8]) -> write_v1::WriteItem {
+        write_v1::WriteItem {
+            spec: string_spec(address, Some(words)),
+            value: Value::Bytes(bytes.to_vec()),
+        }
+    }
+
+    #[test]
+    fn string_parse_offset_and_supported_kinds_follow_the_numeric_register_form() {
+        let kinds = <Component as address::Guest>::supported_kinds();
+        assert_eq!(kinds.iter().filter(|kind| *kind == "string").count(), 1);
+        for (raw, words, canonical, area_name, writable, index) in [
+            ("40001", 4, "400001", "holding_register", true, 0),
+            (" 400010 ", 1, "400010", "holding_register", true, 9),
+            ("30001", 123, "300001", "input_register", false, 0),
+            ("465536", 1, "465536", "holding_register", true, 65_535),
+            ("465414", 123, "465414", "holding_register", true, 65_413),
+        ] {
+            let parsed =
+                <Component as address::Guest>::parse(raw.into(), "string".into(), Some(words))
+                    .unwrap();
+            assert_eq!(parsed.canonical, canonical, "{raw}");
+            assert_eq!(parsed.area, area_name);
+            assert_eq!(parsed.writable_area, writable);
+            assert_eq!(parsed.bit, None);
+            assert_eq!(parsed.word_count, words);
+            assert_eq!(parsed.index, Some(index));
+            // Same canonical and index as a numeric tag at the same start.
+            let numeric =
+                <Component as address::Guest>::parse(raw.into(), "u16".into(), None).unwrap();
+            assert_eq!(
+                (numeric.canonical, numeric.area, numeric.index),
+                (parsed.canonical, parsed.area, parsed.index)
+            );
+        }
+        for (raw, data_type, words) in [
+            ("40001", "string", Some(0)),
+            ("40001", "string", Some(124)),
+            ("40001", "string", None),
+            ("465415", "string", Some(123)),
+            ("465536", "string", Some(2)),
+            ("00001", "string", Some(1)),
+            ("10001", "string", Some(1)),
+            ("40001.3", "string", Some(1)),
+            ("40000", "string", Some(1)),
+            ("200001", "string", Some(1)),
+            ("40001", "u16", Some(1)),
+            ("40001", "bool", Some(1)),
+            ("00001", "bool", Some(1)),
+            ("40001", "STRING", Some(1)),
+        ] {
+            assert!(
+                <Component as address::Guest>::parse(raw.into(), data_type.into(), words).is_err(),
+                "{raw} {data_type} {words:?}"
+            );
+        }
+        let offset = |address: &str, words, n| {
+            <Component as address::Guest>::offset(address.into(), "string".into(), Some(words), n)
+        };
+        assert_eq!(offset("400001", 10, 1).as_deref(), Ok("400011"));
+        assert_eq!(offset("400011", 10, -1).as_deref(), Ok("400001"));
+        assert_eq!(offset("300001", 4, 2).as_deref(), Ok("300009"));
+        assert_eq!(offset("400001", 4, 0).as_deref(), Ok("400001"));
+        assert!(offset("400005", 10, -1).is_err());
+        assert_eq!(offset("465527", 10, 0).as_deref(), Ok("465527"));
+        assert!(offset("465517", 10, 1).is_ok());
+        assert!(offset("465518", 10, 1).is_err());
+        assert!(offset("400001", 10, i64::MAX).is_err());
+        assert!(offset("400001", 0, 1).is_err());
+        assert_eq!(
+            <Component as address::Guest>::offset_words("400001".into(), 3).as_deref(),
+            Ok("400004")
+        );
+    }
+
+    #[test]
+    fn string_read_is_one_fc3_or_fc4_span_returned_as_raw_wire_bytes() {
+        let conn = conn();
+        let specs = [
+            spec("40001"),
+            string_spec("40002", Some(3)),
+            string_spec("30101", Some(2)),
+            TagSpec {
+                address: "40005".into(),
+                data_type: "u32".into(),
+                string_words: None,
+            },
+            string_spec("40001", Some(124)),
+        ];
+        let plans = planned_read(&conn, &specs);
+        // One request per tag; an invalid string is left uncovered.
+        assert_eq!(
+            plans.iter().map(|p| p.covers.clone()).collect::<Vec<_>>(),
+            [[0], [1], [2], [3]]
+        );
+        assert_eq!(plans[1].step.send, [0, 1, 0, 0, 0, 6, 1, 3, 0, 1, 0, 3]);
+        assert_eq!(plans[2].step.send, [0, 2, 0, 0, 0, 6, 1, 4, 0, 100, 0, 2]);
+        // Character order is wire order; NUL and non-UTF-8 bytes are kept.
+        let data = [b'A', b'B', 0, b'C', 0xff, 0];
+        let mut response = vec![0, 1, 0, 0, 0, 9, 1, 3, 6];
+        response.extend_from_slice(&data);
+        assert!(matches!(
+            decode_planned(&conn, &plans[1], &specs, &response).as_deref(),
+            Ok([Ok(Value::Bytes(bytes))]) if bytes == &data
+        ));
+        assert!(matches!(
+            decode_planned(&conn, &plans[2], &specs, &[0, 2, 0, 0, 0, 7, 1, 4, 4, 0, 0, 0, 0]).as_deref(),
+            Ok([Ok(Value::Bytes(bytes))]) if bytes == &[0, 0, 0, 0]
+        ));
+        // Numerics around the string keep their values.
+        assert!(matches!(
+            decode_planned(
+                &conn,
+                &plans[0],
+                &specs,
+                &[0, 0, 0, 0, 0, 5, 1, 3, 2, 0, 42]
+            )
+            .as_deref(),
+            Ok([Ok(Value::Uint(42))])
+        ));
+        assert!(matches!(
+            decode_planned(
+                &conn,
+                &plans[3],
+                &specs,
+                &[0, 3, 0, 0, 0, 7, 1, 3, 4, 0, 1, 0, 0]
+            )
+            .as_deref(),
+            Ok([Ok(Value::Uint(1))])
+        ));
+        // A reply that is not exactly 2 n bytes, or of the other table, is fatal.
+        for bad in [
+            vec![0, 1, 0, 0, 0, 7, 1, 3, 4, 0, 0, 0, 0],
+            vec![0, 1, 0, 0, 0, 11, 1, 3, 8, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![0, 1, 0, 0, 0, 9, 1, 4, 6, 0, 0, 0, 0, 0, 0],
+        ] {
+            assert!(matches!(
+                decode_planned(&conn, &plans[1], &specs, &bad),
+                Err(FatalError::Framing(_))
+            ));
+        }
+        assert!(matches!(
+            decode_planned(&conn, &plans[1], &specs, &[0, 1, 0, 0, 0, 3, 1, 0x83, 2]).as_deref(),
+            Ok([Err(ItemError::Device(error))]) if error.code == 2 && error.message.contains("FC=0x03")
+        ));
+        // A plan for a different span no longer matches its tag.
+        let other = [spec("40001"), string_spec("40002", Some(4))];
+        assert!(matches!(
+            decode_planned(&conn, &plans[1], &other, &response),
+            Err(FatalError::Protocol(_))
+        ));
+
+        // The largest string fits the 260-byte response cap.
+        let specs = [string_spec("400001", Some(123))];
+        let plans = planned_read(&conn, &specs);
+        assert_eq!(plans[0].step.send[10..12], [0, 123]);
+        let tid = [plans[0].step.send[0], plans[0].step.send[1]];
+        let mut response = vec![tid[0], tid[1], 0, 0, 0, 249, 1, 3, 246];
+        response.extend((0..246).map(|n| n as u8));
+        assert!(response.len() <= MAX_RESPONSE_LEN);
+        assert!(matches!(
+            decode_planned(&conn, &plans[0], &specs, &response).as_deref(),
+            Ok([Ok(Value::Bytes(bytes))]) if bytes.len() == 246 && bytes[..] == response[9..]
+        ));
+    }
+
+    #[test]
+    fn string_write_is_one_fc16_over_the_whole_allowed_span() {
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.write_allowlist = parse_write_allowlist("400001-400010,400101-400223").unwrap();
+        let item = string_item("40002", 3, b"AB\0C\xff\0");
+        let (function, frame, echo) =
+            preflight_write(&conn, std::slice::from_ref(&item), 9).unwrap();
+        assert_eq!(function, 16);
+        assert_eq!(
+            frame,
+            [0, 9, 0, 0, 0, 13, 1, 16, 0, 1, 0, 3, 6, b'A', b'B', 0, b'C', 0xff, 0]
+        );
+        assert_eq!(echo, [0, 1, 0, 3]);
+        let Ok(write_v1::WriteProgress::Send(planned)) =
+            write_next_impl(&conn, vec![item.clone()], None)
+        else {
+            panic!("FC16 request expected");
+        };
+        assert_eq!(planned.covers, [0]);
+        assert_eq!(planned.step.send[7], 16);
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], Some(vec![0, 0, 0, 0, 0, 6, 1, 16, 0, 1, 0, 3])),
+            Ok(write_v1::WriteProgress::Done(results)) if matches!(results.as_slice(), [Ok(())])
+        ));
+        // An exception is item-level; a wrong quantity echo poisons writes.
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], Some(vec![0, 1, 0, 0, 0, 3, 1, 0x90, 2])),
+            Ok(write_v1::WriteProgress::Done(results))
+                if matches!(results.as_slice(), [Err(ItemError::Device(error))] if error.code == 2)
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, vec![item.clone()], None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        assert!(matches!(
+            write_next_impl(
+                &conn,
+                vec![item.clone()],
+                Some(vec![0, 2, 0, 0, 0, 6, 1, 16, 0, 1, 0, 2])
+            ),
+            Err(FatalError::Protocol(_))
+        ));
+        assert!(matches!(
+            write_next_impl(&conn, vec![item], None),
+            Err(FatalError::Protocol(_))
+        ));
+
+        // The 123-word maximum is one FC16 inside one interval.
+        let conn = {
+            let mut conn = self::conn();
+            conn.write_enabled = true;
+            conn.write_allowlist = parse_write_allowlist("400001-400010,400101-400223").unwrap();
+            conn
+        };
+        let bytes: Vec<u8> = (0..246).map(|n| n as u8).collect();
+        let (function, frame, echo) =
+            preflight_write(&conn, &[string_item("400101", 123, &bytes)], 0).unwrap();
+        assert_eq!(
+            (function, frame.len(), &echo[..]),
+            (16, 13 + 246, &[0, 100, 0, 123][..])
+        );
+        assert_eq!(frame[13..], bytes[..]);
+    }
+
+    #[test]
+    fn string_writes_outside_the_contract_are_rejected_before_send() {
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.write_allowlist =
+            parse_write_allowlist("400001-400010,400011-400020,000001-000010").unwrap();
+        for items in [
+            // span partly outside, or across two intervals
+            vec![string_item("40009", 3, &[0; 6])],
+            vec![string_item("40010", 2, &[0; 4])],
+            // wrong byte length: no truncation or padding
+            vec![string_item("40001", 2, b"ABC")],
+            vec![string_item("40001", 2, b"ABCDE")],
+            vec![string_item("40001", 2, b"")],
+            // non-bytes value
+            vec![write_v1::WriteItem {
+                spec: string_spec("40001", Some(1)),
+                value: Value::Uint(0x4142),
+            }],
+            // input registers and missing or invalid string_words
+            vec![string_item("30001", 1, b"AB")],
+            vec![write_v1::WriteItem {
+                spec: string_spec("40001", None),
+                value: Value::Bytes(b"AB".to_vec()),
+            }],
+            vec![string_item("40001", 0, b"")],
+            vec![string_item("40001", 124, &[0; 248])],
+            vec![string_item("00001", 1, b"AB")],
+            vec![string_item("40001.0", 1, b"AB")],
+            // mixed with other items, either order, or two strings
+            vec![
+                string_item("40001", 1, b"AB"),
+                write_item("40002", "u16", Value::Uint(1)),
+            ],
+            vec![
+                write_item("40001", "u16", Value::Uint(1)),
+                string_item("40002", 1, b"AB"),
+            ],
+            vec![
+                string_item("40001", 1, b"AB"),
+                string_item("40002", 1, b"CD"),
+            ],
+            // bytes for non-string tags
+            vec![write_item("40001", "u16", Value::Bytes(b"AB".to_vec()))],
+            vec![write_item("00001", "bool", Value::Bytes(b"\x01".to_vec()))],
+            vec![write_item(
+                "40001.0",
+                "bool",
+                Value::Bytes(b"\x01".to_vec()),
+            )],
+        ] {
+            assert_rejected_before_send(&conn, items);
+        }
+        conn.write_enabled = false;
+        assert!(matches!(
+            write_next_impl(&conn, vec![string_item("40001", 1, b"AB")], None),
+            Ok(write_v1::WriteProgress::Done(results))
+                if matches!(results.as_slice(), [Err(ItemError::Rejected(message))] if message == "writes are disabled")
+        ));
+    }
+
+    #[test]
+    fn string_write_under_register_write_fc6_fits_only_one_word() {
+        let mut conn = conn();
+        conn.write_enabled = true;
+        conn.register_write_fc6 = true;
+        conn.write_allowlist = parse_write_allowlist("400001-400010").unwrap();
+        let item = string_item("40003", 1, b"Hi");
+        let Ok(write_v1::WriteProgress::Send(planned)) =
+            write_next_impl(&conn, vec![item.clone()], None)
+        else {
+            panic!("FC6 request expected");
+        };
+        assert_eq!(
+            planned.step.send,
+            [0, 0, 0, 0, 0, 6, 1, 6, 0, 2, b'H', b'i']
+        );
+        assert!(matches!(
+            write_next_impl(&conn, vec![item], Some(vec![0, 0, 0, 0, 0, 6, 1, 6, 0, 2, b'H', b'i'])),
+            Ok(write_v1::WriteProgress::Done(results)) if matches!(results.as_slice(), [Ok(())])
+        ));
+        let wide = vec![string_item("40001", 2, b"ABCD")];
+        assert!(matches!(
+            preflight_write(&conn, &wide, 0),
+            Err(message) if message.contains("register_write=fc6")
+        ));
+        assert_rejected_before_send(&conn, wide);
     }
 }

@@ -1011,8 +1011,9 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
         data_type: "string".into(),
         string_words: Some(words),
     };
-    // Every tag starts inside the configured count; all but D96/f64 and
-    // W1E/u32 end beyond it. Strings are not a supported SLMP guest type.
+    // Every tag starts inside the configured count; all but D96/f64,
+    // W1E/u32, D96/string(4) and W1C/string(4) end beyond it. A string is
+    // judged by its whole span, exactly like a multiword numeric tag.
     let specs = vec![
         spec("D99", "u32"),
         spec("D97", "u64"),
@@ -1022,8 +1023,10 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
         spec("W1E", "u32"),
         string("D98", 4),
         string("W1E", 4),
+        string("D96", 4),
+        string("W1C", 4),
     ];
-    // (model, SD reply, expected numeric verdicts and reasons for D99..W1E)
+    // (model, SD reply, expected verdicts and reasons in spec order)
     for (name, code, sd, expected) in [
         (
             "R04CPU",
@@ -1036,6 +1039,10 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
                 ("inside", "same-connection-sd-guaranteed-span"),
                 ("outside", "complete-configured-count"),
                 ("inside", "same-connection-sd-guaranteed-span"),
+                ("outside", "complete-configured-count"),
+                ("outside", "complete-configured-count"),
+                ("inside", "same-connection-sd-guaranteed-span"),
+                ("inside", "same-connection-sd-guaranteed-span"),
             ],
         ),
         (
@@ -1043,6 +1050,10 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
             0x4800,
             None,
             [
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
+                ("unknown", "sd-refused"),
                 ("unknown", "sd-refused"),
                 ("unknown", "sd-refused"),
                 ("unknown", "sd-refused"),
@@ -1064,6 +1075,13 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
                     "unknown",
                     "internal-w-prefix-unproven; guest-read-path-unavailable",
                 ),
+                ("inside", "same-connection-sd-guaranteed-span"),
+                ("unknown", "configured-range-unproven"),
+                (
+                    "unknown",
+                    "internal-w-prefix-unproven; guest-read-path-unavailable",
+                ),
+                ("inside", "same-connection-sd-guaranteed-span"),
                 ("inside", "same-connection-sd-guaranteed-span"),
             ],
         ),
@@ -1118,6 +1136,7 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
             panic!("D/W evidence is already in handshake");
         };
         assert_eq!(report.tags.len(), specs.len());
+        assert_eq!(expected.len(), specs.len());
         for (index, (kind, expected_reason)) in expected.iter().enumerate() {
             let (actual, reason) = match &report.tags[index].verdict {
                 TagVerdict::Inside(reason) => ("inside", reason),
@@ -1134,18 +1153,11 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
                 specs[index].address
             );
         }
-        for tag in &report.tags[6..] {
-            assert!(
-                matches!(&tag.verdict, TagVerdict::Invalid(reason) if !reason.is_empty()),
-                "{name}: string {} must not be judged from a word prefix",
-                tag.address
-            );
-        }
         // The read path never plans a tag this report found outside. Unknown
         // tags on a known wire may still be read explicitly by contract.
         let plans = guest
             .banto_driver_read()
-            .call_plan(&mut store, conn, &specs[..6])?
+            .call_plan(&mut store, conn, &specs)?
             .expect("plan");
         for plan in &plans {
             for &cover in &plan.covers {
@@ -1210,16 +1222,13 @@ fn multiword_and_string_tags_crossing_area_end_never_report_inside() -> wasmtime
             report.model.is_none(),
             model_reason == "0101-refused-or-unavailable"
         );
-        for tag in &report.tags[..6] {
+        for tag in &report.tags {
             assert!(
                 matches!(&tag.verdict, TagVerdict::Unknown(reason) if reason == tag_reason),
                 "{model_reason}: {} {:?}",
                 tag.address,
                 tag.verdict
             );
-        }
-        for tag in &report.tags[6..] {
-            assert!(matches!(tag.verdict, TagVerdict::Invalid(_)));
         }
         conn.resource_drop(&mut store)?;
     }
