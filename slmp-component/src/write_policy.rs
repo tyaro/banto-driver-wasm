@@ -1,5 +1,10 @@
 //! Guest-side copy of the bounded SLMP area policy grammar. The Host independently
 //! validates its saved policy before handing a request to this component.
+//!
+//! Word intervals (`D100-D105`) authorize word and bit-device writes. Word-bit
+//! intervals (`D100.3-D100.5`, `W1A.0-W1B.F`) are a separate list that alone
+//! authorizes read-modify-write of single bits inside D/W words; a word
+//! interval never authorizes a bit, and a bit interval never a word.
 
 use banto_slmp_read_core::Device;
 
@@ -15,6 +20,8 @@ const MAX_DEVICE: u32 = 0x00ff_ffff;
 pub(super) struct WritePolicy {
     enabled: bool,
     ranges: Vec<(Device, u32, u32)>,
+    /// D/W word-bit intervals as inclusive `word * 16 + bit` positions.
+    bit_ranges: Vec<(Device, u64, u64)>,
 }
 
 impl WritePolicy {
@@ -32,14 +39,41 @@ impl WritePolicy {
             return Err((ALLOWLIST_KEY, "write allowlist is too long"));
         }
         let mut ranges = Vec::new();
+        let mut bit_ranges: Vec<(Device, u64, u64)> = Vec::new();
         if !raw.is_empty() {
             for interval in raw.split(',') {
-                if ranges.len() == MAX_INTERVALS {
+                if ranges.len() + bit_ranges.len() == MAX_INTERVALS {
                     return Err((ALLOWLIST_KEY, "too many write ranges"));
                 }
                 let Some((start, end)) = interval.split_once('-') else {
                     return Err((ALLOWLIST_KEY, "expected same-area start-end ranges"));
                 };
+                if start.contains('.') || end.contains('.') {
+                    let (device, start) = parse_word_bit(start)?;
+                    let (end_device, end) = parse_word_bit(end)?;
+                    if device != end_device {
+                        return Err((ALLOWLIST_KEY, "write range must remain in one device area"));
+                    }
+                    if end < start || end - start >= MAX_BITS as u64 {
+                        return Err((
+                            ALLOWLIST_KEY,
+                            "write range is reversed or exceeds device request limit",
+                        ));
+                    }
+                    if device == Device::D && start / 16 <= 3001 && end / 16 >= 3000 {
+                        return Err((ALLOWLIST_KEY, "D3000 and D3001 are protected"));
+                    }
+                    if bit_ranges
+                        .iter()
+                        .rev()
+                        .find(|&&(area, _, _)| area == device)
+                        .is_some_and(|&(_, _, last)| start <= last)
+                    {
+                        return Err((ALLOWLIST_KEY, "write ranges must be ordered and disjoint"));
+                    }
+                    bit_ranges.push((device, start, end));
+                    continue;
+                }
                 let (device, start) = parse_device(start)?;
                 let (end_device, end) = parse_device(end)?;
                 if device != end_device {
@@ -66,13 +100,17 @@ impl WritePolicy {
                 ranges.push((device, start, end));
             }
         }
-        if enabled && ranges.is_empty() {
+        if enabled && ranges.is_empty() && bit_ranges.is_empty() {
             return Err((
                 ALLOWLIST_KEY,
                 "enabled write requires an explicit allowlist",
             ));
         }
-        Ok(Self { enabled, ranges })
+        Ok(Self {
+            enabled,
+            ranges,
+            bit_ranges,
+        })
     }
 
     #[cfg(test)]
@@ -103,6 +141,25 @@ impl WritePolicy {
                 })
     }
 
+    /// Every written bit of one D/W word must lie inside a word-bit interval.
+    /// Word intervals do not count. D3000/D3001 stay protected.
+    pub(super) fn allows_word_bits(&self, device: Device, number: u32, bits: &[u8]) -> bool {
+        self.enabled
+            && matches!(device, Device::D | Device::W)
+            && !bits.is_empty()
+            && number <= MAX_DEVICE
+            && (device != Device::D || !(3000..=3001).contains(&number))
+            && bits.iter().all(|&bit| {
+                let position = u64::from(number) * 16 + u64::from(bit);
+                bit < 16
+                    && self.bit_ranges.iter().any(|&(area, start, end)| {
+                        area == device && (start..=end).contains(&position)
+                    })
+            })
+    }
+
+    /// M/Y/L/B intervals only; they request the bit-count SD read in handshake.
+    /// Word-bit intervals use the D/W counts and do not change the handshake.
     pub(super) fn has_bit_ranges(&self) -> bool {
         self.enabled && self.ranges.iter().any(|(device, _, _)| device.is_bit())
     }
@@ -136,6 +193,30 @@ fn parse_device(value: &str) -> Result<(Device, u32), (&'static str, &'static st
         return Err((ALLOWLIST_KEY, "write address is out of range"));
     }
     Ok((device, number))
+}
+
+/// `D<decimal>.<hex>` or `W<HEX>.<hex>`; uppercase hexadecimal only. Returns
+/// the inclusive bit position `word * 16 + bit`.
+fn parse_word_bit(value: &str) -> Result<(Device, u64), (&'static str, &'static str)> {
+    let (word, bit) = value
+        .split_once('.')
+        .ok_or((ALLOWLIST_KEY, "bit range ends must both be word bits"))?;
+    if !matches!(word.as_bytes().first(), Some(b'D' | b'W')) {
+        return Err((ALLOWLIST_KEY, "word-bit ranges require D or W"));
+    }
+    let (device, number) = parse_device(word)?;
+    if bit.len() != 1
+        || !bit
+            .bytes()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_lowercase())
+    {
+        return Err((
+            ALLOWLIST_KEY,
+            "word bit must be one uppercase hexadecimal digit",
+        ));
+    }
+    let bit = u64::from_str_radix(bit, 16).map_err(|_| (ALLOWLIST_KEY, "invalid word bit"))?;
+    Ok((device, u64::from(number) * 16 + bit))
 }
 
 #[cfg(test)]
@@ -234,5 +315,99 @@ mod tests {
         assert!(WritePolicy::parse(Some("enabled"), Some(&seventeen)).is_err());
         let wide = "D4000-D4000,".repeat(22);
         assert!(WritePolicy::parse(Some("enabled"), Some(&wide)).is_err());
+    }
+
+    #[test]
+    fn word_bit_intervals_are_separate_from_word_intervals() {
+        let policy = WritePolicy::parse(
+            Some("enabled"),
+            Some("D100-D105,D100.3-D100.5,W1A.0-W1B.F,D200.F-D201.1"),
+        )
+        .unwrap();
+        assert!(policy.allows_word_bits(Device::D, 100, &[3, 4, 5]));
+        assert!(!policy.allows_word_bits(Device::D, 100, &[2]));
+        assert!(!policy.allows_word_bits(Device::D, 100, &[5, 6]));
+        assert!(
+            !policy.allows_word_bits(Device::D, 101, &[0]),
+            "a word interval does not authorize bits"
+        );
+        assert!(policy.allows_word_bits(Device::W, 0x1a, &[0, 15]));
+        assert!(policy.allows_word_bits(Device::W, 0x1b, &[15]));
+        assert!(!policy.allows_word_bits(Device::W, 0x1c, &[0]));
+        assert!(!policy.allows_word_bits(Device::D, 0x1a, &[0]));
+        assert!(policy.allows_word_bits(Device::D, 200, &[15]));
+        assert!(policy.allows_word_bits(Device::D, 201, &[0, 1]));
+        assert!(!policy.allows_word_bits(Device::D, 200, &[14]));
+        assert!(!policy.allows_word_bits(Device::D, 201, &[2]));
+        assert!(!policy.allows_word_bits(Device::D, 100, &[]));
+        assert!(!policy.allows_word_bits(Device::D, 100, &[16]));
+        assert!(!policy.allows_word_bits(Device::M, 100, &[3]));
+        // Bit intervals never authorize word writes, nor do they request bit SD.
+        let bits_only = WritePolicy::parse(Some("enabled"), Some("D100.0-D100.F")).unwrap();
+        assert!(!bits_only.allows_device_span(Device::D, 100, 1));
+        assert!(!bits_only.has_bit_ranges());
+        assert!(policy.allows_device_span(Device::D, 100, 6));
+        let disabled = WritePolicy::parse(Some("disabled"), Some("D100.0-D100.F")).unwrap();
+        assert!(!disabled.allows_word_bits(Device::D, 100, &[0]));
+        // Word and bit intervals are ordered independently per device.
+        assert!(WritePolicy::parse(Some("enabled"), Some("D100.0-D100.F,D50-D60")).is_ok());
+        assert!(WritePolicy::parse(Some("enabled"), Some("D200-D205,D100.0-D100.1")).is_ok());
+        assert!(WritePolicy::parse(Some("enabled"), Some("W1A.0-W1A.1,D5.0-D5.1")).is_ok());
+        assert!(
+            WritePolicy::parse(Some("enabled"), Some("D2999.0-D2999.F,D3002.0-D3002.F")).is_ok()
+        );
+        let max = WritePolicy::parse(Some("enabled"), Some("D0.0-D447.F")).unwrap();
+        assert!(max.allows_word_bits(Device::D, 447, &[15]));
+    }
+
+    #[test]
+    fn malformed_word_bit_intervals_fail_closed() {
+        for ranges in [
+            "D100.5-D100.3",
+            "D100.3-D100.3,D100.3-D100.4",
+            "D100.4-D100.5,D100.0-D100.1",
+            "D100.3-D101",
+            "D100-D101.3",
+            "D100.3-W64.3",
+            "D100.a-D100.b",
+            "W1a.0-W1a.1",
+            "W1A.f-W1A.f",
+            "D100.10-D100.11",
+            "D100.-D100.1",
+            "D.1-D.2",
+            "M10.0-M10.1",
+            "Y1.0-Y1.1",
+            "SD10.0-SD10.1",
+            "D2999.0-D3000.0",
+            "D3001.F-D3001.F",
+            "D3000.0-D3000.0",
+            "D0.0-D448.0",
+            "D16777216.0-D16777216.1",
+            "D100.3 - D100.5",
+            "D100.3-D100.5,",
+        ] {
+            assert!(
+                WritePolicy::parse(Some("enabled"), Some(ranges)).is_err(),
+                "{ranges}"
+            );
+        }
+        // The 16-interval cap is shared between word and bit intervals.
+        let sixteen = (0..8)
+            .map(|n| {
+                format!(
+                    "D{}-D{},D{}.0-D{}.0",
+                    4000 + n,
+                    4000 + n,
+                    5000 + n,
+                    5000 + n
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(WritePolicy::parse(Some("enabled"), Some(&sixteen)).is_ok());
+        let seventeen = format!("{sixteen},D6000.0-D6000.0");
+        assert!(WritePolicy::parse(Some("enabled"), Some(&seventeen)).is_err());
+        let long = "D4000.0-D4000.0,".repeat(17);
+        assert!(WritePolicy::parse(Some("enabled"), Some(&long)).is_err());
     }
 }

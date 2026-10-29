@@ -1,6 +1,11 @@
 //! Binary 4E or 3E SLMP guest for Q/R reads and restricted numeric/bit writes.
 //! The host owns transport. Each connection owns its discovery evidence.
 //! 3E has no serial number: reads are matched to responses in issue order.
+//! A D/W word-bit write is a three-step read-modify-write (0401 read, 1401
+//! write-back of `(current & !(set | clear)) | set`, 0401 confirm read). It is
+//! not atomic: a change by the PLC to another bit of the same word between
+//! the read and the write-back is overwritten, and the confirm read checks
+//! only the written bits.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -80,9 +85,51 @@ struct SlmpConnection {
 }
 
 #[derive(Clone)]
-struct PendingWrite {
-    route: Route,
-    run: WriteRun,
+enum PendingWrite {
+    Run {
+        route: Route,
+        run: WriteRun,
+    },
+    /// Word-bit read-modify-write; `route` is the request awaiting a response.
+    Rmw {
+        route: Route,
+        series: Series,
+        rmw: BitRmw,
+        stage: RmwStage,
+    },
+}
+
+/// One word-bit write request: distinct bits of a single D/W word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BitRmw {
+    device: Device,
+    number: u32,
+    /// Bit index of each item, in item order.
+    bits: Vec<u8>,
+    set: u16,
+    clear: u16,
+}
+
+impl BitRmw {
+    fn span(&self) -> ReadSpan {
+        ReadSpan {
+            device: self.device,
+            start: self.number,
+            count: 1,
+        }
+    }
+
+    /// Keep every bit outside `set | clear` as read.
+    const fn merge(&self, current: u16) -> u16 {
+        (current & !(self.set | self.clear)) | self.set
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RmwStage {
+    Read,
+    WriteBack,
+    Confirm,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,6 +364,52 @@ impl ReadKind {
 }
 
 impl SlmpConnection {
+    fn new(settings: &[session::Setting]) -> Result<Self, FatalError> {
+        if let Some(error) = validate_settings(settings).first() {
+            return Err(FatalError::InvalidConfig(error.message.clone()));
+        }
+        let (network, pc, io) = route_fields(settings);
+        Ok(Self {
+            base_route: Route {
+                frame: match setting(settings, "frame") {
+                    Some("3e") => Frame::E3,
+                    _ => Frame::E4,
+                },
+                network,
+                pc,
+                io,
+                ..Route::default()
+            },
+            word_order: match setting(settings, "word_order") {
+                Some("high_low") => WordOrder::HighLow,
+                _ => WordOrder::LowHigh,
+            },
+            q25prh_test_write_enabled: setting(settings, "q25prh_d3010_3013_test_write")
+                == Some("enabled"),
+            write_policy: WritePolicy::parse(
+                setting(settings, MODE_KEY),
+                setting(settings, ALLOWLIST_KEY),
+            )
+            .expect("settings validated above"),
+            q25prh_internal_d_count: Cell::new(PointCount::Unknown),
+            next_serial: Cell::new(1),
+            phase: RefCell::new(Phase::Start),
+            w_count: Cell::new(PointCount::Unknown),
+            q_w_total: Cell::new(None),
+            bit_counts: Cell::new([PointCount::Unknown; 4]),
+            diagnostic_bit_counts: Cell::new([PointCount::Unknown; 3]),
+            pending: RefCell::new(BTreeMap::new()),
+            read_order: RefCell::new(VecDeque::new()),
+            pending_write: RefCell::new(None),
+            write_poisoned: Cell::new(false),
+            pending_diagnostic: RefCell::new(None),
+            diagnostic_poisoned: Cell::new(false),
+            bit_sd_attempted: Cell::new(false),
+            bit_sd_refused: Cell::new(false),
+            dw_sd_refused: Cell::new(false),
+        })
+    }
+
     fn finish_dw_discovery(
         &self,
         model: TypeName,
@@ -1174,49 +1267,7 @@ fn checked_read_span_ext(
 
 impl session::GuestConnection for SlmpConnection {
     fn create(settings: Vec<session::Setting>) -> Result<session::Connection, FatalError> {
-        if let Some(error) = validate_settings(&settings).first() {
-            return Err(FatalError::InvalidConfig(error.message.clone()));
-        }
-        let (network, pc, io) = route_fields(&settings);
-        Ok(session::Connection::new(Self {
-            base_route: Route {
-                frame: match setting(&settings, "frame") {
-                    Some("3e") => Frame::E3,
-                    _ => Frame::E4,
-                },
-                network,
-                pc,
-                io,
-                ..Route::default()
-            },
-            word_order: match setting(&settings, "word_order") {
-                Some("high_low") => WordOrder::HighLow,
-                _ => WordOrder::LowHigh,
-            },
-            q25prh_test_write_enabled: setting(&settings, "q25prh_d3010_3013_test_write")
-                == Some("enabled"),
-            write_policy: WritePolicy::parse(
-                setting(&settings, MODE_KEY),
-                setting(&settings, ALLOWLIST_KEY),
-            )
-            .expect("settings validated above"),
-            q25prh_internal_d_count: Cell::new(PointCount::Unknown),
-            next_serial: Cell::new(1),
-            phase: RefCell::new(Phase::Start),
-            w_count: Cell::new(PointCount::Unknown),
-            q_w_total: Cell::new(None),
-            bit_counts: Cell::new([PointCount::Unknown; 4]),
-            diagnostic_bit_counts: Cell::new([PointCount::Unknown; 3]),
-            pending: RefCell::new(BTreeMap::new()),
-            read_order: RefCell::new(VecDeque::new()),
-            pending_write: RefCell::new(None),
-            write_poisoned: Cell::new(false),
-            pending_diagnostic: RefCell::new(None),
-            diagnostic_poisoned: Cell::new(false),
-            bit_sd_attempted: Cell::new(false),
-            bit_sd_refused: Cell::new(false),
-            dw_sd_refused: Cell::new(false),
-        }))
+        Ok(session::Connection::new(Self::new(&settings)?))
     }
 
     fn handshake_next(
@@ -1776,173 +1827,426 @@ impl write_v1::Guest for Component {
         items: Vec<write_v1::WriteItem>,
         prev_response: Option<Vec<u8>>,
     ) -> Result<write_v1::WriteProgress, FatalError> {
-        let conn = conn.get::<SlmpConnection>();
-        if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
-            return Err(FatalError::Protocol(
-                "diagnostic response is pending; reconnect".into(),
-            ));
-        }
-        if let Some(response) = prev_response {
-            // Consume before parsing so a malformed or refused ACK cannot be retried.
-            conn.write_poisoned.set(true);
-            let pending = conn.pending_write.borrow_mut().take().ok_or_else(|| {
-                FatalError::Protocol("write response without a pending request".into())
-            })?;
-            let run = parse_write_run(&items, conn.word_order)
-                .map_err(|_| FatalError::Protocol("write items changed after send".into()))?;
-            if run != pending.run {
-                return Err(FatalError::Protocol("write item changed after send".into()));
-            }
-            let len = items.len();
-            return match decode_write_ack(pending.route, &response) {
-                Ok(()) => {
-                    conn.write_poisoned.set(false);
-                    Ok(write_v1::WriteProgress::Done(
-                        (0..len).map(|_| Ok(())).collect(),
-                    ))
-                }
-                Err(ResponseError::EndCode(code)) => {
-                    conn.write_poisoned.set(false);
-                    Ok(write_v1::WriteProgress::Done(
-                        (0..len)
-                            .map(|_| {
-                                Err(ItemError::Device(banto::driver::types::DeviceError {
-                                    code: u32::from(code),
-                                    message: format!("SLMP end code 0x{code:04X}"),
-                                }))
-                            })
-                            .collect(),
-                    ))
-                }
-                Err(error) => Err(response_error(error)),
-            };
-        }
-        if conn.write_poisoned.get() {
-            return Err(FatalError::Protocol(
-                "write outcome is uncertain; reconnect".into(),
-            ));
-        }
-        if conn.pending_write.borrow().is_some() || !conn.pending.borrow().is_empty() {
-            return Err(FatalError::Protocol(
-                "a response is pending on this connection".into(),
-            ));
-        }
-        if items.is_empty() {
-            return Err(FatalError::InvalidConfig(
-                "write requires at least one supported item".into(),
-            ));
-        }
-        let (model, count) = match &*conn.phase.borrow() {
-            Phase::Ready { model, count } => (model.clone(), *count),
-            _ => return Ok(rejected_write_count(items.len(), "discovery is incomplete")),
-        };
-        let q25prh = model.family == ModelFamily::Q25PrhWireOnly
-            && model.name == "Q25PRHCPU"
-            && model.code == 0x004c;
-        let q25prh_test = q25prh && conn.q25prh_test_write_enabled;
-        if !matches!(
-            model.family,
-            ModelFamily::StandardR | ModelFamily::StandardQ
-        ) && !q25prh
-        {
-            return Ok(rejected_write_count(
-                items.len(),
-                "write requires a confirmed Q/R model",
-            ));
-        }
-        let run = match parse_write_run(&items, conn.word_order) {
-            Ok(run) => run,
-            Err(message) => return Ok(rejected_write_count(items.len(), &message)),
-        };
-        let device = run.device;
-        let number = run.number;
-        let points = run.payload.points();
-        if q25prh_test
-            && (device != Device::D
-                || number != 3010
-                || points != 4
-                || !run.all_u16
-                || items.len() != 4)
-        {
-            return Ok(rejected_write_count(
-                items.len(),
-                "Q25PRH test write requires exactly D3010..D3013/u16",
-            ));
-        }
-        if q25prh_test && !count_guarantees_span(conn.q25prh_internal_d_count.get(), number, 4) {
-            return Ok(rejected_write_count(
-                items.len(),
-                "Q25PRH SD302 does not confirm the full D3010..D3013 test span",
-            ));
-        }
-        if !q25prh_test && !conn.write_policy.allows_device_span(device, number, points) {
-            return Ok(rejected_write_count(
-                items.len(),
-                "device span is outside the enabled connection allowlist",
-            ));
-        }
-        if !q25prh_test {
-            let proven = if device.is_bit() {
-                matches!(
-                    model.family,
-                    ModelFamily::StandardQ | ModelFamily::StandardR
-                ) && count_guarantees_span(write_bit_count(conn, device), number, points as u16)
-            } else if model.family == ModelFamily::StandardR {
-                let area_count = if device == Device::D {
-                    count
-                } else {
-                    conn.w_count.get()
-                };
-                assess_d_span(&model, area_count, number, points as u16)
-                    == RangeAssessment::VerifiedInside
-            } else if model.family == ModelFamily::StandardQ && device == Device::W {
-                count_guarantees_span(conn.w_count.get(), number, points as u16)
-            } else if q25prh && device == Device::D {
-                count_guarantees_span(conn.q25prh_internal_d_count.get(), number, points as u16)
-            } else {
-                false
-            };
-            if !proven {
-                return Ok(rejected_write_count(
-                    items.len(),
-                    "device span is not within the same-connection SD range",
-                ));
-            }
-        }
-        let route = conn.route();
-        let send = if q25prh_test {
-            // This opt-in never upgrades Q's unknown configured D count.
-            let WritePayload::Words(ref values) = run.payload else {
-                unreachable!("checked Q test unit")
-            };
-            let words: [u16; 4] = values.as_slice().try_into().expect("checked Q test width");
-            encode_q25prh_d3010_3013_test_write(route, words)
-        } else {
-            match &run.payload {
-                WritePayload::Words(values) if model.family == ModelFamily::StandardR => {
-                    encode_r_dw_words(route, device, number, values)
-                }
-                WritePayload::Words(values) => encode_q_dw_words(route, device, number, values),
-                WritePayload::Bits(bits) => encode_bits(
-                    route,
-                    if model.family == ModelFamily::StandardR {
-                        Series::R
-                    } else {
-                        Series::Q
-                    },
-                    device,
-                    number,
-                    bits,
-                ),
-            }
-            .map_err(|_| FatalError::Protocol("validated write span cannot be encoded".into()))?
-        };
-        *conn.pending_write.borrow_mut() = Some(PendingWrite { route, run });
-        Ok(write_v1::WriteProgress::Send(read::Planned {
-            step: frame_step(route.frame, send),
-            covers: (0..items.len() as u32).collect(),
-        }))
+        write_next_on(conn.get::<SlmpConnection>(), items, prev_response)
     }
+}
+
+fn write_next_on(
+    conn: &SlmpConnection,
+    items: Vec<write_v1::WriteItem>,
+    prev_response: Option<Vec<u8>>,
+) -> Result<write_v1::WriteProgress, FatalError> {
+    if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
+        return Err(FatalError::Protocol(
+            "diagnostic response is pending; reconnect".into(),
+        ));
+    }
+    if let Some(response) = prev_response {
+        // Consume before parsing so a malformed or refused ACK cannot be retried.
+        conn.write_poisoned.set(true);
+        let pending = conn.pending_write.borrow_mut().take().ok_or_else(|| {
+            FatalError::Protocol("write response without a pending request".into())
+        })?;
+        let (route, pending_run) = match pending {
+            PendingWrite::Run { route, run } => (route, run),
+            PendingWrite::Rmw {
+                route,
+                series,
+                rmw,
+                stage,
+            } => return rmw_response(conn, &items, route, series, rmw, stage, &response),
+        };
+        let run = parse_write_run(&items, conn.word_order)
+            .map_err(|_| FatalError::Protocol("write items changed after send".into()))?;
+        if run != pending_run {
+            return Err(FatalError::Protocol("write item changed after send".into()));
+        }
+        let len = items.len();
+        return match decode_write_ack(route, &response) {
+            Ok(()) => {
+                conn.write_poisoned.set(false);
+                Ok(write_v1::WriteProgress::Done(
+                    (0..len).map(|_| Ok(())).collect(),
+                ))
+            }
+            Err(ResponseError::EndCode(code)) => {
+                conn.write_poisoned.set(false);
+                Ok(device_error_results(len, code))
+            }
+            Err(error) => Err(response_error(error)),
+        };
+    }
+    if conn.write_poisoned.get() {
+        return Err(FatalError::Protocol(
+            "write outcome is uncertain; reconnect".into(),
+        ));
+    }
+    if conn.pending_write.borrow().is_some() || !conn.pending.borrow().is_empty() {
+        return Err(FatalError::Protocol(
+            "a response is pending on this connection".into(),
+        ));
+    }
+    if items.is_empty() {
+        return Err(FatalError::InvalidConfig(
+            "write requires at least one supported item".into(),
+        ));
+    }
+    let (model, count) = match &*conn.phase.borrow() {
+        Phase::Ready { model, count } => (model.clone(), *count),
+        _ => return Ok(rejected_write_count(items.len(), "discovery is incomplete")),
+    };
+    let q25prh = model.family == ModelFamily::Q25PrhWireOnly
+        && model.name == "Q25PRHCPU"
+        && model.code == 0x004c;
+    let q25prh_test = q25prh && conn.q25prh_test_write_enabled;
+    if !matches!(
+        model.family,
+        ModelFamily::StandardR | ModelFamily::StandardQ
+    ) && !q25prh
+    {
+        return Ok(rejected_write_count(
+            items.len(),
+            "write requires a confirmed Q/R model",
+        ));
+    }
+    // A request naming any D/W word bit is a read-modify-write of one word.
+    match parse_bit_rmw(&items) {
+        Ok(Some(rmw)) => return rmw_preflight(conn, &model, count, rmw, items.len()),
+        Ok(None) => {}
+        Err(message) => return Ok(rejected_write_count(items.len(), &message)),
+    }
+    let run = match parse_write_run(&items, conn.word_order) {
+        Ok(run) => run,
+        Err(message) => return Ok(rejected_write_count(items.len(), &message)),
+    };
+    let device = run.device;
+    let number = run.number;
+    let points = run.payload.points();
+    if q25prh_test
+        && (device != Device::D
+            || number != 3010
+            || points != 4
+            || !run.all_u16
+            || items.len() != 4)
+    {
+        return Ok(rejected_write_count(
+            items.len(),
+            "Q25PRH test write requires exactly D3010..D3013/u16",
+        ));
+    }
+    if q25prh_test && !count_guarantees_span(conn.q25prh_internal_d_count.get(), number, 4) {
+        return Ok(rejected_write_count(
+            items.len(),
+            "Q25PRH SD302 does not confirm the full D3010..D3013 test span",
+        ));
+    }
+    if !q25prh_test && !conn.write_policy.allows_device_span(device, number, points) {
+        return Ok(rejected_write_count(
+            items.len(),
+            "device span is outside the enabled connection allowlist",
+        ));
+    }
+    if !q25prh_test && !write_span_proven(conn, &model, count, q25prh, device, number, points) {
+        return Ok(rejected_write_count(
+            items.len(),
+            "device span is not within the same-connection SD range",
+        ));
+    }
+    let route = conn.route();
+    let send = if q25prh_test {
+        // This opt-in never upgrades Q's unknown configured D count.
+        let WritePayload::Words(ref values) = run.payload else {
+            unreachable!("checked Q test unit")
+        };
+        let words: [u16; 4] = values.as_slice().try_into().expect("checked Q test width");
+        encode_q25prh_d3010_3013_test_write(route, words)
+    } else {
+        match &run.payload {
+            WritePayload::Words(values) if model.family == ModelFamily::StandardR => {
+                encode_r_dw_words(route, device, number, values)
+            }
+            WritePayload::Words(values) => encode_q_dw_words(route, device, number, values),
+            WritePayload::Bits(bits) => encode_bits(
+                route,
+                if model.family == ModelFamily::StandardR {
+                    Series::R
+                } else {
+                    Series::Q
+                },
+                device,
+                number,
+                bits,
+            ),
+        }
+        .map_err(|_| FatalError::Protocol("validated write span cannot be encoded".into()))?
+    };
+    *conn.pending_write.borrow_mut() = Some(PendingWrite::Run { route, run });
+    Ok(write_v1::WriteProgress::Send(read::Planned {
+        step: frame_step(route.frame, send),
+        covers: all_covers(items.len()),
+    }))
+}
+
+fn all_covers(len: usize) -> Vec<u32> {
+    (0..len as u32).collect()
+}
+
+fn device_error_results(len: usize, code: u16) -> write_v1::WriteProgress {
+    write_v1::WriteProgress::Done(
+        (0..len)
+            .map(|_| {
+                Err(ItemError::Device(banto::driver::types::DeviceError {
+                    code: u32::from(code),
+                    message: format!("SLMP end code 0x{code:04X}"),
+                }))
+            })
+            .collect(),
+    )
+}
+
+/// Same-connection SD evidence for a word or bit-device write span. Standard
+/// Q D has no write proof (SD302 counts internal D only); Q W uses SD303.
+fn write_span_proven(
+    conn: &SlmpConnection,
+    model: &TypeName,
+    count: PointCount,
+    q25prh: bool,
+    device: Device,
+    number: u32,
+    points: usize,
+) -> bool {
+    if device.is_bit() {
+        matches!(
+            model.family,
+            ModelFamily::StandardQ | ModelFamily::StandardR
+        ) && count_guarantees_span(write_bit_count(conn, device), number, points as u16)
+    } else if model.family == ModelFamily::StandardR {
+        let area_count = if device == Device::D {
+            count
+        } else {
+            conn.w_count.get()
+        };
+        assess_d_span(model, area_count, number, points as u16) == RangeAssessment::VerifiedInside
+    } else if model.family == ModelFamily::StandardQ && device == Device::W {
+        count_guarantees_span(conn.w_count.get(), number, points as u16)
+    } else if q25prh && device == Device::D {
+        count_guarantees_span(conn.q25prh_internal_d_count.get(), number, points as u16)
+    } else {
+        false
+    }
+}
+
+/// `Ok(None)` when no item names a word bit, so the ordinary run path decides.
+/// Otherwise every item must be a distinct bit of one D/W word with a bool value.
+fn parse_bit_rmw(items: &[write_v1::WriteItem]) -> Result<Option<BitRmw>, String> {
+    let parsed = items
+        .iter()
+        .map(|item| {
+            parse_read_address(
+                &item.spec.address,
+                &item.spec.data_type,
+                item.spec.string_words,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !parsed
+        .iter()
+        .any(|address| matches!(address, Ok((_, _, ReadKind::WordBit(_)))))
+    {
+        return Ok(None);
+    }
+    let mut word = None;
+    let mut bits = Vec::with_capacity(items.len());
+    let (mut set, mut clear) = (0u16, 0u16);
+    for (item, address) in items.iter().zip(parsed) {
+        let Ok((device @ (Device::D | Device::W), number, ReadKind::WordBit(bit))) = address else {
+            return Err("a word-bit write cannot be mixed with other items".into());
+        };
+        if word.is_some_and(|word| word != (device, number)) {
+            return Err("word-bit write items must be bits of one word".into());
+        }
+        word = Some((device, number));
+        let Value::Bool(value) = item.value else {
+            return Err("word-bit write requires a bool value".into());
+        };
+        let mask = 1u16 << bit;
+        if (set | clear) & mask != 0 {
+            return Err("word-bit write names the same bit twice".into());
+        }
+        if value {
+            set |= mask;
+        } else {
+            clear |= mask;
+        }
+        bits.push(bit);
+    }
+    let (device, number) = word.expect("at least one word bit");
+    Ok(Some(BitRmw {
+        device,
+        number,
+        bits,
+        set,
+        clear,
+    }))
+}
+
+/// Check everything before the first (read) step; nothing is sent on refusal.
+fn rmw_preflight(
+    conn: &SlmpConnection,
+    model: &TypeName,
+    count: PointCount,
+    rmw: BitRmw,
+    len: usize,
+) -> Result<write_v1::WriteProgress, FatalError> {
+    let series = match model.family {
+        ModelFamily::StandardQ => Series::Q,
+        ModelFamily::StandardR => Series::R,
+        _ => {
+            return Ok(rejected_write_count(
+                len,
+                "word-bit write requires a confirmed standard Q/R model",
+            ))
+        }
+    };
+    if rmw.device == Device::D && (3000..=3001).contains(&rmw.number) {
+        return Ok(rejected_write_count(len, "D3000 and D3001 are protected"));
+    }
+    if !conn
+        .write_policy
+        .allows_word_bits(rmw.device, rmw.number, &rmw.bits)
+    {
+        return Ok(rejected_write_count(
+            len,
+            "word bits are outside the enabled connection bit allowlist",
+        ));
+    }
+    // The extended Q W total (SD310-311) is a read path only.
+    if !write_span_proven(conn, model, count, false, rmw.device, rmw.number, 1) {
+        return Ok(rejected_write_count(
+            len,
+            "device span is not within the same-connection SD range",
+        ));
+    }
+    let route = conn.route();
+    let span = rmw.span();
+    let send = encode_read(route, series, span)
+        .map_err(|_| FatalError::Protocol("validated word-bit span cannot be encoded".into()))?;
+    *conn.pending_write.borrow_mut() = Some(PendingWrite::Rmw {
+        route,
+        series,
+        rmw,
+        stage: RmwStage::Read,
+    });
+    Ok(write_v1::WriteProgress::Send(read::Planned {
+        step: read_step(route.frame, send, span),
+        covers: all_covers(len),
+    }))
+}
+
+/// One RMW response. The caller has consumed the pending step and poisoned
+/// writes; only a final outcome or a PLC refusal clears the poison.
+fn rmw_response(
+    conn: &SlmpConnection,
+    items: &[write_v1::WriteItem],
+    route: Route,
+    series: Series,
+    rmw: BitRmw,
+    stage: RmwStage,
+    response: &[u8],
+) -> Result<write_v1::WriteProgress, FatalError> {
+    if parse_bit_rmw(items).ok().flatten().as_ref() != Some(&rmw) {
+        return Err(FatalError::Protocol("write item changed after send".into()));
+    }
+    let len = items.len();
+    if stage == RmwStage::WriteBack {
+        return match decode_write_ack(route, response) {
+            Ok(()) => {
+                let next = conn.route();
+                let span = rmw.span();
+                let send = encode_read(next, series, span).map_err(|_| {
+                    FatalError::Protocol("validated word-bit span cannot be encoded".into())
+                })?;
+                *conn.pending_write.borrow_mut() = Some(PendingWrite::Rmw {
+                    route: next,
+                    series,
+                    rmw,
+                    stage: RmwStage::Confirm,
+                });
+                Ok(write_v1::WriteProgress::Send(read::Planned {
+                    step: read_step(next.frame, send, span),
+                    covers: all_covers(len),
+                }))
+            }
+            Err(ResponseError::EndCode(code)) => {
+                conn.write_poisoned.set(false);
+                Ok(device_error_results(len, code))
+            }
+            Err(error) => Err(response_error(error)),
+        };
+    }
+    let word = match decode_read(route, rmw.span(), response) {
+        Ok(Values::Words(words)) if words.len() == 1 => words[0],
+        Ok(_) => {
+            return Err(FatalError::Protocol(
+                "word-bit read returned an unexpected unit".into(),
+            ))
+        }
+        Err(ResponseError::EndCode(code)) => {
+            conn.write_poisoned.set(false);
+            return Ok(if stage == RmwStage::Read {
+                // Refused before the write-back: the word is unchanged.
+                device_error_results(len, code)
+            } else {
+                // The write-back was accepted; its effect is not confirmed.
+                write_v1::WriteProgress::Done(
+                    (0..len)
+                        .map(|_| {
+                            Err(ItemError::VerificationFailed(format!(
+                                "confirm read refused: SLMP end code 0x{code:04X}"
+                            )))
+                        })
+                        .collect(),
+                )
+            });
+        }
+        Err(error) => return Err(response_error(error)),
+    };
+    if stage == RmwStage::Read {
+        let next = conn.route();
+        let words = [rmw.merge(word)];
+        let send = if series == Series::R {
+            encode_r_dw_words(next, rmw.device, rmw.number, &words)
+        } else {
+            encode_q_dw_words(next, rmw.device, rmw.number, &words)
+        }
+        .map_err(|_| FatalError::Protocol("validated word-bit span cannot be encoded".into()))?;
+        *conn.pending_write.borrow_mut() = Some(PendingWrite::Rmw {
+            route: next,
+            series,
+            rmw,
+            stage: RmwStage::WriteBack,
+        });
+        return Ok(write_v1::WriteProgress::Send(read::Planned {
+            step: frame_step(next.frame, send),
+            covers: all_covers(len),
+        }));
+    }
+    conn.write_poisoned.set(false);
+    Ok(write_v1::WriteProgress::Done(
+        rmw.bits
+            .iter()
+            .map(|&bit| {
+                let mask = 1u16 << bit;
+                if (word & mask != 0) == (rmw.set & mask != 0) {
+                    Ok(())
+                } else {
+                    Err(ItemError::VerificationFailed(format!(
+                        "read-back bit {bit:X} does not match the written value"
+                    )))
+                }
+            })
+            .collect(),
+    ))
 }
 
 /// Validate the entire request before assigning a serial or producing a frame.
@@ -2070,7 +2374,7 @@ impl address::Guest for Component {
             // Connection policy, model, same-connection SD evidence and Host
             // authorization remain separate from this static type capability.
             writable_area: (matches!(device, Device::D | Device::W)
-                && matches!(kind, ReadKind::Numeric(_)))
+                && matches!(kind, ReadKind::Numeric(_) | ReadKind::WordBit(_)))
                 || (matches!(device, Device::M | Device::Y | Device::L | Device::B)
                     && kind == ReadKind::Bit),
             bit: if let ReadKind::WordBit(bit) = kind {
@@ -2163,7 +2467,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read and is read-only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or M/Y/L/B bool spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -2320,7 +2624,7 @@ impl config::Guest for Component {
             SettingField {
                 key: MODE_KEY.into(),
                 label: "SLMP write mode".into(),
-                help: Some("D/W numeric and M/Y/L/B bool writes require one explicit connection allowlist, same-connection area SD proof, and a separate Host write gate. Default is disabled. Unknown ranges reject writes.".into()),
+                help: Some("D/W numeric, M/Y/L/B bool and D/W word-bit writes require one explicit connection allowlist, same-connection area SD proof, and a separate Host write gate. Default is disabled. Unknown ranges reject writes.".into()),
                 kind: FieldKind::Choice(vec![
                     ChoiceOption {
                         value: "disabled".into(),
@@ -2338,7 +2642,7 @@ impl config::Guest for Component {
             SettingField {
                 key: ALLOWLIST_KEY.into(),
                 label: "SLMP writable ranges".into(),
-                help: Some("Comma-separated nonoverlapping D/M/L decimal and W/Y/B hexadecimal ranges, such as D3010-D3013,W1A-W1F,M10-M17. Up to 16 ranges; each D/W interval is at most 960 words and each M/Y/L/B interval at most 7168 bits. D3000 and D3001 are protected. Old D/W saved values keep their meaning. A separate Host gate is required.".into()),
+                help: Some("Comma-separated nonoverlapping D/M/L decimal and W/Y/B hexadecimal ranges, such as D3010-D3013,W1A-W1F,M10-M17. Word-bit ranges such as D100.3-D100.5 or W1A.0-W1B.F (D word decimal, W word uppercase hexadecimal, bit one uppercase hexadecimal digit) are the only entries that allow Dn.h/Wn.h writes; a word range never allows bit writes. Up to 16 ranges in total; each D/W interval is at most 960 words and each M/Y/L/B or word-bit interval at most 7168 bits. D3000 and D3001 are protected. Old saved values keep their meaning. A word-bit write is a read-modify-write and is not atomic: if the PLC program or another station changes another bit of the same word between the read and the write-back, that change is overwritten, and the confirm read checks only the written bits. Allowlist only words whose other bits neither the PLC program nor another station writes. A separate Host gate is required.".into()),
                 kind: FieldKind::Text(TextSpec {
                     max_len: Some(256),
                     placeholder: Some("D3010-D3013,W1A-W1F".into()),
@@ -2519,10 +2823,12 @@ mod tests {
                 (span.device, span.start, span.count),
                 (device, number, points)
             );
-            assert!(
-                !<Component as address::Guest>::parse(text.into(), kind.into(), None)
+            // Only the D word bit is a (read-modify-write) writable area here.
+            assert_eq!(
+                <Component as address::Guest>::parse(text.into(), kind.into(), None)
                     .unwrap()
-                    .writable_area
+                    .writable_area,
+                text == "D10.F"
             );
             if device != Device::D {
                 assert!(
@@ -3084,7 +3390,10 @@ mod tests {
         assert_eq!(parsed.bit, Some(15));
         assert_eq!(parsed.index, Some(0x1A));
         assert_eq!(parsed.word_count, 1);
-        assert!(!parsed.writable_area);
+        assert!(
+            parsed.writable_area,
+            "W word bits are read-modify-write targets"
+        );
         assert_eq!(
             parse_read_address("WFFFFFFFF.0", "bit", None),
             Ok((Device::W, u32::MAX, ReadKind::WordBit(0)))
@@ -3877,6 +4186,694 @@ mod tests {
         assert!(validate_settings(&settings)
             .iter()
             .any(|error| error.key == MODE_KEY));
+    }
+
+    const RMW_ALLOWLIST: &str = "D100.0-D100.5,D200-D210,D3002.0-D3002.F,W1A.0-W1A.F,W40.0-W40.F";
+
+    fn rmw_conn(
+        extra: &[(&str, &str)],
+        family: ModelFamily,
+        d_count: PointCount,
+        w_count: PointCount,
+    ) -> SlmpConnection {
+        let mut settings = vec![
+            ("d_u16_write_mode", "enabled"),
+            ("d_u16_write_allowlist", RMW_ALLOWLIST),
+        ];
+        for (key, value) in extra {
+            settings.retain(|(existing, _)| existing != key);
+            settings.push((key, value));
+        }
+        let conn = SlmpConnection::new(&route_settings(&settings)).expect("valid settings");
+        *conn.phase.borrow_mut() = Phase::Ready {
+            model: model(family),
+            count: d_count,
+        };
+        conn.w_count.set(w_count);
+        conn
+    }
+
+    fn bit_write(address: &str, value: bool) -> write_v1::WriteItem {
+        write_v1::WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: "bit".into(),
+                string_words: None,
+            },
+            value: Value::Bool(value),
+        }
+    }
+
+    fn word_write(address: &str, value: u64) -> write_v1::WriteItem {
+        write_v1::WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Uint(value),
+        }
+    }
+
+    fn sent(progress: Result<write_v1::WriteProgress, FatalError>, len: usize) -> Vec<u8> {
+        let Ok(write_v1::WriteProgress::Send(plan)) = progress else {
+            panic!("RMW step must send")
+        };
+        assert_eq!(plan.covers, all_covers(len));
+        assert_eq!(plan.step.max_len, 64);
+        plan.step.send
+    }
+
+    fn done(progress: Result<write_v1::WriteProgress, FatalError>) -> Vec<Result<(), ItemError>> {
+        let Ok(write_v1::WriteProgress::Done(results)) = progress else {
+            panic!("RMW must finish")
+        };
+        results
+    }
+
+    /// Response to `conn`'s route with `serial` (ignored by 3E).
+    fn reply(conn: &SlmpConnection, serial: u16, end_code: u16, body: &[u8]) -> Vec<u8> {
+        let route = conn.base_route;
+        let mut frame = match route.frame {
+            Frame::E4 => {
+                let mut head = vec![0xd4, 0];
+                head.extend_from_slice(&serial.to_le_bytes());
+                head.extend_from_slice(&[0, 0]);
+                head
+            }
+            Frame::E3 => vec![0xd0, 0],
+        };
+        frame.extend_from_slice(&[route.network, route.pc]);
+        frame.extend_from_slice(&route.io.to_le_bytes());
+        frame.push(route.station);
+        frame.extend_from_slice(&u16::try_from(body.len() + 2).unwrap().to_le_bytes());
+        frame.extend_from_slice(&end_code.to_le_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn assert_rejected(conn: &SlmpConnection, items: &[write_v1::WriteItem], why: &str) {
+        let serial = conn.next_serial.get();
+        let Ok(write_v1::WriteProgress::Done(results)) = write_next_on(conn, items.to_vec(), None)
+        else {
+            panic!("{why}: must be refused before send")
+        };
+        assert_eq!(results.len(), items.len(), "{why}");
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(ItemError::Rejected(_)))),
+            "{why}"
+        );
+        assert_eq!(conn.next_serial.get(), serial, "{why}: nothing sent");
+        assert!(conn.pending_write.borrow().is_none(), "{why}");
+    }
+
+    #[test]
+    fn word_bit_mask_keeps_other_bits_and_mixes_set_and_clear() {
+        let rmw = parse_bit_rmw(&[bit_write("D100.3", true), bit_write("D100.5", false)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rmw,
+            BitRmw {
+                device: Device::D,
+                number: 100,
+                bits: vec![3, 5],
+                set: 0x0008,
+                clear: 0x0020,
+            }
+        );
+        assert_eq!(rmw.merge(0xa520), 0xa508);
+        assert_eq!(rmw.merge(0xffff), 0xffdf);
+        assert_eq!(rmw.merge(0), 0x0008);
+        let w = parse_bit_rmw(&[bit_write("W1A.F", true), bit_write("W1a.0", false)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (w.device, w.number, w.set, w.clear),
+            (Device::W, 0x1a, 0x8000, 1)
+        );
+        assert_eq!(w.merge(0x7ff1), 0xfff0);
+        // Requests without any word bit keep the ordinary run path.
+        assert_eq!(parse_bit_rmw(&[word_write("D100", 1)]), Ok(None));
+        assert_eq!(parse_bit_rmw(&[bit_write("M10", true)]), Ok(None));
+        for items in [
+            vec![bit_write("D100.3", true), bit_write("D100.3", true)],
+            vec![bit_write("D100.3", true), bit_write("D100.3", false)],
+            vec![bit_write("D100.3", true), bit_write("D101.3", true)],
+            vec![bit_write("D100.3", true), bit_write("W64.3", true)],
+            vec![bit_write("D100.3", true), word_write("D100", 1)],
+            vec![word_write("D101", 1), bit_write("D100.3", true)],
+            vec![bit_write("D100.3", true), bit_write("M10", true)],
+            vec![bit_write("D100.3", true), bit_write("X10", true)],
+            vec![write_v1::WriteItem {
+                value: Value::Uint(1),
+                ..bit_write("D100.3", true)
+            }],
+        ] {
+            assert!(parse_bit_rmw(&items).is_err());
+        }
+    }
+
+    #[test]
+    fn r_4e_word_bit_write_reads_writes_back_and_confirms_exact_bytes() {
+        let conn = rmw_conn(
+            &[],
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(64),
+        );
+        let items = vec![bit_write("D100.3", true), bit_write("D100.5", false)];
+        let read = |serial: u8| {
+            vec![
+                0x54, 0, serial, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 14, 0, 0x10, 0, 1, 4, 2, 0, 100, 0,
+                0, 0, 0xa8, 0, 1, 0,
+            ]
+        };
+        assert_eq!(sent(write_next_on(&conn, items.clone(), None), 2), read(1));
+        assert!(!conn.write_poisoned.get());
+        let step2 = sent(
+            write_next_on(
+                &conn,
+                items.clone(),
+                Some(reply(&conn, 1, 0, &[0x20, 0xa5])),
+            ),
+            2,
+        );
+        assert_eq!(
+            step2,
+            [
+                0x54, 0, 2, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 16, 0, 0x10, 0, 1, 0x14, 2, 0, 100, 0, 0,
+                0, 0xa8, 0, 1, 0, 0x08, 0xa5
+            ]
+        );
+        assert!(conn.write_poisoned.get(), "write-back outcome is uncertain");
+        assert_eq!(
+            sent(
+                write_next_on(&conn, items.clone(), Some(reply(&conn, 2, 0, &[]))),
+                2
+            ),
+            read(3)
+        );
+        let results = done(write_next_on(
+            &conn,
+            items.clone(),
+            Some(reply(&conn, 3, 0, &[0x08, 0xa5])),
+        ));
+        assert!(matches!(results.as_slice(), [Ok(()), Ok(())]));
+        assert!(!conn.write_poisoned.get());
+        assert!(conn.pending_write.borrow().is_none());
+        // R W uses the exact iQ-R W count.
+        assert_eq!(
+            sent(
+                write_next_on(&conn, vec![bit_write("W1A.0", true)], None),
+                1
+            )[19..25],
+            [0x1a, 0, 0, 0, 0xb4, 0]
+        );
+    }
+
+    #[test]
+    fn q_3e_routed_word_bit_write_uses_the_route_and_issue_order() {
+        let conn = rmw_conn(
+            &[
+                ("frame", "3e"),
+                ("network_no", "2"),
+                ("station_no", "5"),
+                ("target_cpu", "cpu2"),
+            ],
+            ModelFamily::StandardQ,
+            PointCount::Exact(5000),
+            PointCount::Exact(0x20),
+        );
+        let items = vec![bit_write("W1A.0", true), bit_write("W1A.F", true)];
+        let read = [
+            0x50, 0, 2, 5, 0xe1, 3, 0, 12, 0, 0x10, 0, 1, 4, 0, 0, 0x1a, 0, 0, 0xb4, 1, 0,
+        ];
+        assert_eq!(sent(write_next_on(&conn, items.clone(), None), 2), read);
+        let step2 = sent(
+            write_next_on(
+                &conn,
+                items.clone(),
+                Some(reply(&conn, 0, 0, &[0x00, 0x00])),
+            ),
+            2,
+        );
+        assert_eq!(
+            step2,
+            [
+                0x50, 0, 2, 5, 0xe1, 3, 0, 14, 0, 0x10, 0, 1, 0x14, 0, 0, 0x1a, 0, 0, 0xb4, 1, 0,
+                0x01, 0x80
+            ]
+        );
+        assert_eq!(
+            sent(
+                write_next_on(&conn, items.clone(), Some(reply(&conn, 0, 0, &[]))),
+                2
+            ),
+            read
+        );
+        let results = done(write_next_on(
+            &conn,
+            items,
+            Some(reply(&conn, 0, 0, &[0x01, 0x80])),
+        ));
+        assert!(matches!(results.as_slice(), [Ok(()), Ok(())]));
+        // A 4E response to a 3E connection is a framing error.
+        let conn = rmw_conn(
+            &[("frame", "3e")],
+            ModelFamily::StandardQ,
+            PointCount::Exact(5000),
+            PointCount::Exact(0x20),
+        );
+        sent(
+            write_next_on(&conn, vec![bit_write("W1A.0", true)], None),
+            1,
+        );
+        let mut e4 = vec![0xd4, 0, 1, 0, 0, 0];
+        e4.extend_from_slice(&reply(&conn, 0, 0, &[0, 0])[2..]);
+        assert!(matches!(
+            write_next_on(&conn, vec![bit_write("W1A.0", true)], Some(e4)),
+            Err(FatalError::Framing(_))
+        ));
+    }
+
+    #[test]
+    fn word_bit_end_codes_map_per_step() {
+        let r = || {
+            rmw_conn(
+                &[],
+                ModelFamily::StandardR,
+                PointCount::Exact(200),
+                PointCount::Exact(64),
+            )
+        };
+        let items = vec![bit_write("D100.3", true), bit_write("D100.5", false)];
+        let device = |results: &[Result<(), ItemError>]| {
+            results.len() == 2
+                && results.iter().all(|result| {
+                    matches!(result, Err(ItemError::Device(error))
+                        if error.code == 0xc051 && error.message == "SLMP end code 0xC051")
+                })
+        };
+        // (1) refused: nothing written, nothing more sent, connection usable.
+        let conn = r();
+        sent(write_next_on(&conn, items.clone(), None), 2);
+        let results = done(write_next_on(
+            &conn,
+            items.clone(),
+            Some(reply(&conn, 1, 0xc051, &[])),
+        ));
+        assert!(device(&results));
+        assert!(!conn.write_poisoned.get());
+        assert!(conn.pending_write.borrow().is_none());
+        assert_eq!(sent(write_next_on(&conn, items.clone(), None), 2)[2], 2);
+        // (2) refused.
+        let conn = r();
+        sent(write_next_on(&conn, items.clone(), None), 2);
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0, 0]))),
+            2,
+        );
+        let results = done(write_next_on(
+            &conn,
+            items.clone(),
+            Some(reply(&conn, 2, 0xc051, &[])),
+        ));
+        assert!(device(&results));
+        assert!(!conn.write_poisoned.get());
+        assert!(conn.pending_write.borrow().is_none());
+        // (3) refused: the write-back was accepted, so the outcome is unverified.
+        let conn = r();
+        sent(write_next_on(&conn, items.clone(), None), 2);
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0, 0]))),
+            2,
+        );
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 2, 0, &[]))),
+            2,
+        );
+        let results = done(write_next_on(
+            &conn,
+            items.clone(),
+            Some(reply(&conn, 3, 0xc051, &[])),
+        ));
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| matches!(result,
+            Err(ItemError::VerificationFailed(message)) if message.contains("0xC051"))));
+        assert!(!conn.write_poisoned.get());
+    }
+
+    #[test]
+    fn word_bit_confirm_mismatch_fails_only_the_mismatched_item() {
+        let conn = rmw_conn(
+            &[],
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(64),
+        );
+        let items = vec![bit_write("D100.3", true), bit_write("D100.5", false)];
+        sent(write_next_on(&conn, items.clone(), None), 2);
+        sent(
+            write_next_on(
+                &conn,
+                items.clone(),
+                Some(reply(&conn, 1, 0, &[0x20, 0xa5])),
+            ),
+            2,
+        );
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 2, 0, &[]))),
+            2,
+        );
+        // Bit 3 set as written; bit 5 was set again by someone else.
+        let results = done(write_next_on(
+            &conn,
+            items,
+            Some(reply(&conn, 3, 0, &[0x28, 0xa5])),
+        ));
+        assert!(matches!(
+            results.as_slice(),
+            [Ok(()), Err(ItemError::VerificationFailed(_))]
+        ));
+        assert!(!conn.write_poisoned.get());
+    }
+
+    #[test]
+    fn malformed_word_bit_responses_are_fatal_and_poison_after_the_write_back() {
+        let r = || {
+            rmw_conn(
+                &[("network_no", "1"), ("station_no", "2")],
+                ModelFamily::StandardR,
+                PointCount::Exact(200),
+                PointCount::Exact(64),
+            )
+        };
+        let items = vec![bit_write("D100.3", true)];
+        let poisoned = |conn: &SlmpConnection| {
+            assert!(conn.write_poisoned.get());
+            assert!(conn.pending_write.borrow().is_none());
+            assert!(matches!(
+                write_next_on(conn, vec![bit_write("D100.3", true)], None),
+                Err(FatalError::Protocol(_))
+            ));
+        };
+        // Step (1): a short read is fatal.
+        let conn = r();
+        sent(write_next_on(&conn, items.clone(), None), 1);
+        assert!(matches!(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0]))),
+            Err(FatalError::Framing(_))
+        ));
+        poisoned(&conn);
+        // Step (2): an own-station route echo on a routed connection.
+        let conn = r();
+        sent(write_next_on(&conn, items.clone(), None), 1);
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0, 0]))),
+            1,
+        );
+        let mut wrong_route = reply(&conn, 2, 0, &[]);
+        wrong_route[6..11].copy_from_slice(&[0, 0xff, 0xff, 3, 0]);
+        assert!(matches!(
+            write_next_on(&conn, items.clone(), Some(wrong_route)),
+            Err(FatalError::Framing(_))
+        ));
+        poisoned(&conn);
+        // Step (2): a data-bearing write ACK is fatal.
+        let conn = r();
+        sent(write_next_on(&conn, items.clone(), None), 1);
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0, 0]))),
+            1,
+        );
+        assert!(write_next_on(&conn, items.clone(), Some(reply(&conn, 2, 0, &[0, 0]))).is_err());
+        poisoned(&conn);
+        // Step (3): a stale serial and a short read are fatal.
+        for confirm in [&[8u8, 0][..], &[8][..]] {
+            let conn = r();
+            sent(write_next_on(&conn, items.clone(), None), 1);
+            sent(
+                write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0, 0]))),
+                1,
+            );
+            sent(
+                write_next_on(&conn, items.clone(), Some(reply(&conn, 2, 0, &[]))),
+                1,
+            );
+            let serial = if confirm.len() == 2 { 2 } else { 3 };
+            assert!(matches!(
+                write_next_on(&conn, items.clone(), Some(reply(&conn, serial, 0, confirm))),
+                Err(FatalError::Framing(_))
+            ));
+            poisoned(&conn);
+        }
+    }
+
+    #[test]
+    fn word_bit_steps_refuse_changed_items_and_unanswered_resends() {
+        let conn = rmw_conn(
+            &[],
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(64),
+        );
+        let items = vec![bit_write("D100.3", true), bit_write("D100.5", false)];
+        sent(write_next_on(&conn, items.clone(), None), 2);
+        assert!(
+            matches!(
+                write_next_on(&conn, items.clone(), None),
+                Err(FatalError::Protocol(_))
+            ),
+            "an RMW in progress cannot restart"
+        );
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0, 0]))),
+            2,
+        );
+        for changed in [
+            vec![bit_write("D100.3", true), bit_write("D100.5", true)],
+            vec![bit_write("D100.3", true)],
+            vec![bit_write("D100.5", false), bit_write("D100.3", true)],
+            vec![word_write("D100", 8)],
+        ] {
+            let conn = rmw_conn(
+                &[],
+                ModelFamily::StandardR,
+                PointCount::Exact(200),
+                PointCount::Exact(64),
+            );
+            sent(write_next_on(&conn, items.clone(), None), 2);
+            sent(
+                write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[0, 0]))),
+                2,
+            );
+            assert!(matches!(
+                write_next_on(&conn, changed, Some(reply(&conn, 2, 0, &[]))),
+                Err(FatalError::Protocol(_))
+            ));
+            assert!(conn.write_poisoned.get());
+        }
+        // A word write response cannot be consumed as an RMW step either.
+        let conn = rmw_conn(
+            &[],
+            ModelFamily::StandardR,
+            PointCount::Exact(300),
+            PointCount::Exact(64),
+        );
+        sent(write_next_on(&conn, vec![word_write("D200", 1)], None), 1);
+        assert!(matches!(
+            write_next_on(&conn, items, Some(reply(&conn, 1, 0, &[]))),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn word_bit_writes_are_refused_before_send_without_policy_model_or_range() {
+        let ready = |family, d, w| rmw_conn(&[], family, d, w);
+        let r = ready(
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(0x41),
+        );
+        for (items, why) in [
+            (vec![bit_write("D100.6", true)], "outside the bit allowlist"),
+            (
+                vec![bit_write("D100.3", true), bit_write("D100.6", true)],
+                "one bit outside",
+            ),
+            (vec![bit_write("D200.0", true)], "word interval only"),
+            (vec![bit_write("D201.0", true)], "word interval only"),
+            (
+                vec![bit_write("D100.3", true), word_write("D101", 1)],
+                "mixed with a word",
+            ),
+            (
+                vec![bit_write("D100.3", true), bit_write("W1A.0", true)],
+                "two words",
+            ),
+            (
+                vec![bit_write("D100.3", true), bit_write("M10", true)],
+                "mixed with a bit device",
+            ),
+            (
+                vec![bit_write("D100.3", true), bit_write("D100.3", false)],
+                "duplicate bit",
+            ),
+            (vec![bit_write("D3000.0", true)], "D3000 is protected"),
+            (vec![bit_write("D3001.F", true)], "D3001 is protected"),
+            (vec![bit_write("SD10.0", true)], "not a D/W word bit"),
+        ] {
+            assert_rejected(&r, &items, why);
+        }
+        // D3002 is allowlisted but beyond the R D count of 200.
+        assert_rejected(&r, &[bit_write("D3002.0", true)], "out of range");
+        let small_r = ready(
+            ModelFamily::StandardR,
+            PointCount::Exact(100),
+            PointCount::Exact(0x41),
+        );
+        assert_rejected(
+            &small_r,
+            &[bit_write("D100.3", true)],
+            "D100 out of R range",
+        );
+        let small_w = ready(
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(0x40),
+        );
+        assert_rejected(
+            &small_w,
+            &[bit_write("W40.0", true)],
+            "W40 out of R W range",
+        );
+        let unknown_r = ready(
+            ModelFamily::StandardR,
+            PointCount::Unknown,
+            PointCount::Unknown,
+        );
+        assert_rejected(&unknown_r, &[bit_write("D100.3", true)], "SD refused");
+        assert_rejected(&unknown_r, &[bit_write("W1A.3", true)], "SD refused");
+        // Standard Q D has no write proof (as for numeric D); Q W uses SD303.
+        let q = ready(
+            ModelFamily::StandardQ,
+            PointCount::Exact(5000),
+            PointCount::Exact(0x20),
+        );
+        assert_rejected(&q, &[bit_write("D100.3", true)], "Q D bit");
+        assert_rejected(&q, &[word_write("D200", 1)], "Q D numeric");
+        assert_rejected(&q, &[bit_write("W40.0", true)], "Q W past SD303");
+        // The extended W total is never a write grant.
+        q.q_w_total.set(Some(0x100));
+        assert_rejected(&q, &[bit_write("W40.0", true)], "extended Q W");
+        assert_eq!(
+            sent(write_next_on(&q, vec![bit_write("W1A.3", true)], None), 1)[19..25],
+            [0x1a, 0, 0, 0xb4, 1, 0]
+        );
+        let r = ready(
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(0x41),
+        );
+        sent(write_next_on(&r, vec![bit_write("D100.3", true)], None), 1);
+        let r = ready(
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(0x41),
+        );
+        sent(write_next_on(&r, vec![bit_write("W40.F", false)], None), 1);
+        for family in [ModelFamily::Q25PrhWireOnly, ModelFamily::Unknown] {
+            let conn = ready(family, PointCount::Exact(5000), PointCount::Exact(0x100));
+            conn.q25prh_internal_d_count.set(PointCount::Exact(5000));
+            assert_rejected(&conn, &[bit_write("D100.3", true)], "Q25PRH/unknown D");
+            assert_rejected(&conn, &[bit_write("W1A.3", true)], "Q25PRH/unknown W");
+        }
+        let disabled = rmw_conn(
+            &[("d_u16_write_mode", "disabled")],
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(0x41),
+        );
+        assert_rejected(
+            &disabled,
+            &[bit_write("D100.3", true)],
+            "write_mode disabled",
+        );
+        let words_only = rmw_conn(
+            &[("d_u16_write_allowlist", "D100-D101,W1A-W1A")],
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(0x41),
+        );
+        assert_rejected(
+            &words_only,
+            &[bit_write("D100.3", true)],
+            "word allowlist only",
+        );
+        assert_rejected(
+            &words_only,
+            &[bit_write("W1A.3", true)],
+            "word allowlist only",
+        );
+        let undiscovered = rmw_conn(
+            &[],
+            ModelFamily::StandardR,
+            PointCount::Exact(200),
+            PointCount::Exact(0x41),
+        );
+        *undiscovered.phase.borrow_mut() = Phase::Start;
+        assert_rejected(&undiscovered, &[bit_write("D100.3", true)], "no discovery");
+        // Existing bytes for numeric word writes are unchanged.
+        let r = ready(
+            ModelFamily::StandardR,
+            PointCount::Exact(300),
+            PointCount::Exact(0x41),
+        );
+        assert_eq!(
+            sent(write_next_on(&r, vec![word_write("D200", 0x1234)], None), 1)[15..],
+            [1, 0x14, 2, 0, 200, 0, 0, 0, 0xa8, 0, 1, 0, 0x34, 0x12]
+        );
+    }
+
+    #[test]
+    fn word_bit_allowlist_settings_and_help_are_declared() {
+        for ranges in ["D100.3-D100.5", "W1A.0-W1B.F", "D100-D105,D100.0-D100.F"] {
+            let settings = route_settings(&[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", ranges),
+            ]);
+            assert!(validate_settings(&settings).is_empty(), "{ranges}");
+        }
+        for ranges in [
+            "D100.5-D100.3",
+            "D3000.0-D3000.1",
+            "M1.0-M1.1",
+            "w1a.0-w1a.1",
+        ] {
+            let settings = route_settings(&[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", ranges),
+            ]);
+            assert!(
+                validate_settings(&settings)
+                    .iter()
+                    .any(|error| error.key == ALLOWLIST_KEY),
+                "{ranges}"
+            );
+        }
+        let schema = <Component as config::Guest>::schema();
+        let help = schema
+            .iter()
+            .find(|field| field.key == ALLOWLIST_KEY)
+            .and_then(|field| field.help.clone())
+            .unwrap();
+        for needle in ["D100.3-D100.5", "W1A.0-W1B.F", "not atomic", "overwritten"] {
+            assert!(help.contains(needle), "{needle}");
+        }
+        assert!(<Component as address::Guest>::help().contains("read-modify-write"));
     }
 }
 
