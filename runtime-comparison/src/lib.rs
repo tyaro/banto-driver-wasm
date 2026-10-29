@@ -175,7 +175,7 @@ mod tests {
         let valid: JsonValue =
             serde_json::from_str(include_str!("../../component/manifest.json")).unwrap();
         assert_eq!(manifest_settings_version(&valid), Ok(1));
-        assert_eq!(valid["version"], "0.8.0");
+        assert_eq!(valid["version"], "0.9.0");
         assert_eq!(valid["hubApi"], "1");
         assert_eq!(
             valid["displayName"],
@@ -515,7 +515,7 @@ mod tests {
             driver
                 .banto_driver_address()
                 .call_supported_kinds(&mut store)?,
-            ["bool", "u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64"]
+            ["bool", "u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64", "string"]
         );
 
         let settings = [
@@ -809,7 +809,7 @@ mod tests {
             driver
                 .banto_driver_address()
                 .call_supported_kinds(&mut store)?,
-            ["bool", "u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64"]
+            ["bool", "u16", "u32", "i16", "i32", "i64", "u64", "f32", "f64", "string"]
         );
         let first = driver
             .banto_driver_address()
@@ -1630,6 +1630,127 @@ mod write_runtime {
             .banto_driver_write_v1()
             .call_write_next(&mut store, conn, &items, None)?
             .is_err());
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn real_component_string_reads_raw_span_and_writes_one_fc16() -> wasmtime::Result<()> {
+        use banto::driver::types::{FatalError, ItemError, Setting, TagSpec, Value};
+        use exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_COMPONENT_WASM")?;
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::from_file(&engine, path)?;
+        let linker = wasmtime::component::Linker::new(&engine);
+        let mut store = wasmtime::Store::new(&engine, ());
+        let driver = DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let kinds = driver
+            .banto_driver_address()
+            .call_supported_kinds(&mut store)?;
+        assert_eq!(kinds.iter().filter(|kind| *kind == "string").count(), 1);
+        for (raw, words, canonical, area, writable) in [
+            ("40002", 3, "400002", "holding_register", true),
+            ("30001", 123, "300001", "input_register", false),
+        ] {
+            let parsed = driver
+                .banto_driver_address()
+                .call_parse(&mut store, raw, "string", Some(words))?
+                .unwrap();
+            assert_eq!(parsed.canonical, canonical);
+            assert_eq!(parsed.area, area);
+            assert_eq!(parsed.writable_area, writable);
+            assert_eq!(parsed.word_count, words);
+        }
+        for words in [None, Some(0), Some(124)] {
+            assert!(driver
+                .banto_driver_address()
+                .call_parse(&mut store, "40001", "string", words)?
+                .is_err());
+        }
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_offset(&mut store, "400001", "string", Some(10), 1)?
+                .unwrap(),
+            "400011"
+        );
+
+        let settings = [
+            ("host", "fixture.invalid"),
+            ("port", "502"),
+            ("write_mode", "enabled"),
+            ("write_allowlist", "400001-400010"),
+        ]
+        .map(|(key, value)| Setting {
+            key: key.into(),
+            value: value.into(),
+        });
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings)?
+            .unwrap();
+        let specs = [TagSpec {
+            address: "400002".into(),
+            data_type: "string".into(),
+            string_words: Some(3),
+        }];
+        let plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].covers, [0]);
+        assert_eq!(plan[0].step.send, [0, 0, 0, 0, 0, 6, 1, 3, 0, 1, 0, 3]);
+        // Register high byte first is character order; the NUL stays.
+        let response = [0, 0, 0, 0, 0, 9, 1, 3, 6, b'A', b'B', 0, b'C', 0xff, 0];
+        assert!(matches!(
+            driver.banto_driver_read().call_decode(&mut store, conn, &plan[0], &specs, &response)?,
+            Ok(values) if matches!(values.as_slice(), [Ok(Value::Bytes(bytes))] if bytes == &response[9..])
+        ));
+        assert!(matches!(
+            driver.banto_driver_read().call_decode(
+                &mut store,
+                conn,
+                &plan[0],
+                &specs,
+                &[0, 0, 0, 0, 0, 7, 1, 3, 4, b'A', b'B', 0, b'C']
+            )?,
+            Err(FatalError::Framing(_))
+        ));
+
+        let item = |bytes: &[u8]| WriteItem {
+            spec: specs[0].clone(),
+            value: Value::Bytes(bytes.to_vec()),
+        };
+        let progress = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &[item(b"AB\0\0\0\0\0")], None)?
+            .unwrap();
+        assert!(
+            matches!(&progress, WriteProgress::Done(results)
+                if matches!(results.as_slice(), [Err(ItemError::Rejected(_))])),
+            "{progress:?}"
+        );
+        let write = [item(b"AB\0C\xff\0")];
+        let WriteProgress::Send(planned) = driver
+            .banto_driver_write_v1()
+            .call_write_next(&mut store, conn, &write, None)?
+            .unwrap()
+        else {
+            panic!("FC16 request expected");
+        };
+        assert_eq!(
+            planned.step.send,
+            [0, 1, 0, 0, 0, 13, 1, 16, 0, 1, 0, 3, 6, b'A', b'B', 0, b'C', 0xff, 0]
+        );
+        assert!(matches!(
+            driver
+                .banto_driver_write_v1()
+                .call_write_next(&mut store, conn, &write, Some(&[0, 1, 0, 0, 0, 6, 1, 16, 0, 1, 0, 3]))?
+                .unwrap(),
+            WriteProgress::Done(results) if matches!(results.as_slice(), [Ok(())])
+        ));
         conn.resource_drop(&mut store)?;
         Ok(())
     }
