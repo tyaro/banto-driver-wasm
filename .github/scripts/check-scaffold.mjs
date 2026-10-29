@@ -46,6 +46,7 @@ const allowed = new Set([
   'drivers/slmp/tests/read_frame.rs',
   'drivers/slmp/tests/sd_basic.rs',
   'drivers/slmp/tests/type_name.rs',
+  'drivers/slmp/tests/unit_buffer.rs',
   'drivers/slmp/tests/write_frame.rs',
   'slmp-component/Cargo.toml',
   'slmp-component/Cargo.lock',
