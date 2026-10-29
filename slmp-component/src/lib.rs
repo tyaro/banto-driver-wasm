@@ -14,6 +14,9 @@
 //! item of its request: the Host's already encoded, 0-padded bytes of exactly
 //! that length go out as one 1401 word write over the whole span, under the
 //! same allowlist and SD gates as a numeric write of the same width.
+//! `U<h>\G<n>` reads unit buffer memory (Q/R `U0`-`UFF`, plus R CPU buffer
+//! `U3E0`-`U3E3`) through the 0401 device extension. It is read-only, has no
+//! configured range (Unknown) and is always a request of its own.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -25,8 +28,9 @@ use banto_register_codec::{
 use banto_slmp_read_core::{
     basic_sd_count, decode_q_w_total, decode_read, decode_type_name, decode_write_ack, encode_bits,
     encode_q25prh_d3010_3013_test_write, encode_q_dw_words, encode_r_dw_words, encode_read,
-    encode_type_name, plan_basic_sd, plan_q_w_total, BasicArea, BasicEvidence, Device, Frame,
-    ModelFamily, PointCount, ReadSpan, ResponseError, Route, Series, TypeName, Values,
+    encode_read_unit_buffer, encode_type_name, plan_basic_sd, plan_q_w_total, BasicArea,
+    BasicEvidence, Device, Frame, ModelFamily, PointCount, ReadSpan, ResponseError, Route, Series,
+    TypeName, UnitBufferSpan, Values,
 };
 use exports::banto::driver::{address, config, diagnostics_v1, read, session, write_v1};
 mod diagnostics;
@@ -168,6 +172,8 @@ struct WriteRun {
 struct PendingRead {
     span: ReadSpan,
     covers: Vec<u32>,
+    /// `U<h>` module of a `U\G` read; such a read has exactly one cover.
+    module: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -752,6 +758,10 @@ fn parse_read_address(
     data_type: &str,
     words: Option<u32>,
 ) -> Result<(Device, u32, ReadKind), String> {
+    if text.starts_with('U') {
+        let (_, number, kind) = parse_unit_buffer(text, data_type, words)?;
+        return Ok((Device::UG, number, kind));
+    }
     // Dn.h and Wn.h read one bit of one word. D numbers are decimal and W
     // numbers hexadecimal; the bit index is one hexadecimal digit for both.
     for (prefix, device, radix) in [('D', Device::D, 10), ('W', Device::W, 16)] {
@@ -947,6 +957,86 @@ fn parse_read_address(
     Ok((device, number, ReadKind::Numeric(kind)))
 }
 
+/// `U<h>\G<n>` with an optional `.<b>` word bit. `h` is one to three hex digits
+/// (either case) naming 0..=0xFF or the CPU buffer modules 0x3E0..=0x3E3; which
+/// of those a CPU accepts is decided with the model. `n` is decimal. HG,
+/// index modification and anything else after the number are refused.
+fn parse_unit_buffer(
+    text: &str,
+    data_type: &str,
+    words: Option<u32>,
+) -> Result<(u16, u32, ReadKind), String> {
+    let rest = text.strip_prefix('U').ok_or("U\\G address required")?;
+    let (module, rest) = rest
+        .split_once("\\G")
+        .ok_or("buffer memory address must be U<h>\\G<n>")?;
+    if !(1..=3).contains(&module.len()) || !module.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("U module must be one to three hexadecimal digits".into());
+    }
+    let module = u16::from_str_radix(module, 16).map_err(|_| "invalid U module")?;
+    if !(module <= 0xff || (0x3e0..=0x3e3).contains(&module)) {
+        return Err("U module must be 0-FF or 3E0-3E3".into());
+    }
+    let (digits, bit) = match rest.split_once('.') {
+        Some((digits, bit)) => (digits, Some(bit)),
+        None => (rest, None),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid buffer memory address".into());
+    }
+    let number = digits
+        .parse::<u32>()
+        .map_err(|_| "buffer memory address exceeds u32")?;
+    let kind = if let Some(bit) = bit {
+        if data_type != "bit" || words.is_some() {
+            return Err("U\\G word-bit requires bit type without string_words".into());
+        }
+        if bit.len() != 1 || !bit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("word bit must be one hexadecimal digit".into());
+        }
+        ReadKind::WordBit(u8::from_str_radix(bit, 16).map_err(|_| "invalid word bit")?)
+    } else if data_type == "string" {
+        let words = words.ok_or("string tags require string_words")?;
+        if !(1..=MAX_STRING_WORDS).contains(&words) {
+            return Err(format!("string_words must be 1..={MAX_STRING_WORDS}"));
+        }
+        ReadKind::String(words as u16)
+    } else {
+        ReadKind::Numeric(DKind::parse(data_type, words)?)
+    };
+    number
+        .checked_add(u32::from(kind.points() - 1))
+        .ok_or("buffer memory tag address overflows u32")?;
+    Ok((module, number, kind))
+}
+
+fn canonical_unit_buffer(module: u16, number: i64, kind: ReadKind) -> Result<String, String> {
+    let number = u32::try_from(number).map_err(|_| "read address exceeds u32")?;
+    Ok(match kind {
+        ReadKind::WordBit(bit) => format!("U{module:X}\\G{number}.{bit:X}"),
+        _ => format!("U{module:X}\\G{number}"),
+    })
+}
+
+/// Canonical text of any readable tag; `module` is `Some` for `U\G` only.
+fn canonical_tag(
+    module: Option<u16>,
+    device: Device,
+    number: i64,
+    kind: ReadKind,
+) -> Result<String, String> {
+    match module {
+        Some(module) => canonical_unit_buffer(module, number, kind),
+        None => canonical_read_tag(device, number, kind),
+    }
+}
+
+/// `U<h>` of a `U\G` tag text; `None` for every other address.
+fn unit_buffer_module(text: &str) -> Option<u16> {
+    let digits = text.strip_prefix('U')?.split_once("\\G")?.0;
+    u16::from_str_radix(digits, 16).ok()
+}
+
 /// `D<decimal>` or `W<hex>` with 1..=128 words; word bits and every other
 /// device are refused. The whole span must fit in u32 like a numeric tag.
 fn parse_string_address(text: &str, words: Option<u32>) -> Result<(Device, u32, ReadKind), String> {
@@ -1012,6 +1102,7 @@ fn canonical_read(device: Device, number: i64) -> Result<String, String> {
         Device::S => Ok(format!("S{number}")),
         Device::Z => Ok(format!("Z{number}")),
         Device::RD => Ok(format!("RD{number}")),
+        Device::UG => Err("U\\G needs a module number".into()),
     }
 }
 
@@ -1195,7 +1286,8 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
         | Device::ZR
         | Device::S
         | Device::Z
-        | Device::RD => PointCount::Unknown,
+        | Device::RD
+        | Device::UG => PointCount::Unknown,
     }
 }
 
@@ -1211,6 +1303,37 @@ fn zr_read_allowed(model: &TypeName) -> bool {
             ("Q00JCPU", 0x0250) | ("Q00UJCPU", 0x0260)
         ),
         _ => false,
+    }
+}
+
+/// `U<h>\G<n>` has a path on standard Q (`U0`-`UFF`) and standard R (also the
+/// CPU buffer `U3E0`-`U3E3`). Q25PRH and unknown models have none, like ZR.
+fn unit_buffer_read_allowed(model: &TypeName, module: u16) -> bool {
+    match model.family {
+        ModelFamily::StandardR => module <= 0xff || (0x3e0..=0x3e3).contains(&module),
+        ModelFamily::StandardQ => module <= 0xff,
+        _ => false,
+    }
+}
+
+/// Encode a read; `module` is `Some` for a `U\G` read.
+fn encode_span(
+    route: Route,
+    series: Series,
+    span: ReadSpan,
+    module: Option<u16>,
+) -> Result<Vec<u8>, banto_slmp_read_core::RequestError> {
+    match module {
+        Some(module) => encode_read_unit_buffer(
+            route,
+            series,
+            UnitBufferSpan {
+                module,
+                start: span.start,
+                count: span.count,
+            },
+        ),
+        None => encode_read(route, series, span),
     }
 }
 
@@ -1231,6 +1354,41 @@ fn checked_read_span_ext(
     w_count: PointCount,
     w_total: Option<u32>,
 ) -> Result<ReadSpan, FatalError> {
+    checked_read_target(spec, model, d_count, w_count, w_total).map(|(span, _)| span)
+}
+
+/// The checked span plus the `U<h>` module of a `U\G` tag.
+fn checked_read_target(
+    spec: &TagSpec,
+    model: &TypeName,
+    d_count: PointCount,
+    w_count: PointCount,
+    w_total: Option<u32>,
+) -> Result<(ReadSpan, Option<u16>), FatalError> {
+    if spec.address.starts_with('U') {
+        let (module, number, kind) =
+            parse_unit_buffer(&spec.address, &spec.data_type, spec.string_words)
+                .map_err(FatalError::InvalidConfig)?;
+        if !unit_buffer_read_allowed(model, module) {
+            return Err(FatalError::InvalidConfig(
+                "device is unsupported for this CPU family".into(),
+            ));
+        }
+        // Q has a 3-byte number: the last word must fit. R fits u32 by parsing.
+        if model.family == ModelFamily::StandardQ
+            && number + u32::from(kind.points() - 1) > 0x00ff_ffff
+        {
+            return Err(FatalError::InvalidConfig(
+                "buffer memory span exceeds the Q 24-bit address".into(),
+            ));
+        }
+        let span = ReadSpan {
+            device: Device::UG,
+            start: number,
+            count: kind.points(),
+        };
+        return Ok((span, Some(module)));
+    }
     let (device, number, kind) =
         parse_read_address(&spec.address, &spec.data_type, spec.string_words)
             .map_err(FatalError::InvalidConfig)?;
@@ -1323,11 +1481,14 @@ fn checked_read_span_ext(
             "address exceeds verified configured count".into(),
         ));
     }
-    Ok(ReadSpan {
-        device,
-        start: number,
-        count: kind.points(),
-    })
+    Ok((
+        ReadSpan {
+            device,
+            start: number,
+            count: kind.points(),
+        },
+        None,
+    ))
 }
 
 impl session::GuestConnection for SlmpConnection {
@@ -1594,7 +1755,7 @@ impl read::Guest for Component {
             .iter()
             .enumerate()
             .filter_map(|(index, spec)| {
-                let span = checked_read_span_ext(
+                let (span, module) = checked_read_target(
                     spec,
                     model,
                     *count,
@@ -1605,10 +1766,11 @@ impl read::Guest for Component {
                 if diagnostics::bit_span_outside(conn, model, span) {
                     return None;
                 }
-                encode_read(conn.base_route, series, span).ok()?;
+                encode_span(conn.base_route, series, span, module).ok()?;
                 Some((
                     u32::try_from(index).ok()?,
                     span,
+                    module,
                     assess_read_span(
                         model,
                         span.device,
@@ -1622,10 +1784,12 @@ impl read::Guest for Component {
             })
             .collect::<Vec<_>>();
         let mut groups: Vec<PendingRead> = Vec::new();
-        for (cover, span, verified) in eligible {
+        for (cover, span, module, verified) in eligible {
             // Preserve input order. A duplicate, a gap in either specs or D
             // addresses, or an unverified range starts a separate request.
-            let joined = if verified {
+            // A U\G read has an Unknown range, so it is never verified and
+            // never joins another tag.
+            let joined = if verified && module.is_none() {
                 groups.last_mut().is_some_and(|last| {
                     if last.span.device != span.device
                         || assess_read_span(
@@ -1685,6 +1849,7 @@ impl read::Guest for Component {
                 groups.push(PendingRead {
                     span,
                     covers: vec![cover],
+                    module,
                 });
             }
         }
@@ -1705,7 +1870,7 @@ impl read::Guest for Component {
                 serial,
                 ..conn.base_route
             };
-            let send = encode_read(route, series, group.span)
+            let send = encode_span(route, series, group.span, group.module)
                 .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
             let step = read_step(route.frame, send, group.span);
             plans.push(read::Planned {
@@ -1781,7 +1946,7 @@ impl read::Guest for Component {
             let spec = specs
                 .get(*cover as usize)
                 .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
-            let tag = checked_read_span_ext(
+            let (tag, tag_module) = checked_read_target(
                 spec,
                 model,
                 *count,
@@ -1805,6 +1970,7 @@ impl read::Guest for Component {
                 .checked_add(u32::from(word_offset))
                 .ok_or_else(|| FatalError::Protocol("batch address overflow".into()))?;
             if tag.device != pending.span.device
+                || tag_module != pending.module
                 || tag.start != expected_d
                 || (p.covers.len() > 1
                     && (assess_read_span(
@@ -1830,7 +1996,7 @@ impl read::Guest for Component {
             ));
         }
         let series = known_series(model).expect("ready model has series");
-        let expected = encode_read(route, series, pending.span)
+        let expected = encode_span(route, series, pending.span, pending.module)
             .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
         if p.step.send != expected
             || p.step.max_len != read_step(route.frame, expected, pending.span).max_len
@@ -2400,8 +2566,9 @@ impl address::Guest for Component {
         string_words: Option<u32>,
     ) -> Result<address::Parsed, String> {
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
-        Ok(address::Parsed {
-            canonical: canonical_read_tag(device, i64::from(number), kind)?,
+        let module = unit_buffer_module(&text);
+        let parsed = address::Parsed {
+            canonical: canonical_tag(unit_buffer_module(&text), device, i64::from(number), kind)?,
             area: match device {
                 Device::M => "M",
                 Device::X => "X",
@@ -2441,6 +2608,7 @@ impl address::Guest for Component {
                 Device::S => "S",
                 Device::Z => "Z",
                 Device::RD => "RD",
+                Device::UG => "UG",
             }
             .into(),
             // Static capability only; the common setting, SD proof and Host gate still decide writes.
@@ -2460,6 +2628,14 @@ impl address::Guest for Component {
             },
             word_count: kind.value_words(),
             index: Some(u64::from(number)),
+        };
+        // The Hub compares (area, index) for overlap, so the module is part of the area.
+        Ok(match module {
+            Some(module) => address::Parsed {
+                area: format!("U{module:X}\\G"),
+                ..parsed
+            },
+            None => parsed,
         })
     }
 
@@ -2470,6 +2646,7 @@ impl address::Guest for Component {
         n: i64,
     ) -> Result<String, String> {
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
+        let module = unit_buffer_module(&text);
         let next = if let ReadKind::WordBit(bit) = kind {
             let start = i64::from(number)
                 .checked_mul(16)
@@ -2479,7 +2656,8 @@ impl address::Guest for Component {
             if next_bit < 0 {
                 return Err("offset before word 0 bit 0".into());
             }
-            canonical_read_tag(
+            canonical_tag(
+                module,
                 device,
                 next_bit / 16,
                 ReadKind::WordBit((next_bit % 16) as u8),
@@ -2498,7 +2676,7 @@ impl address::Guest for Component {
             let next = i64::from(number)
                 .checked_add(point_offset)
                 .ok_or("offset overflow")?;
-            canonical_read_tag(device, next, kind)?
+            canonical_tag(module, device, next, kind)?
         };
         parse_read_address(&next, &data_type, string_words)?;
         Ok(next)
@@ -2520,7 +2698,8 @@ impl address::Guest for Component {
         {
             return Err("offset_words is undefined for long current values".into());
         }
-        let kind = if (text.starts_with('D') || text.starts_with('W')) && text.contains('.')
+        let kind = if (text.starts_with('D') || text.starts_with('W') || text.starts_with('U'))
+            && text.contains('.')
             || [
                 "STS", "STC", "TS", "TC", "SS", "SC", "CS", "CC", "M", "X", "Y", "B", "L", "F",
                 "V", "SB", "SM",
@@ -2536,7 +2715,8 @@ impl address::Guest for Component {
             "u16"
         };
         let (device, number, parsed_kind) = parse_read_address(&text, kind, None)?;
-        canonical_read_tag(
+        canonical_tag(
+            unit_buffer_module(&text),
             device,
             i64::from(number).checked_add(n).ok_or("offset overflow")?,
             parsed_kind,
@@ -2544,7 +2724,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -3242,6 +3422,317 @@ mod tests {
             assert!(
                 parse_write_run(&[item], WordOrder::LowHigh).is_err(),
                 "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_buffer_addresses_parse_canonicalize_and_offset() {
+        let parse = |text: &str, kind: &str, words: Option<u32>| {
+            <Component as address::Guest>::parse(text.into(), kind.into(), words)
+        };
+        // (text, type, canonical, module, number, value words)
+        for (text, kind, canonical, module, number, words) in [
+            ("U3\\G10", "u16", "U3\\G10", 3, 10, 1),
+            ("U03\\G010", "i16", "U3\\G10", 3, 10, 1),
+            ("U0\\G0", "u32", "U0\\G0", 0, 0, 2),
+            ("U00\\G5", "f64", "U0\\G5", 0, 5, 4),
+            ("Uff\\G1", "u16", "UFF\\G1", 0xff, 1, 1),
+            ("U0FF\\G1", "u16", "UFF\\G1", 0xff, 1, 1),
+            ("u3e0\\G1", "u16", "", 0, 0, 0), // lowercase U is refused
+            (
+                "U3e0\\G4294967295",
+                "u16",
+                "U3E0\\G4294967295",
+                0x3e0,
+                u32::MAX,
+                1,
+            ),
+            ("U3E3\\G7", "i64", "U3E3\\G7", 0x3e3, 7, 4),
+        ] {
+            let parsed = parse(text, kind, None);
+            if canonical.is_empty() {
+                assert!(parsed.is_err(), "{text}");
+                continue;
+            }
+            let parsed = parsed.unwrap();
+            assert_eq!(parsed.canonical, canonical, "{text}");
+            assert_eq!(parsed.area, format!("U{module:X}\\G"));
+            assert_eq!(parsed.index, Some(u64::from(number)));
+            assert_eq!(parsed.word_count, words);
+            assert_eq!(parsed.bit, None);
+            assert!(!parsed.writable_area, "{text}");
+            assert_eq!(parse_read_address(text, kind, None).unwrap().0, Device::UG);
+            assert_eq!(unit_buffer_module(text), Some(module));
+        }
+        let area = |text: &str| parse(text, "u16", None).unwrap().area;
+        assert_eq!(area("U3\\G10"), "U3\\G");
+        assert_eq!(area("UFF\\G10"), "UFF\\G");
+        assert_eq!(area("U0ff\\G10"), "UFF\\G");
+        assert_eq!(area("U3E0\\G10"), "U3E0\\G");
+        assert_ne!(area("U3\\G10"), area("U5\\G10"));
+        assert_eq!(parse("U3\\G10.2", "bit", None).unwrap().area, "U3\\G");
+        assert_eq!(parse("U3\\G10", "string", Some(2)).unwrap().area, "U3\\G");
+        let bit = parse("U3\\G10.f", "bit", None).unwrap();
+        assert_eq!(bit.canonical, "U3\\G10.F");
+        assert_eq!(
+            (bit.bit, bit.word_count, bit.writable_area),
+            (Some(15), 1, false)
+        );
+        assert!(parse("u3\\G10.0", "bit", None).is_err());
+        let string = parse("U3\\G100", "string", Some(128)).unwrap();
+        assert_eq!(
+            (string.canonical.as_str(), string.word_count),
+            ("U3\\G100", 128)
+        );
+        assert!(!string.writable_area);
+        // Refused forms: HG, index modification, link direct, bad module/number/bit/type.
+        for (text, kind, words) in [
+            ("U3\\HG10", "u16", None),
+            ("U3\\G10Z1", "u16", None),
+            ("U3\\G10Z", "u16", None),
+            ("U3\\G", "u16", None),
+            ("U3\\G-1", "u16", None),
+            ("U3\\G+1", "u16", None),
+            ("U3\\G1A", "u16", None),
+            ("U3\\G 1", "u16", None),
+            ("U3\\g1", "u16", None),
+            ("U\\G1", "u16", None),
+            ("U1000\\G1", "u16", None),
+            ("UG\\G1", "u16", None),
+            ("U100\\G1", "u16", None),
+            ("U3DF\\G1", "u16", None),
+            ("U3E4\\G1", "u16", None),
+            ("UFFF\\G1", "u16", None),
+            ("U3", "u16", None),
+            ("U3G10", "u16", None),
+            ("U3/G10", "u16", None),
+            ("J1\\W10", "u16", None),
+            ("U3\\G10.", "bit", None),
+            ("U3\\G10.10", "bit", None),
+            ("U3\\G10.g", "bit", None),
+            ("U3\\G10", "bit", None),
+            ("U3\\G10.1", "u16", None),
+            ("U3\\G10.1", "bit", Some(1)),
+            ("U3\\G10", "u16", Some(1)),
+            ("U3\\G10", "string", None),
+            ("U3\\G10", "string", Some(0)),
+            ("U3\\G10", "string", Some(129)),
+            ("U3\\G10", "bool", None),
+            ("U3\\G4294967296", "u16", None),
+            ("U3\\G4294967295", "u32", None),
+            ("U3\\G4294967294", "u64", None),
+            ("U3\\G4294967290", "string", Some(10)),
+        ] {
+            assert!(parse(text, kind, words).is_err(), "{text} {kind} {words:?}");
+        }
+        // The last word of the span still fits u32.
+        assert!(parse("U3\\G4294967294", "u32", None).is_ok());
+        assert!(parse("U3\\G4294967286", "string", Some(10)).is_ok());
+
+        let off = |text: &str, kind: &str, words: Option<u32>, n| {
+            <Component as address::Guest>::offset(text.into(), kind.into(), words, n)
+        };
+        assert_eq!(off("U3E0\\G10", "u16", None, 5).unwrap(), "U3E0\\G15");
+        assert_eq!(off("U3E0\\G10", "u32", None, 2).unwrap(), "U3E0\\G14");
+        assert_eq!(off("U3\\G10", "string", Some(4), 3).unwrap(), "U3\\G22");
+        assert_eq!(off("U3\\G10", "u16", None, -10).unwrap(), "U3\\G0");
+        assert!(off("U3\\G10", "u16", None, -11).is_err());
+        assert!(off("U3\\G4294967295", "u16", None, 1).is_err());
+        assert!(off("U3\\G4294967294", "u32", None, 1).is_err());
+        // Word-bit offsets count bits and keep the module.
+        assert_eq!(off("U3\\G10.E", "bit", None, 3).unwrap(), "U3\\G11.1");
+        assert_eq!(off("U3\\G10.1", "bit", None, -161).unwrap(), "U3\\G0.0");
+        assert!(off("U3\\G10.1", "bit", None, -162).is_err());
+        let words = |text: &str| <Component as address::Guest>::offset_words(text.into(), 1);
+        assert_eq!(words("U3\\G10").unwrap(), "U3\\G11");
+        assert_eq!(words("U3E1\\G0").unwrap(), "U3E1\\G1");
+        assert_eq!(words("UA\\G10.5").unwrap(), "UA\\G11.5");
+        assert!(words("U3\\HG10").is_err());
+        assert!(<Component as address::Guest>::help().contains("U<h>\\G<n>"));
+    }
+
+    #[test]
+    fn unit_buffer_reads_are_gated_by_model_and_series_limits() {
+        let spec = |address: &str, kind: &str, words: Option<u32>| TagSpec {
+            address: address.into(),
+            data_type: kind.into(),
+            string_words: words,
+        };
+        let unknown = (PointCount::Unknown, PointCount::Unknown);
+        let counted = (PointCount::Exact(1), PointCount::Exact(1));
+        let q = model(ModelFamily::StandardQ);
+        let r = model(ModelFamily::StandardR);
+        let q25 = model(ModelFamily::Q25PrhWireOnly);
+        let unknown_model = model(ModelFamily::Unknown);
+        let target = |tag: &TagSpec, model: &TypeName, counts: (PointCount, PointCount)| {
+            checked_read_target(tag, model, counts.0, counts.1, None)
+        };
+        let u16_tag = spec("U3\\G10", "u16", None);
+        for counts in [unknown, counted] {
+            assert_eq!(
+                target(&u16_tag, &q, counts).unwrap(),
+                (
+                    ReadSpan {
+                        device: Device::UG,
+                        start: 10,
+                        count: 1
+                    },
+                    Some(3)
+                )
+            );
+            assert_eq!(
+                target(&spec("UFF\\G7", "f64", None), &r, counts).unwrap(),
+                (
+                    ReadSpan {
+                        device: Device::UG,
+                        start: 7,
+                        count: 4
+                    },
+                    Some(0xff)
+                )
+            );
+            assert!(
+                target(&spec("U3E2\\G1", "bit", None), &r, counts).is_err(),
+                "bit without .b"
+            );
+            assert_eq!(
+                target(&spec("U3E2\\G1.A", "bit", None), &r, counts)
+                    .unwrap()
+                    .1,
+                Some(0x3e2)
+            );
+            assert_eq!(
+                target(&spec("U1\\G1", "string", Some(128)), &r, counts)
+                    .unwrap()
+                    .0
+                    .count,
+                128
+            );
+            assert!(target(&u16_tag, &q25, counts).is_err());
+            assert!(target(&u16_tag, &unknown_model, counts).is_err());
+        }
+        // CPU buffer memory exists only on R.
+        for module in ["U3E0", "U3E1", "U3E2", "U3E3"] {
+            let tag = spec(&format!("{module}\\G0"), "u16", None);
+            assert!(target(&tag, &q, unknown).is_err(), "Q {module}");
+            assert!(target(&tag, &r, unknown).is_ok(), "R {module}");
+            assert!(target(&tag, &q25, unknown).is_err(), "Q25PRH {module}");
+        }
+        // Number limit: Q last word <= 0xFFFFFF; R last word <= u32::MAX.
+        for (address, kind, q_ok) in [
+            ("U3\\G16777215", "u16", true),
+            ("U3\\G16777214", "u32", true),
+            ("U3\\G16777215", "u32", false),
+            ("U3\\G16777216", "u16", false),
+            ("U3\\G16777200", "string", true),
+        ] {
+            let words = (kind == "string").then_some(16);
+            let tag = spec(address, kind, words);
+            assert_eq!(target(&tag, &q, unknown).is_ok(), q_ok, "{address}");
+            assert!(target(&tag, &r, unknown).is_ok(), "R {address}");
+        }
+        assert!(target(&spec("U3\\G4294967295", "u16", None), &r, unknown).is_ok());
+        // Unit buffer memory has no count: never a verified range.
+        assert_eq!(
+            read_count(Device::UG, PointCount::Exact(1), PointCount::Exact(1)),
+            PointCount::Unknown
+        );
+        assert_eq!(
+            assess_read_span(
+                &r,
+                Device::UG,
+                PointCount::Exact(100),
+                PointCount::Exact(100),
+                None,
+                10,
+                1
+            ),
+            RangeAssessment::Unknown
+        );
+        // Frames carry the module and the CPU-buffer extension byte.
+        let (span, module) = target(&spec("U3E1\\G9", "u16", None), &r, unknown).unwrap();
+        let frame = encode_span(Route::default(), Series::R, span, module).unwrap();
+        assert_eq!(
+            &frame[15..],
+            &[1, 4, 0x82, 0, 0, 0, 9, 0, 0, 0, 0xab, 0, 0, 0, 0xe1, 3, 0xfa, 1, 0]
+        );
+        let (span, module) = target(&u16_tag, &q, unknown).unwrap();
+        let frame = encode_span(Route::default(), Series::Q, span, module).unwrap();
+        assert_eq!(
+            &frame[15..],
+            &[1, 4, 0x80, 0, 0, 0, 10, 0, 0, 0xab, 0, 0, 3, 0, 0xf8, 1, 0]
+        );
+    }
+
+    #[test]
+    fn unit_buffer_values_decode_numeric_bit_and_string_words() {
+        let order = WordOrder::LowHigh;
+        let (_, _, kind) = parse_read_address("U3\\G10", "u32", None).unwrap();
+        assert!(matches!(
+            kind.decode_words(&[0x5678, 0x1234], order),
+            Ok(Value::Uint(0x1234_5678))
+        ));
+        assert!(matches!(
+            kind.decode_words(&[0x5678, 0x1234], WordOrder::HighLow),
+            Ok(Value::Uint(0x5678_1234))
+        ));
+        let (_, _, kind) = parse_read_address("U3\\G10.F", "bit", None).unwrap();
+        assert!(matches!(
+            kind.decode_words(&[0x8000], order),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            kind.decode_words(&[0x7fff], order),
+            Ok(Value::Bool(false))
+        ));
+        let (_, _, kind) = parse_read_address("U3\\G10", "string", Some(2)).unwrap();
+        assert!(matches!(
+            kind.decode_words(&[0x4241, 0x0043], order),
+            Ok(Value::Bytes(bytes)) if bytes == [0x41, 0x42, 0x43, 0x00]
+        ));
+    }
+
+    #[test]
+    fn unit_buffer_writes_are_rejected_before_sending() {
+        let item =
+            |address: &str, kind: &str, words: Option<u32>, value: Value| write_v1::WriteItem {
+                spec: TagSpec {
+                    address: address.into(),
+                    data_type: kind.into(),
+                    string_words: words,
+                },
+                value,
+            };
+        for run in [
+            vec![item("U3\\G10", "u16", None, Value::Float(1.0))],
+            vec![item("U3E0\\G10", "u32", None, Value::Uint(1))],
+            vec![item("U3\\G10", "string", Some(1), Value::Bytes(vec![0, 0]))],
+            vec![
+                item("U3\\G10", "u16", None, Value::Float(1.0)),
+                item("U3\\G11", "u16", None, Value::Float(1.0)),
+            ],
+            vec![
+                item("D10", "u16", None, Value::Float(1.0)),
+                item("U3\\G11", "u16", None, Value::Float(1.0)),
+            ],
+        ] {
+            assert!(parse_write_run(&run, WordOrder::LowHigh).is_err());
+        }
+        // A word-bit write never becomes a read-modify-write of buffer memory.
+        let bit = [item("U3\\G10.1", "bit", None, Value::Bool(true))];
+        assert!(parse_bit_rmw(&bit).is_err());
+        assert!(parse_write_run(&bit, WordOrder::LowHigh).is_err());
+        // The allowlist cannot name U\G.
+        for entry in [
+            "U3\\G10",
+            "U3\\G10-U3\\G11",
+            "U3\\G10.1",
+            "U3E0\\G0-U3E0\\G9",
+        ] {
+            assert!(
+                WritePolicy::parse(Some("enabled"), Some(entry)).is_err(),
+                "{entry}"
             );
         }
     }

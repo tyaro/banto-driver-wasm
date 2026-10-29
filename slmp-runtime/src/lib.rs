@@ -2189,6 +2189,191 @@ mod tests {
     }
 
     #[test]
+    fn unit_buffer_reads_are_one_request_per_tag_with_the_device_extension_frame(
+    ) -> wasmtime::Result<()> {
+        use banto::driver::types::{ItemError, TagSpec, Value};
+        let spec = |address: &str, data_type: &str, string_words: Option<u32>| TagSpec {
+            address: address.into(),
+            data_type: data_type.into(),
+            string_words,
+        };
+        let (mut store, driver) = load()?;
+        let parsed = driver
+            .banto_driver_address()
+            .call_parse(&mut store, "U03\\G010.f", "bit", None)?
+            .expect("U\\G word bit");
+        assert_eq!(parsed.canonical, "U3\\G10.F");
+        assert_eq!(parsed.area, "U3\\G");
+        assert!(!parsed.writable_area);
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_offset_words(&mut store, "U3E0\\G9", 2)?
+                .expect("offset_words"),
+            "U3E0\\G11"
+        );
+        for text in ["U3\\HG10", "U3\\G10Z1", "U100\\G0", "J1\\W10"] {
+            assert!(driver
+                .banto_driver_address()
+                .call_parse(&mut store, text, "u16", None)?
+                .is_err());
+        }
+
+        // Standard Q: U0-UFF only. Unit buffer tags are never joined, not even
+        // with an adjacent number, and never with a D tag.
+        let q = ready_q(&mut store, &driver, 100)?;
+        let q_specs = [
+            spec("U3\\G10", "u16", None),
+            spec("U3\\G11", "u16", None),
+            spec("D0", "u16", None),
+            spec("U3\\G100", "u32", None),
+            spec("U3\\G200.5", "bit", None),
+            spec("U3\\G300", "string", Some(2)),
+            spec("U3E0\\G0", "u16", None), // CPU buffer memory: R only
+            spec("U3\\G16777215", "u32", None), // past the Q 24-bit number
+            spec("U3\\HG1", "u16", None),
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, q, &q_specs)?
+            .expect("Q plans");
+        assert_eq!(
+            plans.iter().map(|p| p.covers.clone()).collect::<Vec<_>>(),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4], vec![5]]
+        );
+        // 0401 Q device-extension: subcommand 0080, then
+        // 0000 | number | AB | 0000 | module | F8 | points.
+        for (i, (number, module, points, body)) in [
+            ([10u8, 0, 0], 3u8, 1u8, vec![0x34, 0x12]),
+            ([11, 0, 0], 3, 1, vec![0x35, 0x12]),
+            ([0, 0, 0], 0, 1, vec![]), // D0 is an ordinary Q read
+            ([100, 0, 0], 3, 2, vec![0x78, 0x56, 0x34, 0x12]),
+            ([200, 0, 0], 3, 1, vec![0x20, 0x00]),
+            ([0x2c, 1, 0], 3, 2, vec![b'A', b'B', b'C', 0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let plan = &plans[i];
+            assert_eq!(&plan.step.send[15..17], &[0x01, 0x04], "0401");
+            if i == 2 {
+                assert_eq!(&plan.step.send[17..19], &[0, 0]);
+                assert_eq!(plan.step.send[22], 0xa8);
+                continue;
+            }
+            assert_eq!(&plan.step.send[7..9], &[0xff, 0xff]);
+            assert_eq!(&plan.step.send[11..13], &[19, 0], "request data length");
+            assert_eq!(
+                &plan.step.send[17..19],
+                &[0x80, 0],
+                "Q extension subcommand"
+            );
+            assert_eq!(&plan.step.send[19..21], &[0, 0]);
+            assert_eq!(&plan.step.send[21..24], &number);
+            assert_eq!(plan.step.send[24], 0xab);
+            assert_eq!(&plan.step.send[25..27], &[0, 0]);
+            assert_eq!(&plan.step.send[27..29], &[module, 0]);
+            assert_eq!(plan.step.send[29], 0xf8);
+            assert_eq!(&plan.step.send[30..32], &[points, 0]);
+            assert_eq!(plan.step.send.len(), 32);
+            let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+            let values = driver
+                .banto_driver_read()
+                .call_decode(&mut store, q, plan, &q_specs, &response(serial, &body))?
+                .expect("Q U\\G decode");
+            assert!(
+                matches!(values.as_slice(), [Ok(Value::Uint(0x1234))] if i == 0)
+                    || matches!(values.as_slice(), [Ok(Value::Uint(0x1235))] if i == 1)
+                    || matches!(values.as_slice(), [Ok(Value::Uint(0x1234_5678))] if i == 3)
+                    || matches!(values.as_slice(), [Ok(Value::Bool(true))] if i == 4)
+                    || matches!(values.as_slice(), [Ok(Value::Bytes(b))] if i == 5 && b == &[b'A', b'B', b'C', 0]),
+                "{i}: {values:?}"
+            );
+        }
+        // A PLC end code is an item error like any other read.
+        let plan = driver
+            .banto_driver_read()
+            .call_plan(&mut store, q, &[spec("UFF\\G0", "u16", None)])?
+            .expect("refusal plan")
+            .remove(0);
+        let serial = u16::from_le_bytes([plan.step.send[2], plan.step.send[3]]);
+        let mut refused = response(serial, &[]);
+        refused[13..15].copy_from_slice(&0xc061u16.to_le_bytes());
+        let result = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                q,
+                &plan,
+                &[spec("UFF\\G0", "u16", None)],
+                &refused,
+            )?
+            .expect("item error");
+        assert!(
+            matches!(result.as_slice(), [Err(ItemError::Device(error))] if error.code == 0xc061)
+        );
+        q.resource_drop(&mut store)?;
+
+        // Standard R: U0-UFF and the CPU buffer memory U3E0-U3E3 (extension FAH).
+        let r = ready_r(&mut store, &driver, 200, 32)?;
+        let r_specs = [
+            spec("U3E0\\G1", "u16", None),
+            spec("U3E3\\G4294967294", "u32", None),
+            spec("U3E4\\G0", "u16", None), // not a CPU buffer module
+            spec("U10\\G5", "i16", None),
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, r, &r_specs)?
+            .expect("R plans");
+        assert_eq!(
+            plans.iter().map(|p| p.covers.clone()).collect::<Vec<_>>(),
+            vec![vec![0], vec![1], vec![3]]
+        );
+        // Manual example (U3E0 address 1): 0082 | 0000 | 01000000 | AB00 | 0000 | E003 | FA.
+        assert_eq!(&plans[0].step.send[11..13], &[21, 0], "request data length");
+        assert_eq!(
+            &plans[0].step.send[15..],
+            &[0x01, 0x04, 0x82, 0, 0, 0, 1, 0, 0, 0, 0xab, 0, 0, 0, 0xe0, 0x03, 0xfa, 1, 0]
+        );
+        assert_eq!(
+            &plans[1].step.send[21..],
+            &[0xfe, 0xff, 0xff, 0xff, 0xab, 0, 0, 0, 0xe3, 0x03, 0xfa, 2, 0]
+        );
+        assert_eq!(
+            &plans[2].step.send[19..],
+            &[0, 0, 5, 0, 0, 0, 0xab, 0, 0, 0, 0x10, 0, 0xf8, 1, 0]
+        );
+        let serial = |plan: &exports::banto::driver::read::Planned| {
+            u16::from_le_bytes([plan.step.send[2], plan.step.send[3]])
+        };
+        for (i, body) in [
+            (0usize, vec![0xcd, 0xab]),
+            (1, vec![0x78, 0x56, 0x34, 0x12]),
+            (2, vec![0xff, 0xff]),
+        ] {
+            let values = driver
+                .banto_driver_read()
+                .call_decode(
+                    &mut store,
+                    r,
+                    &plans[i],
+                    &r_specs,
+                    &response(serial(&plans[i]), &body),
+                )?
+                .expect("R U\\G decode");
+            assert!(
+                matches!(values.as_slice(), [Ok(Value::Uint(0xabcd))] if i == 0)
+                    || matches!(values.as_slice(), [Ok(Value::Uint(0x1234_5678))] if i == 1)
+                    || matches!(values.as_slice(), [Ok(Value::Int(-1))] if i == 2),
+                "{i}: {values:?}"
+            );
+        }
+        r.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
     fn mxyb_bits_use_separate_q_requests_and_typed_boolean_values() -> wasmtime::Result<()> {
         use banto::driver::types::{ItemError, Value};
         let (mut store, driver) = load()?;
