@@ -5398,4 +5398,409 @@ mod tests {
         conn.resource_drop(&mut store)?;
         Ok(())
     }
+
+    fn string_spec(address: &str, words: u32) -> banto::driver::types::TagSpec {
+        banto::driver::types::TagSpec {
+            address: address.into(),
+            data_type: "string".into(),
+            string_words: Some(words),
+        }
+    }
+
+    /// Standard R ready with exact D/W counts from SD280-283.
+    fn ready_r(
+        store: &mut Store<()>,
+        driver: &Driver,
+        d_count: u16,
+        w_count: u16,
+    ) -> wasmtime::Result<exports::banto::driver::session::Connection> {
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut *store, &settings())?
+            .expect("settings");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut *store, conn, None)?
+            .expect("0101")
+            .is_some());
+        assert!(feed(store, driver, conn, &model_response("R04CPU", 0x4800))?.is_some());
+        let [d0, d1] = d_count.to_le_bytes();
+        let [w0, w1] = w_count.to_le_bytes();
+        assert!(feed(
+            store,
+            driver,
+            conn,
+            &response(2, &[d0, d1, 0, 0, w0, w1, 0, 0])
+        )?
+        .is_none());
+        Ok(conn)
+    }
+
+    #[test]
+    fn string_reads_return_the_wire_bytes_in_character_order_through_the_component(
+    ) -> wasmtime::Result<()> {
+        use banto::driver::types::{TagSpec, Value};
+        let (mut store, driver) = load()?;
+        let kinds = driver
+            .banto_driver_address()
+            .call_supported_kinds(&mut store)?;
+        assert_eq!(kinds.iter().filter(|kind| *kind == "string").count(), 1);
+        let parsed = driver
+            .banto_driver_address()
+            .call_parse(&mut store, "W1c", "string", Some(4))?
+            .expect("W string");
+        assert_eq!(
+            (
+                parsed.canonical.as_str(),
+                parsed.area.as_str(),
+                parsed.word_count,
+                parsed.index,
+                parsed.bit,
+                parsed.writable_area
+            ),
+            ("W1C", "W", 4, Some(0x1c), None, true)
+        );
+        for (text, words) in [
+            ("D10", None),
+            ("D10", Some(129)),
+            ("D10.1", Some(1)),
+            ("M10", Some(1)),
+        ] {
+            assert!(driver
+                .banto_driver_address()
+                .call_parse(&mut store, text, "string", words)?
+                .is_err());
+        }
+        assert_eq!(
+            driver
+                .banto_driver_address()
+                .call_offset(&mut store, "D10", "string", Some(3), 2)?
+                .expect("offset"),
+            "D16"
+        );
+        let conn = ready_r(&mut store, &driver, 200, 32)?;
+        let u16_spec = |address: &str| TagSpec {
+            address: address.into(),
+            data_type: "u16".into(),
+            string_words: None,
+        };
+        let specs = [
+            u16_spec("D10"),
+            string_spec("D11", 3),
+            u16_spec("D14"),
+            string_spec("D96", 4),
+            string_spec("D198", 4), // crosses the exact R D count of 200
+            string_spec("W1C", 4),
+            TagSpec {
+                string_words: None,
+                ..string_spec("D50", 1)
+            },
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plan");
+        assert_eq!(
+            plans
+                .iter()
+                .map(|p| p.covers.as_slice())
+                .collect::<Vec<_>>(),
+            vec![&[0, 1, 2][..], &[3][..], &[5][..]],
+            "a verified string joins its contiguous neighbours; outside and invalid stay uncovered"
+        );
+        // 0401 word reads: start, device code, word count.
+        assert_eq!(&plans[0].step.send[19..27], &[10, 0, 0, 0, 0xa8, 0, 5, 0]);
+        assert_eq!(&plans[1].step.send[19..27], &[96, 0, 0, 0, 0xa8, 0, 4, 0]);
+        assert_eq!(&plans[2].step.send[19..27], &[0x1c, 0, 0, 0, 0xb4, 0, 4, 0]);
+        let serial = |plan: &exports::banto::driver::read::Planned| {
+            u16::from_le_bytes([plan.step.send[2], plan.step.send[3]])
+        };
+        // "AB" "C\0" "\0D": the first character is the low byte of each word.
+        let batch = [0x34, 0x12, b'A', b'B', b'C', 0, 0, b'D', 0x78, 0x56];
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response(serial(&plans[0]), &batch),
+            )?
+            .expect("batch");
+        assert!(matches!(
+            values.as_slice(),
+            [Ok(Value::Uint(0x1234)), Ok(Value::Bytes(text)), Ok(Value::Uint(0x5678))]
+                if text == b"ABC\0\0D"
+        ));
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[1],
+                &specs,
+                &response(serial(&plans[1]), &[0; 8]),
+            )?
+            .expect("all NUL");
+        assert!(matches!(values.as_slice(), [Ok(Value::Bytes(text))] if text == &[0; 8]));
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[2],
+                &specs,
+                &response(serial(&plans[2]), b"12\x0045678"),
+            )?
+            .expect("W string");
+        assert!(matches!(values.as_slice(), [Ok(Value::Bytes(text))] if text == b"12\x0045678"));
+        // The longest string (128 words) is one request with a matching limit.
+        let longest = [string_spec("D0", 128)];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &longest)?
+            .expect("128 words");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(&plans[0].step.send[25..27], &[128, 0]);
+        assert!(plans[0].step.max_len >= 15 + 256);
+        let data = (0..=255u8).collect::<Vec<_>>();
+        let values = driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &longest,
+                &response(serial(&plans[0]), &data),
+            )?
+            .expect("256 bytes");
+        assert!(matches!(values.as_slice(), [Ok(Value::Bytes(text))] if *text == data));
+        // A response one byte short of the span is fatal, never a short string.
+        let short = [string_spec("D20", 2)];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &short)?
+            .expect("short plan");
+        assert!(driver
+            .banto_driver_read()
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &short,
+                &response(serial(&plans[0]), b"ABC"),
+            )?
+            .is_err());
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn three_e_q_string_read_keeps_the_internal_w_prefix_rule() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let conn = ready_q_3e(&mut store, &driver)?;
+        let specs = [string_spec("W1E", 2), string_spec("W1F", 2)];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("plan");
+        assert_eq!(plans.len(), 1, "W1F/2 crosses the SD303 prefix of 32");
+        assert_eq!(plans[0].covers, [0]);
+        assert_eq!(
+            plans[0].step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0x10, 0, 1, 4, 0, 0, 0x1e, 0, 0, 0xb4, 2, 0]
+        );
+        let values = driver
+            .banto_driver_read()
+            .call_decode(&mut store, conn, &plans[0], &specs, &response_3e(b"OK\0\0"))?
+            .expect("3E string");
+        assert!(matches!(values.as_slice(), [Ok(Value::Bytes(text))] if text == b"OK\0\0"));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn string_write_is_one_gated_1401_over_the_whole_span_on_4e_and_3e() -> wasmtime::Result<()> {
+        use write_host::banto::driver::types::{ItemError, Setting, TagSpec, Value};
+        use write_host::exports::banto::driver::write_v1::{WriteItem, WriteProgress};
+        let path = std::env::var("BANTO_SLMP_COMPONENT_WASM")?;
+        let engine = Engine::default();
+        let component = Component::from_file(&engine, path)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let driver = write_host::DriverWithWriteV1::instantiate(&mut store, &component, &linker)?;
+        let settings = |frame: &str| {
+            vec![
+                Setting {
+                    key: "host".into(),
+                    value: "fixture.invalid".into(),
+                },
+                Setting {
+                    key: "port".into(),
+                    value: "5000".into(),
+                },
+                Setting {
+                    key: "frame".into(),
+                    value: frame.into(),
+                },
+                Setting {
+                    key: "d_u16_write_mode".into(),
+                    value: "enabled".into(),
+                },
+                Setting {
+                    key: "d_u16_write_allowlist".into(),
+                    value: "D200-D210,W10-W1F".into(),
+                },
+            ]
+        };
+        let text = |address: &str, words: u32, bytes: &[u8]| WriteItem {
+            spec: TagSpec {
+                address: address.into(),
+                data_type: "string".into(),
+                string_words: Some(words),
+            },
+            value: Value::Bytes(bytes.to_vec()),
+        };
+        let session = driver.banto_driver_session().connection();
+        let write = driver.banto_driver_write_v1();
+
+        // Standard R over 4E: D count 300, W count 32.
+        let conn = session
+            .call_create(&mut store, &settings("4e"))?
+            .expect("4E settings");
+        session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        session
+            .call_handshake_next(&mut store, conn, Some(&model_response("R04CPU", 0x4800)))?
+            .expect("SD280");
+        assert!(session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response(2, &[0x2c, 1, 0, 0, 32, 0, 0, 0]))
+            )?
+            .expect("ready")
+            .is_none());
+        let items = [text("D200", 3, b"ABC\0\0\0")];
+        let WriteProgress::Send(plan) = write
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("preflight")
+        else {
+            panic!("allowlisted, proven string span should send")
+        };
+        assert_eq!(plan.covers, [0]);
+        assert_eq!(
+            plan.step.send,
+            [
+                0x54, 0, 3, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 20, 0, 0x10, 0, 1, 0x14, 2, 0, 200, 0, 0,
+                0, 0xa8, 0, 3, 0, b'A', b'B', b'C', 0, 0, 0
+            ]
+        );
+        let done = write
+            .call_write_next(&mut store, conn, &items, Some(&response(3, &[])))?
+            .expect("ACK");
+        assert!(
+            matches!(done, WriteProgress::Done(results) if matches!(results.as_slice(), [Ok(())]))
+        );
+        let numeric = WriteItem {
+            spec: TagSpec {
+                address: "D201".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: Value::Uint(1),
+        };
+        for refused in [
+            vec![text("D200", 3, b"ABCDE")],
+            vec![text("D200", 3, b"ABCDEFG")],
+            vec![WriteItem {
+                value: Value::Uint(1),
+                ..text("D200", 1, b"AB")
+            }],
+            vec![text("D200", 1, b"AB"), numeric.clone()],
+            vec![text("D200", 1, b"AB"), text("D201", 1, b"CD")],
+            vec![WriteItem {
+                value: Value::Bytes(b"AB".to_vec()),
+                ..numeric.clone()
+            }],
+            vec![text("D209", 3, b"ABCDEF")], // past the allowlist end
+            vec![text("W1D", 4, b"ABCDEFGH")], // past the R W count of 32
+            vec![TagSpec {
+                string_words: None,
+                ..text("D200", 1, b"AB").spec
+            }]
+            .into_iter()
+            .map(|spec| WriteItem {
+                spec,
+                value: Value::Bytes(b"AB".to_vec()),
+            })
+            .collect(),
+        ] {
+            let outcome = write
+                .call_write_next(&mut store, conn, &refused, None)?
+                .expect("preflight");
+            assert!(matches!(outcome, WriteProgress::Done(results)
+                if results.len() == refused.len()
+                    && results.iter().all(|r| matches!(r, Err(ItemError::Rejected(_))))));
+        }
+        conn.resource_drop(&mut store)?;
+
+        // Standard Q over 3E: internal W count 32 (SD303), T == WC.
+        let conn = session
+            .call_create(&mut store, &settings("3e"))?
+            .expect("3E settings");
+        session
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("0101");
+        session
+            .call_handshake_next(
+                &mut store,
+                conn,
+                Some(&response_3e(&model_data("Q02UCPU", 0x0263))),
+            )?
+            .expect("SD302");
+        session
+            .call_handshake_next(&mut store, conn, Some(&response_3e(&q_sd_data(300, 32))))?
+            .expect("SD310");
+        assert!(session
+            .call_handshake_next(&mut store, conn, Some(&response_3e(&q_w_total_data(32))))?
+            .expect("ready")
+            .is_none());
+        let items = [text("W18", 4, b"Hi\0\0\0\0\0\0")];
+        let WriteProgress::Send(plan) = write
+            .call_write_next(&mut store, conn, &items, None)?
+            .expect("3E preflight")
+        else {
+            panic!("allowlisted Q internal W string should send")
+        };
+        assert_eq!(
+            plan.step.send,
+            [
+                0x50, 0, 0, 0xff, 0xff, 3, 0, 20, 0, 0x10, 0, 1, 0x14, 0, 0, 0x18, 0, 0, 0xb4, 4,
+                0, b'H', b'i', 0, 0, 0, 0, 0, 0
+            ]
+        );
+        let done = write
+            .call_write_next(&mut store, conn, &items, Some(&response_3e(&[])))?
+            .expect("3E ACK");
+        assert!(
+            matches!(done, WriteProgress::Done(results) if matches!(results.as_slice(), [Ok(())]))
+        );
+        for refused in [
+            vec![text("D200", 1, b"AB")],      // standard Q D has no write proof
+            vec![text("W1E", 4, b"ABCDEFGH")], // past SD303
+        ] {
+            let outcome = write
+                .call_write_next(&mut store, conn, &refused, None)?
+                .expect("preflight");
+            assert!(matches!(outcome, WriteProgress::Done(results)
+                if results.iter().all(|r| matches!(r, Err(ItemError::Rejected(_))))));
+        }
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
 }

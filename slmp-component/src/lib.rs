@@ -7,6 +7,13 @@
 //! not atomic: a change by the PLC to another bit of the same word between
 //! the read and the write-back is overwritten, and the confirm read checks
 //! only the written bits.
+//! A D/W string tag (`string`, 1-128 `string_words`) reads its whole span as
+//! words and returns `bytes` of exactly 2 x words in character order: each
+//! word packs its low byte first (as native SLMP), so the bytes are the wire
+//! data unchanged, never decoded or cut at NUL. A string write is the only
+//! item of its request: the Host's already encoded, 0-padded bytes of exactly
+//! that length go out as one 1401 word write over the whole span, under the
+//! same allowlist and SD gates as a numeric write of the same width.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -307,11 +314,33 @@ fn write_unsigned(value: &Value) -> Result<u64, String> {
     }
 }
 
+/// The Host has already encoded and 0-padded the whole span; the guest never
+/// truncates or pads. Byte `2i` is the low byte of word `i`.
+fn encode_string(value: &Value, words: u16) -> Result<Vec<u16>, String> {
+    let Value::Bytes(bytes) = value else {
+        return Err("string write requires a bytes value".into());
+    };
+    if bytes.len() != 2 * usize::from(words) {
+        return Err("string write requires exactly 2 x string_words bytes".into());
+    }
+    Ok(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect())
+}
+
+/// Hub registry limit for `string_words`; far below the 960-word 0401/1401 limit.
+const MAX_STRING_WORDS: u32 = 128;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadKind {
     Bit,
     WordBit(u8),
     Numeric(DKind),
+    /// D/W string of this many words (1..=MAX_STRING_WORDS).
+    String(u16),
     LongTimer,
     /// Third response word: b0 coil, b1 contact (MC manual p.87).
     LongTimerFlag(u8),
@@ -324,6 +353,7 @@ impl ReadKind {
             Self::Bit => 1,
             Self::WordBit(_) => 1,
             Self::Numeric(kind) => kind.words(),
+            Self::String(words) => words,
             Self::LongTimer | Self::LongTimerFlag(_) => 4,
             Self::LongCounter => 2,
         }
@@ -335,6 +365,7 @@ impl ReadKind {
         match self {
             Self::Bit | Self::WordBit(_) | Self::LongTimerFlag(_) => 1,
             Self::Numeric(kind) => kind.words() as u32,
+            Self::String(words) => words as u32,
             Self::LongTimer | Self::LongCounter => 2,
         }
     }
@@ -343,6 +374,12 @@ impl ReadKind {
         match self {
             Self::WordBit(bit) if words.len() == 1 => Ok(Value::Bool(words[0] & (1 << bit) != 0)),
             Self::Numeric(kind) => kind.decode(words, order),
+            // Each word carries its first character in the low byte, and the
+            // binary wire sends words little-endian: the result is the wire
+            // data in order. No decoding and no NUL cut; the Host decodes.
+            Self::String(count) if words.len() == usize::from(count) => Ok(Value::Bytes(
+                words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            )),
             // MC batch read returns four words per long timer: two current-value
             // words, then coil/contact and system flags. These are not four
             // independent timer values.
@@ -849,6 +886,9 @@ fn parse_read_address(
             u32::from_str_radix(digits, radix).map_err(|_| "bit device address exceeds u32")?;
         return Ok((device, number, ReadKind::Bit));
     }
+    if data_type == "string" {
+        return parse_string_address(text, words);
+    }
     let kind = DKind::parse(data_type, words)?;
     for (prefix, device) in [
         ("STN", Device::STN),
@@ -905,6 +945,30 @@ fn parse_read_address(
         .checked_add(u32::from(kind.words() - 1))
         .ok_or("word tag address overflows u32")?;
     Ok((device, number, ReadKind::Numeric(kind)))
+}
+
+/// `D<decimal>` or `W<hex>` with 1..=128 words; word bits and every other
+/// device are refused. The whole span must fit in u32 like a numeric tag.
+fn parse_string_address(text: &str, words: Option<u32>) -> Result<(Device, u32, ReadKind), String> {
+    let words = words.ok_or("string tags require string_words")?;
+    if !(1..=MAX_STRING_WORDS).contains(&words) {
+        return Err(format!("string_words must be 1..={MAX_STRING_WORDS}"));
+    }
+    let (device, number) = if text.starts_with('D') {
+        (Device::D, parse_d_number(text)?)
+    } else if let Some(digits) = text.strip_prefix('W') {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid W address".into());
+        }
+        let number = u32::from_str_radix(digits, 16).map_err(|_| "W address exceeds u32")?;
+        (Device::W, number)
+    } else {
+        return Err("string tags require a D or W word address".into());
+    };
+    number
+        .checked_add(words - 1)
+        .ok_or("string tag address overflows u32")?;
+    Ok((device, number, ReadKind::String(words as u16)))
 }
 
 fn canonical_read(device: Device, number: i64) -> Result<String, String> {
@@ -2273,6 +2337,14 @@ fn parse_write_run(items: &[write_v1::WriteItem], order: WordOrder) -> Result<Wr
                 all_u16 &= kind == DKind::U16;
                 WritePayload::Words(kind.encode(&item.value, order)?)
             }
+            // `word_order` is for numeric values only; strings keep character order.
+            (Device::D | Device::W, ReadKind::String(words)) => {
+                if items.len() != 1 {
+                    return Err("a string write must be the only item of its request".into());
+                }
+                all_u16 = false;
+                WritePayload::Words(encode_string(&item.value, words)?)
+            }
             (Device::M | Device::Y | Device::L | Device::B, ReadKind::Bit) => {
                 let Value::Bool(bit) = item.value else {
                     return Err("bit write requires a bool value".into());
@@ -2375,7 +2447,10 @@ impl address::Guest for Component {
             // Connection policy, model, same-connection SD evidence and Host
             // authorization remain separate from this static type capability.
             writable_area: (matches!(device, Device::D | Device::W)
-                && matches!(kind, ReadKind::Numeric(_) | ReadKind::WordBit(_)))
+                && matches!(
+                    kind,
+                    ReadKind::Numeric(_) | ReadKind::WordBit(_) | ReadKind::String(_)
+                ))
                 || (matches!(device, Device::M | Device::Y | Device::L | Device::B)
                     && kind == ReadKind::Bit),
             bit: if let ReadKind::WordBit(bit) = kind {
@@ -2412,6 +2487,7 @@ impl address::Guest for Component {
         } else {
             let width = match kind {
                 ReadKind::Numeric(kind) => i64::from(kind.words()),
+                ReadKind::String(words) => i64::from(words),
                 ReadKind::Bit
                 | ReadKind::LongTimer
                 | ReadKind::LongTimerFlag(_)
@@ -2430,7 +2506,7 @@ impl address::Guest for Component {
 
     fn supported_kinds() -> Vec<String> {
         [
-            "bit", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64",
+            "bit", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "string",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -2468,7 +2544,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -2643,7 +2719,7 @@ impl config::Guest for Component {
             SettingField {
                 key: MODE_KEY.into(),
                 label: "SLMP write mode".into(),
-                help: Some("D/W numeric, M/Y/L/B bool and D/W word-bit writes require one explicit connection allowlist, same-connection area SD proof, and a separate Host write gate. Default is disabled. Unknown ranges reject writes.".into()),
+                help: Some("D/W numeric and string, M/Y/L/B bool and D/W word-bit writes require one explicit connection allowlist, same-connection area SD proof, and a separate Host write gate. Default is disabled. Unknown ranges reject writes.".into()),
                 kind: FieldKind::Choice(vec![
                     ChoiceOption {
                         value: "disabled".into(),
@@ -4941,6 +5017,558 @@ mod tests {
             assert!(help.contains(needle), "{needle}");
         }
         assert!(<Component as address::Guest>::help().contains("read-modify-write"));
+    }
+
+    fn string_spec(address: &str, words: u32) -> TagSpec {
+        TagSpec {
+            address: address.into(),
+            data_type: "string".into(),
+            string_words: Some(words),
+        }
+    }
+
+    fn string_write(address: &str, words: u32, bytes: &[u8]) -> write_v1::WriteItem {
+        write_v1::WriteItem {
+            spec: string_spec(address, words),
+            value: Value::Bytes(bytes.to_vec()),
+        }
+    }
+
+    #[test]
+    fn string_tags_parse_d_and_w_spans_offset_by_their_width_and_are_declared_once() {
+        let parse = |text: &str, words| {
+            <Component as address::Guest>::parse(text.into(), "string".into(), words)
+        };
+        for (text, words, canonical, area, index) in [
+            ("D100", 4, "D100", "D", 100),
+            ("D0", 1, "D0", "D", 0),
+            ("W1a", 128, "W1A", "W", 0x1a),
+            ("W0", 1, "W0", "W", 0),
+            ("D4294967295", 1, "D4294967295", "D", 4_294_967_295),
+        ] {
+            let parsed = parse(text, Some(words)).unwrap();
+            assert_eq!(
+                (
+                    parsed.canonical.as_str(),
+                    parsed.area.as_str(),
+                    parsed.word_count,
+                    parsed.index,
+                    parsed.bit,
+                    parsed.writable_area
+                ),
+                (canonical, area, words, Some(index), None, true),
+                "{text}"
+            );
+        }
+        for (text, words) in [
+            ("D100", None),
+            ("D100", Some(0)),
+            ("D100", Some(129)),
+            ("D4294967295", Some(2)),
+            ("WFFFFFFFF", Some(2)),
+            ("D100.5", Some(1)),
+            ("W1A.0", Some(1)),
+            ("M10", Some(1)),
+            ("X10", Some(1)),
+            ("SD10", Some(1)),
+            ("SW1", Some(1)),
+            ("ZR1", Some(1)),
+            ("Z1", Some(1)),
+            ("RD1", Some(1)),
+            ("TN1", Some(1)),
+            ("LTN1", Some(1)),
+            ("R1", Some(1)),
+            ("D1A", Some(1)),
+            ("Wg", Some(1)),
+            ("D", Some(1)),
+            ("W", Some(1)),
+            ("d100", Some(1)),
+        ] {
+            assert!(parse(text, words).is_err(), "{text} / {words:?}");
+        }
+        // string_words belongs to string tags only.
+        for (text, kind) in [
+            ("D100", "u16"),
+            ("W1A", "f64"),
+            ("D100.5", "bit"),
+            ("M10", "bit"),
+            ("TN1", "u16"),
+            ("LTN1", "i32"),
+            ("D100", "STRING"),
+        ] {
+            assert!(
+                <Component as address::Guest>::parse(text.into(), kind.into(), Some(4)).is_err(),
+                "{text}/{kind}"
+            );
+        }
+        let offset = |text: &str, words, n| {
+            <Component as address::Guest>::offset(text.into(), "string".into(), Some(words), n)
+        };
+        assert_eq!(offset("D100", 4, 1).unwrap(), "D104");
+        assert_eq!(offset("D100", 4, -2).unwrap(), "D92");
+        assert_eq!(offset("W1A", 3, 2).unwrap(), "W20");
+        assert_eq!(offset("D100", 128, 0).unwrap(), "D100");
+        assert!(offset("D2", 4, -1).is_err());
+        assert!(offset("D4294967292", 4, 1).is_err());
+        assert!(
+            <Component as address::Guest>::offset("D100".into(), "string".into(), None, 1).is_err()
+        );
+        assert_eq!(
+            <Component as address::Guest>::supported_kinds()
+                .iter()
+                .filter(|kind| *kind == "string")
+                .count(),
+            1
+        );
+        assert!(<Component as address::Guest>::help().contains("string_words"));
+    }
+
+    #[test]
+    fn string_read_spans_follow_the_numeric_range_rules_for_their_whole_width() {
+        let r = model(ModelFamily::StandardR);
+        let q = model(ModelFamily::StandardQ);
+        let span = |device, start, count| ReadSpan {
+            device,
+            start,
+            count,
+        };
+        // R D/W counts are exact: the last word decides.
+        assert_eq!(
+            checked_read_span(
+                &string_spec("D96", 4),
+                &r,
+                PointCount::Exact(100),
+                PointCount::Exact(0x20)
+            )
+            .unwrap(),
+            span(Device::D, 96, 4)
+        );
+        for spec in [string_spec("D97", 4), string_spec("W1D", 4)] {
+            assert!(
+                checked_read_span(&spec, &r, PointCount::Exact(100), PointCount::Exact(0x20))
+                    .is_err(),
+                "{}",
+                spec.address
+            );
+        }
+        assert_eq!(
+            checked_read_span(
+                &string_spec("W1C", 4),
+                &r,
+                PointCount::Exact(100),
+                PointCount::Exact(0x20)
+            )
+            .unwrap(),
+            span(Device::W, 0x1c, 4)
+        );
+        // Q D beyond the internal prefix stays an explicit range-Unknown read.
+        assert_eq!(
+            checked_read_span(
+                &string_spec("D99", 4),
+                &q,
+                PointCount::Exact(100),
+                PointCount::Exact(0x20)
+            )
+            .unwrap(),
+            span(Device::D, 99, 4)
+        );
+        assert_eq!(
+            assess_read_span(
+                &q,
+                Device::D,
+                PointCount::Exact(100),
+                PointCount::Exact(0x20),
+                None,
+                99,
+                4
+            ),
+            RangeAssessment::Unknown
+        );
+        // Q W: the internal prefix, and with SD310-311 the extended area, but
+        // never a span crossing the boundary, W10000H or the total.
+        let q_w = |address: &str, words, total| {
+            checked_read_span_ext(
+                &string_spec(address, words),
+                &q,
+                PointCount::Exact(100),
+                PointCount::Exact(0x20),
+                total,
+            )
+        };
+        assert_eq!(q_w("W1C", 4, None).unwrap(), span(Device::W, 0x1c, 4));
+        assert!(q_w("W1D", 4, None).is_err());
+        assert!(
+            q_w("W1D", 4, Some(0x40)).is_err(),
+            "crosses internal/extended"
+        );
+        assert_eq!(
+            q_w("W20", 32, Some(0x40)).unwrap(),
+            span(Device::W, 0x20, 32)
+        );
+        assert!(q_w("W21", 32, Some(0x40)).is_err(), "reaches the total");
+        assert!(q_w("WFFFF", 2, Some(0x20000)).is_err(), "reaches W10000H");
+        // The Hub limit is far below the 960-word batch limit.
+        let longest = string_spec("D0", MAX_STRING_WORDS);
+        let max =
+            checked_read_span(&longest, &r, PointCount::Exact(200), PointCount::Unknown).unwrap();
+        assert!(encode_read(Route::default(), Series::R, max).is_ok());
+        assert_eq!(read_step(Frame::E4, Vec::new(), max).max_len, 15 + 256);
+    }
+
+    #[test]
+    fn string_words_decode_to_wire_bytes_in_character_order_without_nul_cut() {
+        // "AB" "C\0" "\0D": low byte first in each word, no cut at the NUL.
+        let words = [0x4241, 0x0043, 0x4400];
+        for order in [WordOrder::LowHigh, WordOrder::HighLow] {
+            assert!(matches!(
+                ReadKind::String(3).decode_words(&words, order),
+                Ok(Value::Bytes(bytes)) if bytes == [0x41, 0x42, 0x43, 0, 0, 0x44]
+            ));
+        }
+        assert!(matches!(
+            ReadKind::String(2).decode_words(&[0, 0], WordOrder::LowHigh),
+            Ok(Value::Bytes(bytes)) if bytes == [0, 0, 0, 0]
+        ));
+        for wrong in [&words[..2], &[0x4241, 0x0043, 0x4400, 0][..], &[][..]] {
+            assert!(ReadKind::String(3)
+                .decode_words(wrong, WordOrder::LowHigh)
+                .is_err());
+        }
+        // decode_read takes the wire words little-endian, so re-packing them
+        // gives back the response data bytes exactly.
+        let data = [0x41u8, 0x42, 0x43, 0, 0, 0x44];
+        let wire = data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            ReadKind::String(3).decode_words(&wire, WordOrder::LowHigh),
+            Ok(Value::Bytes(bytes)) if bytes == data
+        ));
+        assert_eq!(ReadKind::String(3).points(), 3);
+        assert_eq!(ReadKind::String(3).value_words(), 3);
+    }
+
+    #[test]
+    fn string_write_run_takes_the_exact_bytes_as_one_word_payload() {
+        let run =
+            parse_write_run(&[string_write("D200", 3, b"AB\0C\0\0")], WordOrder::HighLow).unwrap();
+        assert_eq!(
+            run,
+            WriteRun {
+                device: Device::D,
+                number: 200,
+                payload: WritePayload::Words(vec![0x4241, 0x4300, 0]),
+                all_u16: false,
+                kinds: vec![ReadKind::String(3)],
+            }
+        );
+        for (items, why) in [
+            (vec![string_write("D200", 3, b"ABCDE")], "short"),
+            (vec![string_write("D200", 3, b"ABCDEFG")], "long"),
+            (vec![string_write("D200", 3, b"")], "empty"),
+            (
+                vec![write_v1::WriteItem {
+                    value: Value::Uint(1),
+                    ..string_write("D200", 1, b"AB")
+                }],
+                "not bytes",
+            ),
+            (
+                vec![
+                    string_write("D200", 1, b"AB"),
+                    string_write("D201", 1, b"CD"),
+                ],
+                "two strings",
+            ),
+            (
+                vec![string_write("D200", 1, b"AB"), word_write("D201", 1)],
+                "string then numeric",
+            ),
+            (
+                vec![word_write("D199", 1), string_write("D200", 1, b"AB")],
+                "numeric then string",
+            ),
+            (
+                vec![write_v1::WriteItem {
+                    value: Value::Bytes(vec![1, 2]),
+                    ..word_write("D200", 1)
+                }],
+                "bytes for u16",
+            ),
+            (
+                vec![write_v1::WriteItem {
+                    value: Value::Bytes(vec![1, 2]),
+                    ..bit_write("M10", true)
+                }],
+                "bytes for a bit",
+            ),
+            (vec![string_write("M10", 1, b"AB")], "string on M"),
+        ] {
+            assert!(
+                parse_write_run(&items, WordOrder::LowHigh).is_err(),
+                "{why}"
+            );
+        }
+        let bytes_word_bit = write_v1::WriteItem {
+            value: Value::Bytes(vec![1, 2]),
+            ..bit_write("D100.3", true)
+        };
+        assert!(parse_bit_rmw(&[bytes_word_bit]).is_err());
+        assert!(
+            parse_bit_rmw(&[bit_write("D100.3", true), string_write("D101", 1, b"AB")]).is_err()
+        );
+        assert_eq!(parse_bit_rmw(&[string_write("D101", 1, b"AB")]), Ok(None));
+    }
+
+    #[test]
+    fn r_4e_string_write_is_one_1401_over_the_span_and_acks_the_single_item() {
+        for order in ["low_high", "high_low"] {
+            let conn = rmw_conn(
+                &[("word_order", order)],
+                ModelFamily::StandardR,
+                PointCount::Exact(300),
+                PointCount::Exact(0x41),
+            );
+            let items = vec![string_write("D200", 3, b"ABC\0\0\0")];
+            assert_eq!(
+                sent(write_next_on(&conn, items.clone(), None), 1),
+                [
+                    0x54, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 3, 0, 20, 0, 0x10, 0, 1, 0x14, 2, 0, 200,
+                    0, 0, 0, 0xa8, 0, 3, 0, b'A', b'B', b'C', 0, 0, 0
+                ],
+                "{order}: bytes go out as given"
+            );
+            assert!(conn.pending_write.borrow().is_some(), "awaiting the ACK");
+            let results = done(write_next_on(
+                &conn,
+                items.clone(),
+                Some(reply(&conn, 1, 0, &[])),
+            ));
+            assert!(matches!(results.as_slice(), [Ok(())]));
+            assert!(!conn.write_poisoned.get());
+            // A refusal maps the single item to Device.
+            sent(write_next_on(&conn, items.clone(), None), 1);
+            let results = done(write_next_on(
+                &conn,
+                items.clone(),
+                Some(reply(&conn, 2, 0xc051, &[])),
+            ));
+            assert!(
+                matches!(results.as_slice(), [Err(ItemError::Device(error))] if error.code == 0xc051)
+            );
+            // Changed bytes after send are fatal and keep writes poisoned.
+            sent(write_next_on(&conn, items.clone(), None), 1);
+            assert!(matches!(
+                write_next_on(
+                    &conn,
+                    vec![string_write("D200", 3, b"ABD\0\0\0")],
+                    Some(reply(&conn, 3, 0, &[]))
+                ),
+                Err(FatalError::Protocol(_))
+            ));
+            assert!(conn.write_poisoned.get());
+        }
+        // R W uses the exact iQ-R W count and code B4H.
+        let conn = rmw_conn(
+            &[("d_u16_write_allowlist", "W10-W1F")],
+            ModelFamily::StandardR,
+            PointCount::Exact(300),
+            PointCount::Exact(0x20),
+        );
+        assert_eq!(
+            sent(
+                write_next_on(&conn, vec![string_write("W1C", 4, b"12345678")], None),
+                1
+            )[15..],
+            [
+                1, 0x14, 2, 0, 0x1c, 0, 0, 0, 0xb4, 0, 4, 0, b'1', b'2', b'3', b'4', b'5', b'6',
+                b'7', b'8'
+            ]
+        );
+    }
+
+    #[test]
+    fn q_3e_routed_string_write_uses_the_route_and_a_3e_ack() {
+        let conn = rmw_conn(
+            &[
+                ("frame", "3e"),
+                ("network_no", "2"),
+                ("station_no", "5"),
+                ("target_cpu", "cpu2"),
+                ("d_u16_write_allowlist", "W10-W1F"),
+            ],
+            ModelFamily::StandardQ,
+            PointCount::Exact(5000),
+            PointCount::Exact(0x20),
+        );
+        let items = vec![string_write("W18", 4, b"Hi\0\0\0\0\0\0")];
+        assert_eq!(
+            sent(write_next_on(&conn, items.clone(), None), 1),
+            [
+                0x50, 0, 2, 5, 0xe1, 3, 0, 20, 0, 0x10, 0, 1, 0x14, 0, 0, 0x18, 0, 0, 0xb4, 4, 0,
+                b'H', b'i', 0, 0, 0, 0, 0, 0
+            ]
+        );
+        let results = done(write_next_on(&conn, items, Some(reply(&conn, 0, 0, &[]))));
+        assert!(matches!(results.as_slice(), [Ok(())]));
+        assert!(!conn.write_poisoned.get());
+        // A 4E ACK on a 3E connection is a framing error.
+        let items = vec![string_write("W18", 1, b"Hi")];
+        sent(write_next_on(&conn, items.clone(), None), 1);
+        let mut e4 = vec![0xd4, 0, 1, 0, 0, 0];
+        e4.extend_from_slice(&reply(&conn, 0, 0, &[])[2..]);
+        assert!(matches!(
+            write_next_on(&conn, items, Some(e4)),
+            Err(FatalError::Framing(_))
+        ));
+    }
+
+    #[test]
+    fn string_writes_are_refused_before_send_by_the_numeric_gates() {
+        let allow = "D200-D210,D2990-D2999,D3002-D3010,W10-W1F";
+        let ready = |extra: &[(&str, &str)], family, d, w| {
+            let mut settings = vec![("d_u16_write_allowlist", allow)];
+            settings.extend_from_slice(extra);
+            rmw_conn(&settings, family, d, w)
+        };
+        let r = ready(
+            &[],
+            ModelFamily::StandardR,
+            PointCount::Exact(4000),
+            PointCount::Exact(0x20),
+        );
+        for (items, why) in [
+            (
+                vec![string_write("D209", 3, b"ABCDEF")],
+                "past the allowlist end",
+            ),
+            (
+                vec![string_write("D199", 2, b"ABCD")],
+                "before the allowlist",
+            ),
+            (
+                vec![string_write("D2999", 2, b"ABCD")],
+                "reaches protected D3000",
+            ),
+            (
+                vec![string_write("D2998", 6, b"ABCDEFGHIJKL")],
+                "spans the protected pair",
+            ),
+            (
+                vec![string_write("D208", 4, b"ABCDEFGH")],
+                "two intervals are not one",
+            ),
+            (vec![string_write("D200", 2, b"ABC")], "wrong length"),
+            (
+                vec![write_v1::WriteItem {
+                    value: Value::Float(1.0),
+                    ..string_write("D200", 1, b"AB")
+                }],
+                "not bytes",
+            ),
+            (
+                vec![string_write("D200", 1, b"AB"), word_write("D201", 1)],
+                "mixed",
+            ),
+            (
+                vec![write_v1::WriteItem {
+                    value: Value::Bytes(b"AB".to_vec()),
+                    ..word_write("D200", 1)
+                }],
+                "bytes for numeric",
+            ),
+            (
+                vec![string_write("W1C", 5, b"ABCDEFGHIJ")],
+                "past the R W count",
+            ),
+            (vec![string_write("SD10", 1, b"AB")], "not D/W"),
+        ] {
+            assert_rejected(&r, &items, why);
+        }
+        sent(
+            write_next_on(&r, vec![string_write("D3002", 4, b"ABCDEFGH")], None),
+            1,
+        );
+        let small_r = ready(
+            &[],
+            ModelFamily::StandardR,
+            PointCount::Exact(205),
+            PointCount::Exact(0x20),
+        );
+        assert_rejected(
+            &small_r,
+            &[string_write("D203", 3, b"ABCDEF")],
+            "crosses the R D count",
+        );
+        sent(
+            write_next_on(&small_r, vec![string_write("D202", 3, b"ABCDEF")], None),
+            1,
+        );
+        assert_rejected(
+            &ready(
+                &[],
+                ModelFamily::StandardR,
+                PointCount::Unknown,
+                PointCount::Unknown,
+            ),
+            &[string_write("D200", 1, b"AB")],
+            "SD refused",
+        );
+        // Q D has no write proof; Q W uses SD303 only, never SD310-311.
+        let q = ready(
+            &[],
+            ModelFamily::StandardQ,
+            PointCount::Exact(5000),
+            PointCount::Exact(0x1c),
+        );
+        assert_rejected(&q, &[string_write("D200", 1, b"AB")], "Q D");
+        assert_rejected(&q, &[string_write("W1A", 3, b"ABCDEF")], "past SD303");
+        q.q_w_total.set(Some(0x100));
+        assert_rejected(&q, &[string_write("W1A", 3, b"ABCDEF")], "extended W");
+        sent(
+            write_next_on(&q, vec![string_write("W1A", 2, b"ABCD")], None),
+            1,
+        );
+        for family in [ModelFamily::Unknown, ModelFamily::Q25PrhWireOnly] {
+            let conn = ready(
+                &[],
+                family,
+                PointCount::Exact(5000),
+                PointCount::Exact(0x20),
+            );
+            conn.q25prh_internal_d_count.set(PointCount::Exact(5000));
+            assert_rejected(&conn, &[string_write("D200", 1, b"AB")], "no Q/R model");
+        }
+        // The Q25PRH test opt-in stays four u16 words only.
+        let q25 = rmw_conn(
+            &[
+                ("d_u16_write_mode", "disabled"),
+                ("q25prh_d3010_3013_test_write", "enabled"),
+            ],
+            ModelFamily::Q25PrhWireOnly,
+            PointCount::Unknown,
+            PointCount::Unknown,
+        );
+        if let Phase::Ready { model, .. } = &mut *q25.phase.borrow_mut() {
+            model.name = "Q25PRHCPU".into();
+            model.code = 0x004c;
+        }
+        q25.q25prh_internal_d_count.set(PointCount::Exact(5000));
+        assert_rejected(
+            &q25,
+            &[string_write("D3010", 4, b"ABCDEFGH")],
+            "Q25PRH test write",
+        );
+        let disabled = ready(
+            &[("d_u16_write_mode", "disabled")],
+            ModelFamily::StandardR,
+            PointCount::Exact(4000),
+            PointCount::Exact(0x20),
+        );
+        assert_rejected(&disabled, &[string_write("D200", 1, b"AB")], "disabled");
     }
 }
 
