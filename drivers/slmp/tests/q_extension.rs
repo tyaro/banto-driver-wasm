@@ -109,12 +109,16 @@ fn only_classified_qnudv_models_use_fast_internal_d_w_pairs() {
     for (name, code) in [
         ("Q02UCPU", 0x0263),
         ("Q04UDPVCPU", 0x0367),
+        ("Q06PHCPU", 0x0042),
+        ("L26CPU", 0x0545),
         ("Q00JCPU", 0x0250),
         ("R04CPU", 0x4800),
         ("RCPU", 0x0360),
     ] {
         let q = model(name, code);
-        if name != "Q02UCPU" {
+        // QnU (code-based) models, including QnUDPV, may plan SD286-289; the
+        // SD282-285 fast D/W pair stays limited to the QnUDV names.
+        if !matches!(name, "Q02UCPU" | "Q04UDPVCPU") {
             assert_eq!(plan_q_extension(&q, A::MTotal, evidence()), None);
         }
         assert_eq!(plan_q_extension(&q, A::FastDInternal, evidence()), None);
@@ -166,6 +170,11 @@ fn sd310_w_total_is_planned_for_classified_qnu_except_q00uj() {
         ("Q06UDVCPU", 0x0368),
         ("Q13UDVCPU", 0x036a),
         ("Q26UDVCPU", 0x036c),
+        // G2a: universal process CPU is QnU.
+        ("Q04UDPVCPU", 0x0367),
+        ("Q06UDPVCPU", 0x0368),
+        ("Q13UDPVCPU", 0x036a),
+        ("Q26UDPVCPU", 0x036c),
     ] {
         let q = model(name, code);
         let span = plan_q_w_total(&q).unwrap();
@@ -189,6 +198,15 @@ fn sd310_w_total_is_not_planned_for_other_models() {
         ("Q06HCPU", 0x0042),
         ("Q25HCPU", 0x0044),
         ("Q25PRHCPU", 0x004c),
+        ("Q12PRHCPU", 0x004b),
+        // G2a: process CPU (non-U) and MELSEC-L get no SD310-311 plan.
+        ("Q02PHCPU", 0x0041),
+        ("Q25PHCPU", 0x0044),
+        ("L02SCPU", 0x0543),
+        ("L02CPU-P", 0x0541),
+        ("L06CPU", 0x0544),
+        ("L26CPU", 0x0545),
+        ("L26CPU-PBT", 0x0542),
         ("R04CPU", 0x4800),
         ("Q03UDVCPU", 0x0367),
         ("RCPU", 0x0360),
@@ -196,5 +214,24 @@ fn sd310_w_total_is_not_planned_for_other_models() {
         let q = model(name, code);
         assert_eq!(plan_q_w_total(&q), None, "{name}");
         assert_eq!(decode_q_w_total(&q, Some(&[0x3000, 0])), None, "{name}");
+    }
+}
+
+#[test]
+fn g2a_qnudpv_plans_m_b_totals_but_not_the_fast_d_w_pair_and_l_plans_nothing() {
+    let q = model("Q06UDPVCPU", 0x0368);
+    assert_eq!(plan_q_extension(&q, A::FastDInternal, evidence()), None);
+    assert_eq!(plan_q_extension(&q, A::FastWInternal, evidence()), None);
+    let m = plan_q_extension(&q, A::MTotal, evidence()).unwrap();
+    assert_eq!((m.start, m.count), (286, 2));
+    for (name, code) in [
+        ("L02CPU", 0x0541),
+        ("L26CPU-BT", 0x0542),
+        ("Q12PHCPU", 0x0043),
+    ] {
+        let q = model(name, code);
+        for area in [A::MTotal, A::BTotal, A::FastDInternal, A::FastWInternal] {
+            assert_eq!(plan_q_extension(&q, area, evidence()), None, "{name}");
+        }
     }
 }
