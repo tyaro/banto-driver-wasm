@@ -42,7 +42,7 @@ main `25b5a1b`（#48）では #32 Modbus 基本、#33 register-bit read、#34 SL
 | E3 | SLMP ASCII コード通信 | 不採用（2026-10-28 作者決定）。必要になった場合は、設定 `encoding` で binary と切り替え、WIT の `ascii-hex` 長さ前置きを使う形で改めて段階を起こす | — |
 | E4 | SLMP UDP | Hub 側は tyaro/banto-industrial#933 で対応済み。ゲストは設定 `transport`（`tcp` 既定／`udp`）を受理するだけで、フレームは不変。3E は UDP で重複・遅延したデータグラムによる古い値のリスクがあり、利用者の責任としてスキーマの説明に明記する（#916 作者決定）。下の「E4 の結果」 | WIT 不変。Hub 側は実装済み |
 | F | SLMP 書込み対象の拡張 | ワード内ビット書込み（`D100.5`・`W1A.0`）は native と同じ RMW（読む→対象ビットだけ差し替えて書き戻す→読み直して確認）で採用する（2026-10-28 作者決定）。設計は下の「F の設計」（許可はビット単位の allowlist）。TN/STN/CN の現在値書込みは見送り | ゲストと Hub ゲートの変更（WIT 不変） |
-| G | SLMP U/G バッファメモリ、ラベル、FX5 / L / MX / 特殊 CPU | 拡張指定サブコマンド、ラベル用コマンド、機種別の型式・基数・点数根拠をそれぞれ契約設計してから段階的に追加する。Q25PRH と同様に機種別の限定対応とする。U/G（G1）を先に行う。設計は下の「G1 の設計」（2026-10-29 作者決定） | 段階ごとに判断（G1 は WIT 不変） |
+| G | SLMP U/G バッファメモリ、ラベル、FX5 / L / MX / 特殊 CPU | 拡張指定サブコマンド、ラベル用コマンド、機種別の型式・基数・点数根拠をそれぞれ契約設計してから段階的に追加する。Q25PRH と同様に機種別の限定対応とする。U/G（G1）を先に行う。設計は下の「G1 の設計」（2026-10-29 作者決定）。他機種は下の「G2 の設計案」 | 段階ごとに判断（G1 は WIT 不変） |
 | H | PLC の時計合わせ（SLMP の Q/R から） | 接続先ごとに違う手順（どのデバイスに何をどの順で書き、どう確かめるか）はゲストが任意の WIT 拡張 `clock-v1` で持ち、時刻の元・実行の契機（定期実行）・許可・監査は Hub が持つ（2026-11-05 作者決定）。設計は下の「H の設計」 | WIT 追加（新しい world）と Hub の変更 |
 
 C0 の確認結果（2026-10-28、Hub main `1120419` の静的照合）: Hub の WASM 経路は文字列を通せない。タグ登録（`string`、1–128 words、UTF-8 / Shift_JIS）、engine の復号（最初の NUL で切り、不正な符号は項目エラー）、REST の read-now と書込み・監査、native SLMP の文字列は対応済みで、周期収集・履歴・ライブ表示は全ドライバで文字列を扱わない（設計どおり）。不足は WASM アダプタ（`crates/banto-driver-wasm`）だけで、`string` を宣言したゲストの読込み拒否、文字列アドレスの照合拒否、`bytes` 結果のバッチ全体 Fatal、Modbus・SLMP 書込みゲートの数値限定（`string-words` 未設定・`bytes` への変換なし）、Modbus の 1 要求 123 ワードと登録上限 128 ワードの差がある。tyaro/banto-industrial#914 はこの一部を記録している。作者の判断で Hub 側の修正はいったん保留し、C1 はその修正の後に行う。先に WIT・Hub 不変の D1・D2 を進める。
@@ -115,6 +115,46 @@ G は U/G（G1）・ラベル・他機種の順に段階を分ける（2026-10-2
 - 影響: WIT 不変。Hub の数値・ビットの読取りはゲストの文法と正規表記の往復で照合するので変更は不要の見込み。ただし Hub の WASM アダプタは SLMP の文字列タグの `area` を `D`・`W` に限っているため、U/G の文字列には Hub 側で `U<h>\G` を足す変更が要る。Hub 模擬受入れでタグ登録（`\` を含む表記）・read-now・周期収集を確認する。SLMP の manifest はこのリポジトリにない。
 
 G1 の結果（2026-10-29）: 上の設計どおりに実装した。コアに `UnitBufferSpan` と `encode_read_unit_buffer`（要求データ長は Q が 19、R が 21 バイト）を足し、マニュアルの 2 つの通信例とバイト単位で一致することを試験した。`U` と `\G` は大文字だけを受け付け、`h` の 16 進は大小文字可、`h`・`n` の先頭の 0 は正規表記で落とす。ゲスト単体・Wasmtime 試験・CI のみで、Hub 模擬受入れと実機は未実施。
+
+G2（他機種）の設計案（2026-11-05。資料を調べて機種群ごとに分けた案で、末尾の「G2 の未決」を作者が決めてから実装する。公式資料が見つからない機種は凍結する（2026-11-05 作者決定））:
+
+- 共通の方針: 機種は今と同じく 0101 の型名と型式コードの組で判別し、表にない組は従来どおり `Unknown`（読書きしない）とする。範囲の根拠は同じ接続で読む SD の点数とし、機種群ごとに「どのフレーム・サブコマンドで送るか」「どの SD 表を使うか」「どのデバイスがないか」を持つ。WIT と Hub は変えない見込み（Hub はゲストの正規表記の往復で照合する）。書込みのゲートは機種群ごとに既存の Q か R の規則に揃える。
+
+- G2a（Q 系・MELSEC-L。Q と同じ配線と SD 表）:
+  - 対象: Q のプロセス CPU（Q02PHCPU 41H・Q06PHCPU 42H・Q12PHCPU 43H・Q25PHCPU 44H。型式コードは QnH と共有で、型名で区別する）、ユニバーサルプロセス CPU（Q04UDPVCPU 367H・Q06UDPVCPU 368H・Q13UDPVCPU 36AH・Q26UDPVCPU 36CH。コードは QnUDV と共有）、MELSEC-L（L02SCPU・L02SCPU-P 543H、L02CPU・L02CPU-P 541H、L06CPU・L06CPU-P 544H、L26CPU・L26CPU-P 545H、L26CPU-BT・L26CPU-PBT 542H）。型名・コードは [SLMP 参照マニュアル SH-080956ENG N 印刷 p.139](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141)。
+  - 根拠: QCPU 取扱説明書の「QCPU」はプロセス CPU・冗長 CPU・ユニバーサル（QnUDPV を含む）の総称で（[SH-080483ENG 用語](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf)）、点数の SD290–SD304 の CPU 欄は「QCPU・LCPU」、LCPU は L シリーズの全 CPU（[同 印刷 p.550](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080483eng/sh080483engbc.pdf#page=552)）。SLMP では L は Q と同じサブコマンド 0000/0001 を使う（SLMP 参照マニュアル 印刷 p.35）。
+  - 扱い: QnPH は標準 Q（非 U）、QnUDPV は QnU（D2・D3 の QnU 規則を含む）、L は標準 Q の基本の SD 表（SD290–SD304）だけを使い、QnU 向けの拡張（D2 の ZR 方針、D3 の SD310–311）は L に当てはまるかを確かめるまで使わない。Q12PRHCPU（4BH）は Q25PRH と同じ配線だけの扱いに加える。
+  - 残る確認: L の内蔵 Ethernet が 4E を受けるか（受けなければ `frame=3e` を案内する）。実機。
+
+- G2b（iQ-R 系の特殊 CPU・MX-R。R と同じ配線と SD 表、S の有無だけ違う）:
+  - 対象: プロセス CPU（R08PCPU 4841H〜R120PCPU 4844H）、SIL2 プロセス CPU（R08PSFCPU 4851H〜R120PSFCPU 4854H）、安全 CPU（R08SFCPU 4891H〜R120SFCPU 4894H）、MX-R（MXR300-16 48E9H・MXR300-32 48EAH・MXR300-64 48EBH・MXR500-128 48EEH・MXR500-256 48EFH）。
+  - 根拠: 点数の SD260–SD309 は標準 R と同じ番号・意味で、S（SD276/277）だけが違う。プロセス CPU は S を持つ（[iQ-R プロセス CPU ユーザーズマニュアル SH-082493ENG F 印刷 p.694](https://www.mitsubishielectric.com/dl/fa/document/manual/plc/sh082493eng/sh082493engf.pdf#page=696)）。SIL2 プロセス CPU は S を持たない（[SH-082503ENG B 印刷 p.506](https://www.mitsubishielectric.com/dl/fa/document/manual/plc/sh082503eng/sh082503engb.pdf#page=508)）。安全 CPU は SD250・SD260–SD309 が全 CPU 共通で S は Rn・RnP だけ（[iQ-R CPU ユニット ユーザーズマニュアル（応用編）SH-081264ENG AR 印刷 pp.982–983](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh081264eng/sh081264engar.pdf#page=984)。安全 CPU 専用のマニュアルは未発行）。MX-R は S を持たない（[MX-R ユーザーズマニュアル SH-082641ENG D 付録 7 印刷 p.2149](https://www.mitsubishielectric.com/dl/fa/document/manual/mxc/sh082641eng/sh082641engd.pdf#page=2151)）。
+  - 扱い: 標準 R と同じ規則で読書きする。S を持たない機種群（SIL2・安全・MX-R）は S のタグを送る前に `Unsupported` とする。安全デバイス（SA\D など）は SLMP で指定できない（SLMP 参照マニュアル 印刷 pp.36–37・p.78）ので、文法にも足さない。SAFETY MODE の安全デバイスの書込み禁止と、安全 CPU（ファームウェア 32 以降）の外部からの書込み禁止範囲は PLC が終了コードで断るので、ゲストは既存の書込みと同じく `device` で返す。MX-R の Ethernet ポートはバイナリだけで、今のゲストもバイナリだけなので差はない。0101 の `MX-R`/037EH（接続局が iQ-R・MX 以外のときの代わりの応答）は `RCPU`/0360H と同じく `Unknown`。冗長構成（R6RFM）は自局の固定宛先だけを扱い、系切替の間の書込みが失われうることを設定の説明に書く（[SH-082493ENG F 印刷 p.443](https://www.mitsubishielectric.com/dl/fa/document/manual/plc/sh082493eng/sh082493engf.pdf#page=445)）。
+  - 残る確認: 各機種群の実機（特に MX-R の大きい既定点数で SD が正しく読めること）。
+
+- G2c（FX5。配線・SD 表・デバイスが違う新しい機種群）:
+  - 根拠はすべて [FX5 ユーザーズマニュアル（SLMP 編）JY997D56001 K](https://dl.mitsubishielectric.com/dl/fa/document/manual/plcf/jy997d56001/jy997d56001k.pdf) と [FX5 ユーザーズマニュアル（応用編）JY997D55401 AH](https://dl.mitsubishielectric.com/dl/fa/document/manual/plcf/jy997d55401/jy997d55401ah.pdf)。
+  - 対象: FX5U・FX5UC・FX5UJ・FX5S の CPU（0101 の型式コード 4A21H〜4B5FH の表、SLMP 編 印刷 pp.109–110）。型名の文字列はマニュアルに例がないので、コードの表と型名の先頭 `FX5` の両方で判別する案とし、実機で型名を記録する。
+  - フレーム: 3E と 1E だけで 4E はない（SLMP 編 印刷 p.8）。ゲストは FX5 では `frame=3e` を要する。4E のまま繋ぐと 0101 に応答がなく型式を確定できないので、設定の説明で 3E を案内する。宛先は自局だけ（ネットワーク 00H・局 FFH・I/O 03FFH、印刷 pp.23–24）。監視タイマは CPU には 0000H（無限待ち）を指定するよう書かれている（印刷 p.27）ので、FX5 で今の 0010H をどう扱うかを決める。
+  - サブコマンドとデバイス: 0401/1401 は Q と同じ 0000/0001（デバイスコード 1 バイト・番号 3 バイト）。0002/0003 はない。1 回の上限は Q と同じ 960 ワード・3584 ビット（印刷 pp.57–60）。デバイスは X・Y・M・L・F・B・S・D・W・SB・SW・SM・SD・Z・R（ファイルレジスタ、AFH、10 進）・T/ST/C 系・LC 系・LZ・G がある。V・LT・LST・ZR はない（印刷 pp.66–67）。LCN・LZ は 0401 で読めない。
+  - X・Y の番号: FX5 の X・Y は 8 進で書くが、バイナリでの番号の送り方がマニュアル内で食い違う（「バイナリは 16 進」とある一方、通信例では X20 を 20H で送っている）。実機で確かめるまで FX5 の X・Y は扱わない。
+  - 点数の根拠: SD260 以降に 32 ビットで点数を持つ（X SD260/261、Y 262/263、M 264/265、B 266/267、SB 268/269、F 270/271、L 274/275、D 280/281、W 282/283、SW 284/285、T 288/289、ST 290/291、C 292/293、LC 298/299、Z 300、LZ 302、R 304/305。応用編 付録 2 印刷 pp.870–871）。番号は iQ-R に近いが同じではない（SD304/305 が R）ので、FX5 専用の SD 表を持つ。S は 4096 点固定で SD がない。
+  - 書込み: 標準 R と同じく、同じ接続の SD で確定した範囲と許可リストを要する。R（ファイルレジスタ）の書込みは別に決める。
+  - 対象外: MX-F（FX5 系の MX コントローラ）は 0101 の表にも見つからないので凍結。
+
+- 凍結（公式資料が見つからない、または PLC の CPU ではない）:
+  - iQ-L（L04HCPU 48C0H〜L32HCPU 48C3H）: SLMP では iQ-R と同じサブコマンドを使うが、点数の SD 表を公式資料で確かめられない（中国語の起動編の第三者の写ししか見つからない）。
+  - QS001CPU（Q の安全 CPU、230H）、MX-F: 資料を確かめていない。
+  - CPU ではないもの: ヘッドユニット（LJ72GF15-T2・RJ72GF15-T2 系）、Ethernet アダプタ（NZ2GF-ETB）、C 言語コントローラ（R12CCPU-V）、MELIPC（MI5122-VW）。
+
+- 試験（案）: 機種群ごとに 0101 の判別（型名とコードの組、コード共有の型名違い）、SD 表の選択とバイト列、S を持たない機種での S の拒否、FX5 の 3E・SD 表・ないデバイスの拒否。ゲスト単体と Wasmtime フィクスチャで行い、Hub 模擬受入れは別に記録する。実機確認は別途承認を得る。
+
+G2 の未決（作者が決める）:
+
+1. 進める順番。案は G2a → G2b → G2c（既存の規則に近い順。G2a・G2b は表と SD 表の追加が中心で、G2c は新しい機種群になる）。実際に使う機種があれば、それを先にする。
+2. FX5 の型名の判別を「コードの表＋型名の先頭 `FX5`」とする案でよいか。
+3. FX5 の監視タイマを 0000H（無限待ち）にするか、今の 0010H のままにするか。
+4. FX5 の R（ファイルレジスタ）の書込みを開くか。
 
 H の設計（2026-11-05 作者決定。役割分担、特殊デバイスの扱い、時刻の元、定期実行、順番は作者決定。iQ-R の手順はオーナー提供のマニュアル抜粋による。残る確認は末尾の「H の残件」）:
 
