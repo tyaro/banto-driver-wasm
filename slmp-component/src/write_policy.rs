@@ -5,7 +5,12 @@
 //! intervals (`D100.3-D100.5`, `W1A.0-W1B.F`) are a separate list that alone
 //! authorizes read-modify-write of single bits inside D/W words; a word
 //! interval never authorizes a bit, and a bit interval never a word.
+//!
+//! G3 global labels have their own list (`label_write_allowlist`, see
+//! `label`) under the same mode. An enabled mode needs at least one of the
+//! two lists to be nonempty; earlier saved values keep their meaning.
 
+use super::label::{Label, LabelAllowlist};
 use banto_slmp_read_core::Device;
 
 pub(super) const MODE_KEY: &str = "d_u16_write_mode";
@@ -22,12 +27,22 @@ pub(super) struct WritePolicy {
     ranges: Vec<(Device, u32, u32)>,
     /// D/W word-bit intervals as inclusive `word * 16 + bit` positions.
     bit_ranges: Vec<(Device, u64, u64)>,
+    labels: LabelAllowlist,
 }
 
 impl WritePolicy {
+    #[cfg(test)]
     pub(super) fn parse(
         mode: Option<&str>,
         allowlist: Option<&str>,
+    ) -> Result<Self, (&'static str, &'static str)> {
+        Self::parse_with_labels(mode, allowlist, None)
+    }
+
+    pub(super) fn parse_with_labels(
+        mode: Option<&str>,
+        allowlist: Option<&str>,
+        labels: Option<&str>,
     ) -> Result<Self, (&'static str, &'static str)> {
         let enabled = match mode.unwrap_or("disabled") {
             "disabled" => false,
@@ -100,17 +115,24 @@ impl WritePolicy {
                 ranges.push((device, start, end));
             }
         }
-        if enabled && ranges.is_empty() && bit_ranges.is_empty() {
+        let labels = LabelAllowlist::parse(labels)?;
+        if enabled && ranges.is_empty() && bit_ranges.is_empty() && labels.is_empty() {
             return Err((
                 ALLOWLIST_KEY,
-                "enabled write requires an explicit allowlist",
+                "enabled write requires an explicit device or label allowlist",
             ));
         }
         Ok(Self {
             enabled,
             ranges,
             bit_ranges,
+            labels,
         })
+    }
+
+    /// A label write needs the common enabled mode and a label allowlist entry.
+    pub(super) fn allows_label(&self, label: &Label) -> bool {
+        self.enabled && self.labels.allows(label)
     }
 
     #[cfg(test)]
@@ -358,6 +380,30 @@ mod tests {
         );
         let max = WritePolicy::parse(Some("enabled"), Some("D0.0-D447.F")).unwrap();
         assert!(max.allows_word_bits(Device::D, 447, &[15]));
+    }
+
+    #[test]
+    fn label_allowlist_alone_satisfies_enabled_mode_and_grants_only_labels() {
+        let labels = Some("@Tank1.Level;@Arr[0-9]");
+        let label = |text| super::super::label::parse_label(text, "u16", None).unwrap();
+        let policy = WritePolicy::parse_with_labels(Some("enabled"), None, labels).unwrap();
+        assert!(policy.allows_label(&label("@Arr[9]")));
+        assert!(!policy.allows_label(&label("@Arr[10]")));
+        assert!(!policy.allows_device_span(Device::D, 0, 1));
+        assert!(!policy.has_bit_ranges());
+        let empty = WritePolicy::parse_with_labels(Some("enabled"), Some(""), Some(""));
+        assert_eq!(empty.unwrap_err().0, ALLOWLIST_KEY);
+        let disabled = WritePolicy::parse_with_labels(Some("disabled"), None, labels).unwrap();
+        assert!(!disabled.allows_label(&label("@Tank1.Level")));
+        let device_only =
+            WritePolicy::parse_with_labels(Some("enabled"), Some("D10-D10"), None).unwrap();
+        assert!(!device_only.allows_label(&label("@Tank1.Level")));
+        assert_eq!(
+            WritePolicy::parse_with_labels(Some("enabled"), Some("D10-D10"), Some("@A;"))
+                .unwrap_err()
+                .0,
+            super::super::label::LABEL_ALLOWLIST_KEY
+        );
     }
 
     #[test]

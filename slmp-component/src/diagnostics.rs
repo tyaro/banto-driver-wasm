@@ -332,6 +332,16 @@ fn tag_diagnostic(
     spec: &TagSpec,
 ) -> diagnostics_v1::TagDiagnostic {
     use diagnostics_v1::TagVerdict;
+    // A global label has no configured range and is not looked up here.
+    if is_label(&spec.address) {
+        return diagnostics_v1::TagDiagnostic {
+            address: spec.address.clone(),
+            verdict: match parse_label(&spec.address, &spec.data_type, spec.string_words) {
+                Ok(_) => TagVerdict::Unknown("label".into()),
+                Err(reason) => TagVerdict::Invalid(reason),
+            },
+        };
+    }
     let verdict = match parse_read_address(&spec.address, &spec.data_type, spec.string_words) {
         Err(reason) => TagVerdict::Invalid(reason),
         Ok((_, number, kind)) if number.checked_add(u32::from(kind.points() - 1)).is_none() => {

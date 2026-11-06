@@ -1,5 +1,6 @@
 //! Binary 4E or 3E SLMP read (0401) and bounded Q/R word or bit write (1401) framing.
 //! FX5 uses the Q layout (subcommands 0000/0001) over 3E only.
+//! Global labels (G3) use 041C/141B framing in `label`.
 //! This core does no I/O or configured-range lookup; the guest gates writes.
 //! 3E has no serial number, so the caller must match its responses by order.
 #![no_std]
@@ -15,6 +16,12 @@ pub use sd_basic::{basic_sd_count, plan_basic_sd, BasicArea, BasicEvidence, Poin
 
 mod q_zr;
 pub use q_zr::{decode_q_zr_count, plan_q_zr, QZrEvidence};
+
+mod label;
+pub use label::{
+    decode_label_read, encode_label_read, encode_label_write, label_read_data_len,
+    label_write_data_len, LabelData, LabelWrite, LABEL_SEND_DATA_LIMIT,
+};
 
 mod q_extension;
 pub use q_extension::{
@@ -241,6 +248,10 @@ impl UnitBufferSpan {
 pub enum RequestError {
     Count,
     DeviceNumber,
+    /// A label name is empty or longer than a u16 count of UTF-16 units.
+    LabelName,
+    /// A label request exceeds the 1920-byte send data limit.
+    TooLarge,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,7 +288,7 @@ fn check_span(series: Series, span: ReadSpan) -> Result<(), RequestError> {
     Ok(())
 }
 
-fn request_head(route: Route, data_length: u16) -> Vec<u8> {
+pub(crate) fn request_head(route: Route, data_length: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(27);
     match route.frame {
         Frame::E4 => {
@@ -501,7 +512,7 @@ pub fn decode_write_ack(route: Route, frame: &[u8]) -> Result<(), ResponseError>
 
 /// Parse a complete response to this request. The Hub owns stream framing and I/O.
 /// Even PLC refusals must echo the request's route, and with 4E its serial number.
-fn response_data(route: Route, frame: &[u8]) -> Result<&[u8], ResponseError> {
+pub(crate) fn response_data(route: Route, frame: &[u8]) -> Result<&[u8], ResponseError> {
     let header = route.frame.response_header_len();
     if frame.len() < header {
         return Err(ResponseError::Framing);
