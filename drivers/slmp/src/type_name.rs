@@ -1,6 +1,7 @@
 //! 0101/0000 Read Type Name (binary 4E or 3E). The lookup is deliberately limited
-//! to Q (ordinary, process, universal process), MELSEC-L and iQ-R/EN CPU pairs
-//! plus the two redundant-CPU wire-only pairs in the official model-code table.
+//! to Q (ordinary, process, universal process), MELSEC-L, iQ-R/EN, iQ-R process,
+//! SIL2 process and safety CPU, and MX-R pairs plus the two redundant-CPU
+//! wire-only pairs in the official model-code table.
 use alloc::{string::String, vec::Vec};
 
 use crate::{request_head, response_data, ResponseError, Route};
@@ -62,9 +63,9 @@ pub fn decode_type_name(route: Route, frame: &[u8]) -> Result<TypeName, Response
 }
 
 // SLMP Reference Manual pp. 139-141 (printed), Q, process, universal process,
-// MELSEC-L and iQ-R/EN entries plus Q25PRH/Q12PRH wire-only. Codes require an
-// exact listed name. Safety, remote, iQ-L, MX and the RCPU/0360H route fallback
-// stay unknown.
+// MELSEC-L, iQ-R/EN, iQ-R process/SIL2 process/safety and MX-R entries plus
+// Q25PRH/Q12PRH wire-only. Codes require an exact listed name. Remote, iQ-L and
+// the RCPU/0360H and MX-R/037EH route fallbacks stay unknown.
 fn classify(name: &str, code: u16) -> ModelFamily {
     const Q: &[(&str, u16)] = &[
         ("Q00JCPU", 0x0250),
@@ -136,6 +137,27 @@ fn classify(name: &str, code: u16) -> ModelFamily {
         ("R32ENCPU", 0x4808),
         ("R120CPU", 0x4804),
         ("R120ENCPU", 0x4809),
+        // Process CPU (G2b): same wire and SD table as standard R.
+        ("R08PCPU", 0x4841),
+        ("R16PCPU", 0x4842),
+        ("R32PCPU", 0x4843),
+        ("R120PCPU", 0x4844),
+        // SIL2 process CPU (G2b): standard R rules, but no S device.
+        ("R08PSFCPU", 0x4851),
+        ("R16PSFCPU", 0x4852),
+        ("R32PSFCPU", 0x4853),
+        ("R120PSFCPU", 0x4854),
+        // Safety CPU (G2b): standard R rules, but no S device.
+        ("R08SFCPU", 0x4891),
+        ("R16SFCPU", 0x4892),
+        ("R32SFCPU", 0x4893),
+        ("R120SFCPU", 0x4894),
+        // MX-R (G2b): standard R rules, but no S device.
+        ("MXR300-16", 0x48e9),
+        ("MXR300-32", 0x48ea),
+        ("MXR300-64", 0x48eb),
+        ("MXR500-128", 0x48ee),
+        ("MXR500-256", 0x48ef),
     ];
     if matches!((name, code), ("Q25PRHCPU", 0x004c) | ("Q12PRHCPU", 0x004b)) {
         // The 0101 table proves these pairs' Q identity, but not SD302's
