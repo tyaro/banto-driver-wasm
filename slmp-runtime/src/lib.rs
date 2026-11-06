@@ -1915,7 +1915,7 @@ mod tests {
             .is_none());
         let r_specs = [
             TagSpec {
-                address: "ZR1A".into(),
+                address: "ZR26".into(),
                 data_type: "u16".into(),
                 string_words: None,
             },
@@ -2108,10 +2108,11 @@ mod tests {
         let specs = [
             numeric("ZR10", "u16"),
             numeric("ZR11", "u16"), // adjacent, but the range is Unknown: not joined
-            numeric("ZR1A", "u32"),
-            numeric("ZRFFFFFF", "u16"),  // last 24-bit Q number
-            numeric("ZRFFFFFF", "u32"),  // spans past 24 bits: uncovered
-            numeric("ZR1000000", "u16"), // 25 bits: uncovered
+            numeric("ZR26", "u32"),
+            numeric("ZR16777215", "u16"), // last 24-bit Q number
+            numeric("ZR16777215", "u32"), // spans past 24 bits: uncovered
+            numeric("ZR16777216", "u16"), // 25 bits: uncovered
+            numeric("ZR1A", "u16"),       // hex letters are not decimal: uncovered
         ];
         let plans = driver
             .banto_driver_read()
@@ -2123,8 +2124,8 @@ mod tests {
             "one request per ZR tag; 24-bit overflow uncovered"
         );
         for (i, (number, points, body)) in [
-            ([0x10u8, 0, 0], 1u8, vec![0x34, 0x12]),
-            ([0x11, 0, 0], 1, vec![0x35, 0x12]),
+            ([0x0au8, 0, 0], 1u8, vec![0x34, 0x12]), // ZR10 = word 10 (decimal)
+            ([0x0b, 0, 0], 1, vec![0x35, 0x12]),
             ([0x1a, 0, 0], 2, vec![0x78, 0x56, 0x34, 0x12]),
             ([0xff, 0xff, 0xff], 1, vec![0xcd, 0xab]),
         ]

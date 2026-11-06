@@ -930,7 +930,7 @@ fn parse_read_address(
     } else if let Some(digits) = text.strip_prefix('W') {
         (Device::W, 16, digits)
     } else if let Some(digits) = text.strip_prefix("ZR") {
-        (Device::ZR, 16, digits)
+        (Device::ZR, 10, digits)
     } else if let Some(digits) = text.strip_prefix('Z') {
         (Device::Z, 10, digits)
     } else if let Some(digits) = text.strip_prefix("RD") {
@@ -1098,7 +1098,7 @@ fn canonical_read(device: Device, number: i64) -> Result<String, String> {
         Device::LCN => Ok(format!("LCN{number}")),
         Device::LCS => Ok(format!("LCS{number}")),
         Device::LCC => Ok(format!("LCC{number}")),
-        Device::ZR => Ok(format!("ZR{number:X}")),
+        Device::ZR => Ok(format!("ZR{number}")),
         Device::S => Ok(format!("S{number}")),
         Device::Z => Ok(format!("Z{number}")),
         Device::RD => Ok(format!("RD{number}")),
@@ -2738,7 +2738,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and hexadecimal ZR. Q ZR (hexadecimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and decimal ZR. Q ZR (decimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
             .into()
     }
 
@@ -3183,7 +3183,7 @@ mod tests {
         };
         assert!(checked_read_span(&q_ret, &r, PointCount::Unknown, PointCount::Unknown).is_err());
         let zr = TagSpec {
-            address: "ZR1a".into(),
+            address: "ZR26".into(),
             data_type: "u32".into(),
             string_words: None,
         };
@@ -3215,6 +3215,40 @@ mod tests {
                 "{name}"
             );
         }
+        // 2026-11-06 owner decision: ZR numbers are decimal on Q and R. Hex
+        // letters are refused; ZR10 is word 10, not 0x10.
+        for text in ["ZR1A", "ZR1a", "ZRFFFFFF", "ZRA"] {
+            assert!(parse_read_address(text, "u16", None).is_err(), "{text}");
+        }
+        for family_model in [&q, &r] {
+            let ten = TagSpec {
+                address: "ZR10".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            };
+            assert_eq!(
+                checked_read_span(&ten, family_model, PointCount::Unknown, PointCount::Unknown)
+                    .unwrap()
+                    .start,
+                10
+            );
+        }
+        // Q's 3-byte number: ZR16777215 is the last word, ZR16777216 is refused.
+        let zr_at = |address: &str| TagSpec {
+            address: address.into(),
+            data_type: "u16".into(),
+            string_words: None,
+        };
+        let unknown = (PointCount::Unknown, PointCount::Unknown);
+        assert_eq!(
+            parse_read_address("ZR16777215", "u16", None).unwrap().1,
+            0x00ff_ffff
+        );
+        assert_eq!(
+            parse_read_address("ZR16777216", "u16", None).unwrap().1,
+            0x0100_0000
+        );
+        assert!(checked_read_span(&zr_at("ZR16777215"), &q, unknown.0, unknown.1).is_ok());
         for (name, code) in [("Q00JCPU", 0x0250), ("Q00UJCPU", 0x0260)] {
             let mut named = model(ModelFamily::StandardQ);
             named.name = name.into();
@@ -3242,7 +3276,7 @@ mod tests {
         };
         assert!(parse_write_run(&[zr_write], WordOrder::LowHigh).is_err());
         assert!(
-            !<Component as address::Guest>::parse("ZR1A".into(), "u32".into(), None)
+            !<Component as address::Guest>::parse("ZR26".into(), "u32".into(), None)
                 .unwrap()
                 .writable_area
         );
@@ -3293,8 +3327,8 @@ mod tests {
             "D11.F"
         );
         assert_eq!(
-            <Component as address::Guest>::offset("ZR1A".into(), "u32".into(), None, 1).unwrap(),
-            "ZR1C"
+            <Component as address::Guest>::offset("ZR26".into(), "u32".into(), None, 1).unwrap(),
+            "ZR28"
         );
         for (text, kind) in [
             ("D0.G", "bit"),
@@ -3391,7 +3425,7 @@ mod tests {
             ("SM0", "bit", Device::SM, 0),
             ("SS0", "bit", Device::SS, 0),
             ("STS0", "bit", Device::STS, 0),
-            ("ZR10", "u16", Device::ZR, 0x10),
+            ("ZR10", "u16", Device::ZR, 10),
             ("L5", "bit", Device::L, 5),
         ] {
             let (d, n, _) = parse_read_address(text, kind, None).unwrap();

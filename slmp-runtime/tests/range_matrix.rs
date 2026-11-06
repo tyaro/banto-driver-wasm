@@ -408,7 +408,7 @@ fn standard_q_exact_bit_counts_and_internal_dw_prefixes() -> wasmtime::Result<()
             ("LTN0", "i32", "unsupported", NO_PATH),
             ("LCS0", "bit", "unsupported", NO_PATH),
             ("ZR0", "u16", "unknown", UNPROVEN),
-            ("ZRFFFFFF", "u16", "unknown", UNPROVEN),
+            ("ZR16777215", "u16", "unknown", UNPROVEN),
             ("S0", "bit", "unknown", UNPROVEN),
             ("Z0", "u16", "unknown", UNPROVEN),
             ("LZ0", "i32", "invalid", LZ_0403),
