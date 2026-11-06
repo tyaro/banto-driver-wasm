@@ -1,6 +1,6 @@
 //! 0101/0000 Read Type Name (binary 4E or 3E). The lookup is deliberately limited
-//! to ordinary Q and iQ-R/EN CPU pairs plus the narrow Q25PRH pair in
-//! the official model-code table.
+//! to Q (ordinary, process, universal process), MELSEC-L and iQ-R/EN CPU pairs
+//! plus the two redundant-CPU wire-only pairs in the official model-code table.
 use alloc::{string::String, vec::Vec};
 
 use crate::{request_head, response_data, ResponseError, Route};
@@ -9,7 +9,9 @@ use crate::{request_head, response_data, ResponseError, Route};
 pub enum ModelFamily {
     StandardQ,
     StandardR,
-    /// Exact Q25PRHCPU/004CH pair: Q wire and SD302 internal-D only.
+    /// Exact Q25PRHCPU/004CH and Q12PRHCPU/004BH redundant-CPU pairs: Q wire
+    /// and SD302/SD303 internal D/W only. Both pairs share the same read and
+    /// write rules (2026-11-06 owner decision).
     Q25PrhWireOnly,
     /// Valid 0101 data whose name/code pair is not in the supported table.
     Unknown,
@@ -59,9 +61,10 @@ pub fn decode_type_name(route: Route, frame: &[u8]) -> Result<TypeName, Response
     })
 }
 
-// SLMP Reference Manual pp. 139-141 (printed), ordinary Q and iQ-R/EN
-// entries plus Q25PRH wire-only. Codes require an exact listed name.
-// Other process, safety, remote, L, MX and the RCPU/0360H route fallback stay unknown.
+// SLMP Reference Manual pp. 139-141 (printed), Q, process, universal process,
+// MELSEC-L and iQ-R/EN entries plus Q25PRH/Q12PRH wire-only. Codes require an
+// exact listed name. Safety, remote, iQ-L, MX and the RCPU/0360H route fallback
+// stay unknown.
 fn classify(name: &str, code: u16) -> ModelFamily {
     const Q: &[(&str, u16)] = &[
         ("Q00JCPU", 0x0250),
@@ -72,6 +75,27 @@ fn classify(name: &str, code: u16) -> ModelFamily {
         ("Q06HCPU", 0x0042),
         ("Q12HCPU", 0x0043),
         ("Q25HCPU", 0x0044),
+        // Process CPU: standard non-U Q (G2a). Codes are shared with QnH.
+        ("Q02PHCPU", 0x0041),
+        ("Q06PHCPU", 0x0042),
+        ("Q12PHCPU", 0x0043),
+        ("Q25PHCPU", 0x0044),
+        // Universal process CPU: QnU (G2a). Codes are shared with QnUDV.
+        ("Q04UDPVCPU", 0x0367),
+        ("Q06UDPVCPU", 0x0368),
+        ("Q13UDPVCPU", 0x036a),
+        ("Q26UDPVCPU", 0x036c),
+        // MELSEC-L: Q wire and the basic SD290-304 table only (G2a).
+        ("L02SCPU", 0x0543),
+        ("L02SCPU-P", 0x0543),
+        ("L02CPU", 0x0541),
+        ("L02CPU-P", 0x0541),
+        ("L06CPU", 0x0544),
+        ("L06CPU-P", 0x0544),
+        ("L26CPU", 0x0545),
+        ("L26CPU-P", 0x0545),
+        ("L26CPU-BT", 0x0542),
+        ("L26CPU-PBT", 0x0542),
         ("Q00UJCPU", 0x0260),
         ("Q00UCPU", 0x0261),
         ("Q01UCPU", 0x0262),
@@ -113,8 +137,8 @@ fn classify(name: &str, code: u16) -> ModelFamily {
         ("R120CPU", 0x4804),
         ("R120ENCPU", 0x4809),
     ];
-    if name == "Q25PRHCPU" && code == 0x004c {
-        // The 0101 table proves this pair's Q identity, but not SD302's
+    if matches!((name, code), ("Q25PRHCPU", 0x004c) | ("Q12PRHCPU", 0x004b)) {
+        // The 0101 table proves these pairs' Q identity, but not SD302's
         // applicability. Never classify it as StandardQ for SD planning.
         ModelFamily::Q25PrhWireOnly
     } else if Q.contains(&(name, code)) {

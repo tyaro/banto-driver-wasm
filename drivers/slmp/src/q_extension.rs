@@ -24,7 +24,10 @@ pub struct QExtensionEvidence {
 }
 
 /// Plan one two-word SD read only for the documented model and version.
-/// QnUDPV models remain unsupported by the current 0101 classifier.
+/// QnUDPV is classified (G2a) and is treated exactly like QnUDV: it shares the
+/// SD282-285 fast D/W pair with QnUDV (2026-11-06 owner decision) as well as
+/// SD286-289. MELSEC-L (codes 0x0541-0x0545) is not QnU and never gets a plan
+/// here.
 pub fn plan_q_extension(
     model: &TypeName,
     area: QExtensionArea,
@@ -123,5 +126,9 @@ fn is_recognized_qnudv(model: &TypeName) -> bool {
             | ("Q06UDVCPU", 0x0368)
             | ("Q13UDVCPU", 0x036a)
             | ("Q26UDVCPU", 0x036c)
+            | ("Q04UDPVCPU", 0x0367)
+            | ("Q06UDPVCPU", 0x0368)
+            | ("Q13UDPVCPU", 0x036a)
+            | ("Q26UDPVCPU", 0x036c)
     )
 }

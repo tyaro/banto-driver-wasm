@@ -46,6 +46,15 @@ fn q00uj_older_q_r_and_unknown_models_never_use_this_map() {
         ("Q00JCPU", 0x0250),
         ("R04CPU", 0x4800),
         ("RCPU", 0x0360),
+        // G2a: MELSEC-L and the redundant CPUs never use the QnU map.
+        ("L02SCPU", 0x0543),
+        ("L02CPU", 0x0541),
+        ("L26CPU-BT", 0x0542),
+        ("L06CPU-P", 0x0544),
+        ("L26CPU", 0x0545),
+        ("Q12PRHCPU", 0x004b),
+        // G2a: non-U process CPU has no SD306-307 either.
+        ("Q12PHCPU", 0x0043),
     ] {
         let model = model(name, code);
         assert_eq!(plan_q_zr(&model, confirmed()), None);
@@ -106,4 +115,13 @@ fn missing_or_partial_sd_pair_and_sd647_single_word_cannot_set_zr_limit() {
         decode_q_zr_count(&q, confirmed(), Some(&[64])),
         PointCount::Unknown
     );
+}
+
+#[test]
+fn g2a_qnudpv_uses_the_qnu_zr_map() {
+    for (name, code) in [("Q04UDPVCPU", 0x0367), ("Q26UDPVCPU", 0x036c)] {
+        let model = model(name, code);
+        let span = plan_q_zr(&model, confirmed()).unwrap();
+        assert_eq!((span.start, span.count), (306, 2));
+    }
 }

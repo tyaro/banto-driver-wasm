@@ -243,3 +243,53 @@ fn model_route_firmware_and_missing_reads_keep_counts_unknown() {
         PointCount::Exact(128)
     );
 }
+
+#[test]
+fn g2a_l_and_qnph_use_the_q_basic_table_and_q12prh_only_sd302_303() {
+    for (name, code) in [
+        ("L02SCPU", 0x0543),
+        ("L02CPU-P", 0x0541),
+        ("L06CPU", 0x0544),
+        ("L26CPU", 0x0545),
+        ("L26CPU-PBT", 0x0542),
+        ("Q06PHCPU", 0x0042),
+        ("Q06UDPVCPU", 0x0368),
+    ] {
+        let q = model(name, code);
+        assert_eq!(q.family, ModelFamily::StandardQ, "{name}");
+        for (area, sd) in [
+            (A::X, 290),
+            (A::M, 292),
+            (A::DInternal, 302),
+            (A::WInternal, 303),
+            (A::SW, 304),
+        ] {
+            let plan = plan_basic_sd(&q, area).unwrap();
+            assert_eq!(
+                (plan.device, plan.start, plan.count),
+                (banto_slmp_read_core::Device::SD, sd, 1),
+                "{name}"
+            );
+        }
+        for area in [A::D, A::W, A::ZR, A::LT] {
+            assert_eq!(plan_basic_sd(&q, area), None, "{name}");
+        }
+        assert_eq!(
+            basic_sd_count(&q, A::DInternal, confirmed(), Some(&[12288])),
+            PointCount::Exact(12288),
+            "{name}"
+        );
+    }
+    let q12 = model("Q12PRHCPU", 0x004b);
+    assert_eq!(q12.family, ModelFamily::Q25PrhWireOnly);
+    for (area, sd) in [(A::DInternal, 302), (A::WInternal, 303)] {
+        let plan = plan_basic_sd(&q12, area).unwrap();
+        assert_eq!(
+            (plan.device, plan.start, plan.count),
+            (banto_slmp_read_core::Device::SD, sd, 1)
+        );
+    }
+    for area in [A::X, A::M, A::SW, A::D, A::ZR] {
+        assert_eq!(plan_basic_sd(&q12, area), None);
+    }
+}

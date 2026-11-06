@@ -1294,7 +1294,9 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
 /// ZR is a read-only, range-Unknown, one-tag read on standard R and on
 /// standard Q CPUs that have a file register. Q00JCPU (no standard RAM) and
 /// Q00UJCPU (no file register) are matched by the exact name/code pair the
-/// type-name classifier uses. Q25PRH has no ZR path. SD306-307 is not read.
+/// type-name classifier uses. Q25PRH/Q12PRH have no ZR path. SD306-307 is not read.
+/// MELSEC-L is classified as standard Q and is treated exactly like it
+/// (2026-11-06 owner decision).
 fn zr_read_allowed(model: &TypeName) -> bool {
     match model.family {
         ModelFamily::StandardR => true,
@@ -1304,6 +1306,17 @@ fn zr_read_allowed(model: &TypeName) -> bool {
         ),
         _ => false,
     }
+}
+
+/// The redundant-CPU pairs Q25PRHCPU/004CH and Q12PRHCPU/004BH. They share the
+/// wire-only family and exactly the same read and write rules (2026-11-06
+/// owner decision).
+fn is_redundant_q_pair(model: &TypeName) -> bool {
+    model.family == ModelFamily::Q25PrhWireOnly
+        && matches!(
+            (model.name.as_str(), model.code),
+            ("Q25PRHCPU", 0x004c) | ("Q12PRHCPU", 0x004b)
+        )
 }
 
 /// `U<h>\G<n>` has a path on standard Q (`U0`-`UFF`) and standard R (also the
@@ -2126,9 +2139,10 @@ fn write_next_on(
         Phase::Ready { model, count } => (model.clone(), *count),
         _ => return Ok(rejected_write_count(items.len(), "discovery is incomplete")),
     };
-    let q25prh = model.family == ModelFamily::Q25PrhWireOnly
-        && model.name == "Q25PRHCPU"
-        && model.code == 0x004c;
+    // The redundant-CPU pairs Q25PRHCPU/004CH and Q12PRHCPU/004BH share one
+    // write path: the SD302-proven internal D map and the D3010 test-write
+    // opt-in (2026-11-06 owner decision).
+    let q25prh = is_redundant_q_pair(&model);
     let q25prh_test = q25prh && conn.q25prh_test_write_enabled;
     if !matches!(
         model.family,
@@ -6060,6 +6074,96 @@ mod tests {
             PointCount::Exact(0x20),
         );
         assert_rejected(&disabled, &[string_write("D200", 1, b"AB")], "disabled");
+    }
+
+    fn named(family: ModelFamily, name: &str, code: u16) -> TypeName {
+        let mut m = model(family);
+        m.name = name.into();
+        m.code = code;
+        m
+    }
+
+    #[test]
+    fn g2a_l_reads_zr_like_standard_q_and_keeps_unit_buffer_limits() {
+        let zr = TagSpec {
+            address: "ZR10".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        };
+        let none = (PointCount::Unknown, PointCount::Unknown);
+        for (name, code) in [
+            ("L02SCPU", 0x0543),
+            ("L02CPU-P", 0x0541),
+            ("L06CPU", 0x0544),
+            ("L26CPU", 0x0545),
+            ("L26CPU-PBT", 0x0542),
+        ] {
+            let l = named(ModelFamily::StandardQ, name, code);
+            assert!(checked_read_span(&zr, &l, none.0, none.1).is_ok(), "{name}");
+            let ug = TagSpec {
+                address: "UFF\\G7".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            };
+            assert!(
+                checked_read_target(&ug, &l, none.0, none.1, None).is_ok(),
+                "{name}"
+            );
+            let beyond = TagSpec {
+                address: "U3E0\\G7".into(),
+                data_type: "u16".into(),
+                string_words: None,
+            };
+            assert!(
+                checked_read_target(&beyond, &l, none.0, none.1, None).is_err(),
+                "{name}"
+            );
+        }
+        for (name, code) in [("Q06PHCPU", 0x0042), ("Q26UDPVCPU", 0x036c)] {
+            let q = named(ModelFamily::StandardQ, name, code);
+            assert!(checked_read_span(&zr, &q, none.0, none.1).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn g2a_q12prh_test_write_matches_q25prh() {
+        let build = |name: &str, code: u16| {
+            let conn = rmw_conn(
+                &[
+                    ("d_u16_write_mode", "disabled"),
+                    ("q25prh_d3010_3013_test_write", "enabled"),
+                ],
+                ModelFamily::Q25PrhWireOnly,
+                PointCount::Unknown,
+                PointCount::Unknown,
+            );
+            if let Phase::Ready { model, .. } = &mut *conn.phase.borrow_mut() {
+                model.name = name.into();
+                model.code = code;
+            }
+            conn.q25prh_internal_d_count.set(PointCount::Exact(5000));
+            conn
+        };
+        let items: Vec<_> = (3010..3014)
+            .map(|n| word_write(&format!("D{n}"), 1))
+            .collect();
+        let mut frames = Vec::new();
+        for (name, code) in [("Q25PRHCPU", 0x004c), ("Q12PRHCPU", 0x004b)] {
+            let conn = build(name, code);
+            let Ok(write_v1::WriteProgress::Send(plan)) = write_next_on(&conn, items.clone(), None)
+            else {
+                panic!("{name}: test write must be sent")
+            };
+            assert_eq!(plan.covers, all_covers(4), "{name}");
+            frames.push(plan.step.send);
+            // Anything but exactly D3010..D3013/u16 is still refused.
+            assert_rejected(&build(name, code), &items[..2], name);
+            // Without SD302 proof of the span the write is refused.
+            let short = build(name, code);
+            short.q25prh_internal_d_count.set(PointCount::Exact(3012));
+            assert_rejected(&short, &items, name);
+        }
+        assert_eq!(frames[0], frames[1]);
     }
 }
 

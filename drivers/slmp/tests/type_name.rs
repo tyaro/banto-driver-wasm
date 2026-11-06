@@ -129,16 +129,6 @@ fn unknown_pairs_remain_unknown_with_exact_name_and_code_preserved() {
     assert_eq!(parsed.code, 0x0360);
     assert_eq!(parsed.family, ModelFamily::Unknown);
 
-    let mut special_q = Q02UCPU;
-    special_q[15..31].copy_from_slice(b"Q02PHCPU        ");
-    special_q[31..33].copy_from_slice(&[0x41, 0x00]);
-    assert_eq!(
-        decode_type_name(Route::default(), &special_q)
-            .unwrap()
-            .family,
-        ModelFamily::Unknown
-    );
-
     let mut special_r = Q02UCPU;
     special_r[15..31].copy_from_slice(b"R08PCPU         ");
     special_r[31..33].copy_from_slice(&[0x41, 0x48]);
@@ -224,4 +214,92 @@ fn request_uses_the_selected_route_and_keeps_command_fixed() {
         &[0x54, 0, 0x34, 0x12, 0, 0, 2, 0xfe, 0x23, 1, 5, 6, 0, 0x99, 0]
     );
     assert_eq!(&req[15..], &[1, 1, 0, 0]);
+}
+
+fn classify_pair(name: &str, code: u16) -> ModelFamily {
+    let mut frame = Q02UCPU;
+    frame[15..31].fill(b' ');
+    frame[15..15 + name.len()].copy_from_slice(name.as_bytes());
+    frame[31..33].copy_from_slice(&code.to_le_bytes());
+    let parsed = decode_type_name(Route::default(), &frame).unwrap();
+    assert_eq!(parsed.name, name);
+    assert_eq!(parsed.code, code);
+    parsed.family
+}
+
+#[test]
+fn g2a_process_universal_process_and_l_pairs_are_standard_q() {
+    // SLMP Reference Manual SH-080956ENG N, printed p.139.
+    for (name, code) in [
+        ("Q02PHCPU", 0x0041),
+        ("Q06PHCPU", 0x0042),
+        ("Q12PHCPU", 0x0043),
+        ("Q25PHCPU", 0x0044),
+        ("Q04UDPVCPU", 0x0367),
+        ("Q06UDPVCPU", 0x0368),
+        ("Q13UDPVCPU", 0x036a),
+        ("Q26UDPVCPU", 0x036c),
+        ("L02SCPU", 0x0543),
+        ("L02SCPU-P", 0x0543),
+        ("L02CPU", 0x0541),
+        ("L02CPU-P", 0x0541),
+        ("L06CPU", 0x0544),
+        ("L06CPU-P", 0x0544),
+        ("L26CPU", 0x0545),
+        ("L26CPU-P", 0x0545),
+        ("L26CPU-BT", 0x0542),
+        ("L26CPU-PBT", 0x0542),
+    ] {
+        assert_eq!(classify_pair(name, code), ModelFamily::StandardQ, "{name}");
+    }
+}
+
+#[test]
+fn g2a_q12prh_pair_is_wire_only_like_q25prh() {
+    assert_eq!(
+        classify_pair("Q12PRHCPU", 0x004b),
+        ModelFamily::Q25PrhWireOnly
+    );
+    assert_eq!(
+        classify_pair("Q25PRHCPU", 0x004c),
+        ModelFamily::Q25PrhWireOnly
+    );
+}
+
+#[test]
+fn g2a_shared_code_name_mismatches_stay_unknown_and_old_pairs_are_unchanged() {
+    for (name, code) in [
+        ("Q02PHCPU", 0x0042),
+        ("Q06PHCPU", 0x0041),
+        ("Q02PHCPU", 0x0263),
+        ("Q04UDPVCPU", 0x0368),
+        ("Q06UDPVCPU", 0x0367),
+        ("Q04UDPVCPU", 0x0366),
+        ("L02CPU", 0x0543),
+        ("L02SCPU", 0x0541),
+        ("L26CPU", 0x0542),
+        ("L26CPU-BT", 0x0545),
+        ("L02CPU", 0x0263),
+        ("Q12PRHCPU", 0x004c),
+        ("Q25PRHCPU", 0x004b),
+        ("Q12PRHCPU", 0x0043),
+        // Not in the supported table.
+        ("L04HCPU", 0x48c0),
+        ("QS001CPU", 0x0230),
+        ("L02CPU-X", 0x0541),
+    ] {
+        assert_eq!(classify_pair(name, code), ModelFamily::Unknown, "{name}");
+    }
+    for (name, code) in [
+        ("Q02HCPU", 0x0041),
+        ("Q06HCPU", 0x0042),
+        ("Q12HCPU", 0x0043),
+        ("Q25HCPU", 0x0044),
+        ("Q04UDVCPU", 0x0367),
+        ("Q06UDVCPU", 0x0368),
+        ("Q13UDVCPU", 0x036a),
+        ("Q26UDVCPU", 0x036c),
+    ] {
+        assert_eq!(classify_pair(name, code), ModelFamily::StandardQ, "{name}");
+    }
 }
