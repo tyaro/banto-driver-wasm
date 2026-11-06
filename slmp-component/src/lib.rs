@@ -2355,12 +2355,14 @@ fn label_read_step(route: Route, labels: &[Label]) -> Result<session::Step, Fata
 }
 
 /// Pack readable label tags, in input order, into 041C requests that each
-/// fit the 1920-byte send data limit. Unparsable labels stay uncovered.
+/// fit the 1920-byte send data limit and whose response allowance fits the
+/// u16 data-length field. Unparsable labels stay uncovered.
 fn plan_label_groups(specs: &[TagSpec]) -> Vec<PendingRead> {
     let mut groups = Vec::new();
     let mut covers: Vec<u32> = Vec::new();
     let mut labels: Vec<Label> = Vec::new();
     let mut units: Vec<usize> = Vec::new();
+    let mut allowances: Vec<u32> = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
         if !is_label(&spec.address) {
             continue;
@@ -2372,20 +2374,25 @@ fn plan_label_groups(specs: &[TagSpec]) -> Vec<PendingRead> {
             continue;
         };
         let name_units = label.utf16().len();
+        let allowance = label::read_allowance(&label);
         if !labels.is_empty()
             && (labels.len() == usize::from(u16::MAX)
                 || label_read_data_len(units.iter().copied().chain([name_units]))
-                    > LABEL_SEND_DATA_LIMIT)
+                    > LABEL_SEND_DATA_LIMIT
+                || label::read_response_data_len(allowances.iter().copied().chain([allowance]))
+                    > u32::from(u16::MAX))
         {
             groups.push(PendingRead::Labels {
                 covers: std::mem::take(&mut covers),
                 labels: std::mem::take(&mut labels),
             });
             units.clear();
+            allowances.clear();
         }
         covers.push(cover);
         labels.push(label);
         units.push(name_units);
+        allowances.push(allowance);
     }
     if !labels.is_empty() {
         groups.push(PendingRead::Labels { covers, labels });
@@ -7637,6 +7644,35 @@ mod tests {
             1920
         );
         assert_eq!(plans[1].covers, vec![2]);
+    }
+
+    #[test]
+    fn g3_read_splits_labels_at_the_u16_response_length_field() {
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        // 254 two-char names: the request is small (about 1.5 KB) but the
+        // response allowance (4 + 256 x 2 bytes each) overflows the u16 field.
+        let specs = (0..254)
+            .map(|i| TagSpec {
+                address: format!(
+                    "@{}{}",
+                    (b'A' + (i / 26) as u8) as char,
+                    (b'a' + (i % 26) as u8) as char
+                ),
+                data_type: "string".into(),
+                string_words: Some(128),
+            })
+            .collect::<Vec<_>>();
+        let plans = plan_on(&conn, specs).unwrap();
+        assert!(plans.len() > 1, "{} frame(s) planned", plans.len());
+        let covered = plans
+            .iter()
+            .flat_map(|plan| plan.covers.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(covered, (0..254).collect::<Vec<u32>>());
+        let adjust = Frame::E4.length_adjust() as u32;
+        for plan in &plans {
+            assert!(plan.step.max_len - adjust <= u32::from(u16::MAX));
+        }
     }
 
     #[test]

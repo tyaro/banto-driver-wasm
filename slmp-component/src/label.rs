@@ -350,11 +350,23 @@ pub(super) fn parsed_label(label: &Label) -> address::Parsed {
 
 /// Response size bound for a 041C of these labels (see `MAX_LABEL_DATA`).
 pub(super) fn read_max_len(frame: Frame, labels: &[Label]) -> u32 {
-    let per_label = labels
-        .iter()
-        .map(|label| 4 + (label.ty.data_len() as u32).max(MAX_LABEL_DATA))
-        .sum::<u32>();
+    let per_label = labels.iter().map(read_allowance).sum::<u32>();
     frame.response_header_len() as u32 + 2 + per_label
+}
+
+/// Per-label response allowance of a 041C: 4 header bytes plus the larger of
+/// the declared data length and `MAX_LABEL_DATA`, so a type-mismatched label
+/// still fits and is reported per item. Shared by `read_max_len` and the
+/// request grouping so the two cannot drift.
+pub(super) fn read_allowance(label: &Label) -> u32 {
+    4 + (label.ty.data_len() as u32).max(MAX_LABEL_DATA)
+}
+
+/// Response data length (the u16 header field) of a 041C of labels with these
+/// allowances. `response_data` counts the field as everything after it, so it
+/// includes the 2-byte end code: 2 (end code) + 2 (label count) + allowances.
+pub(super) fn read_response_data_len(allowances: impl IntoIterator<Item = u32>) -> u32 {
+    4 + allowances.into_iter().sum::<u32>()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
