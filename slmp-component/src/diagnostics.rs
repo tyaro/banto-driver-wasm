@@ -26,25 +26,39 @@ fn requested_bit_count(specs: &[TagSpec], family: ModelFamily) -> bool {
 }
 
 fn uses_bit_sd(family: ModelFamily, device: Device) -> bool {
-    (matches!(family, ModelFamily::StandardQ | ModelFamily::StandardR)
-        && matches!(device, Device::M | Device::Y | Device::L | Device::B))
-        || (family == ModelFamily::StandardQ && device == Device::X)
-        || (family == ModelFamily::StandardR && matches!(device, Device::SB | Device::F))
+    match family {
+        ModelFamily::StandardQ => matches!(
+            device,
+            Device::M | Device::Y | Device::L | Device::B | Device::X
+        ),
+        ModelFamily::StandardR => matches!(
+            device,
+            Device::M | Device::Y | Device::L | Device::B | Device::SB | Device::F
+        ),
+        // FX5 X/Y have no read path, so their counts are not used.
+        ModelFamily::Fx5 => matches!(
+            device,
+            Device::M | Device::L | Device::B | Device::SB | Device::F
+        ),
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => false,
+    }
 }
 
-fn bit_count_span(model: &TypeName) -> Option<ReadSpan> {
+/// The one bounded bit-count SD read of a family: Q SD290-294, and the
+/// SD262-275 pairs of R and FX5 (Y, M, B, SB, F, an unused pair, L).
+pub(super) fn bit_count_span(model: &TypeName) -> Option<ReadSpan> {
     match model.family {
         ModelFamily::StandardQ => Some(ReadSpan {
             device: Device::SD,
             start: 290,
             count: 5,
         }),
-        ModelFamily::StandardR => Some(ReadSpan {
+        ModelFamily::StandardR | ModelFamily::Fx5 => Some(ReadSpan {
             device: Device::SD,
             start: 262,
             count: 14,
         }),
-        _ => None,
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => None,
     }
 }
 
@@ -53,35 +67,44 @@ pub(super) fn update_bit_counts(conn: &SlmpConnection, model: &TypeName, words: 
         route_confirmed: true,
         r_firmware: None,
     };
-    let counts = if model.family == ModelFamily::StandardQ {
-        [
-            basic_sd_count(model, BasicArea::M, evidence, words.get(2..3)),
-            basic_sd_count(model, BasicArea::Y, evidence, words.get(1..2)),
-            basic_sd_count(model, BasicArea::L, evidence, words.get(3..4)),
-            basic_sd_count(model, BasicArea::B, evidence, words.get(4..5)),
-        ]
-    } else {
-        [
-            basic_sd_count(model, BasicArea::M, evidence, words.get(2..4)),
-            basic_sd_count(model, BasicArea::Y, evidence, words.get(0..2)),
-            basic_sd_count(model, BasicArea::L, evidence, words.get(12..14)),
-            basic_sd_count(model, BasicArea::B, evidence, words.get(4..6)),
-        ]
+    let (counts, diagnostic_counts) = match model.family {
+        ModelFamily::StandardQ => (
+            [
+                basic_sd_count(model, BasicArea::M, evidence, words.get(2..3)),
+                basic_sd_count(model, BasicArea::Y, evidence, words.get(1..2)),
+                basic_sd_count(model, BasicArea::L, evidence, words.get(3..4)),
+                basic_sd_count(model, BasicArea::B, evidence, words.get(4..5)),
+            ],
+            [
+                basic_sd_count(model, BasicArea::X, evidence, words.get(0..1)),
+                PointCount::Unknown,
+                PointCount::Unknown,
+            ],
+        ),
+        // The FX5 SD262-275 layout matches R for these fields. FX5 Y has no
+        // read or write path, so its count stays Unknown.
+        ModelFamily::StandardR | ModelFamily::Fx5 => (
+            [
+                basic_sd_count(model, BasicArea::M, evidence, words.get(2..4)),
+                if model.family == ModelFamily::Fx5 {
+                    PointCount::Unknown
+                } else {
+                    basic_sd_count(model, BasicArea::Y, evidence, words.get(0..2))
+                },
+                basic_sd_count(model, BasicArea::L, evidence, words.get(12..14)),
+                basic_sd_count(model, BasicArea::B, evidence, words.get(4..6)),
+            ],
+            [
+                PointCount::Unknown,
+                basic_sd_count(model, BasicArea::SB, evidence, words.get(6..8)),
+                basic_sd_count(model, BasicArea::F, evidence, words.get(8..10)),
+            ],
+        ),
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => {
+            ([PointCount::Unknown; 4], [PointCount::Unknown; 3])
+        }
     };
     conn.bit_counts.set(counts);
-    let diagnostic_counts = if model.family == ModelFamily::StandardQ {
-        [
-            basic_sd_count(model, BasicArea::X, evidence, words.get(0..1)),
-            PointCount::Unknown,
-            PointCount::Unknown,
-        ]
-    } else {
-        [
-            PointCount::Unknown,
-            basic_sd_count(model, BasicArea::SB, evidence, words.get(6..8)),
-            basic_sd_count(model, BasicArea::F, evidence, words.get(8..10)),
-        ]
-    };
     conn.diagnostic_bit_counts.set(diagnostic_counts);
 }
 
@@ -90,6 +113,7 @@ fn family_name(family: ModelFamily) -> &'static str {
         ModelFamily::StandardQ => "standard-q",
         ModelFamily::StandardR => "standard-r",
         ModelFamily::Q25PrhWireOnly => "q25prh-wire-only",
+        ModelFamily::Fx5 => "fx5",
         ModelFamily::Unknown => "unknown",
     }
 }
@@ -126,7 +150,7 @@ fn area_counts(
 ) -> Vec<diagnostics_v1::AreaCount> {
     let family = model.family;
     let (d_scope, d_source, d_value) = match family {
-        ModelFamily::StandardR => ("total", "SD280-281", d_count),
+        ModelFamily::StandardR | ModelFamily::Fx5 => ("total", "SD280-281", d_count),
         ModelFamily::StandardQ => ("internal", "SD302", d_count),
         ModelFamily::Q25PrhWireOnly => (
             "internal-only; general D range unknown",
@@ -136,7 +160,7 @@ fn area_counts(
         ModelFamily::Unknown => ("unknown", "", PointCount::Unknown),
     };
     let (w_scope, w_source) = match family {
-        ModelFamily::StandardR => ("total", "SD282-283"),
+        ModelFamily::StandardR | ModelFamily::Fx5 => ("total", "SD282-283"),
         ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly => ("internal", "SD303"),
         ModelFamily::Unknown => ("unknown", ""),
     };
@@ -164,22 +188,40 @@ fn area_counts(
         "sd-unavailable-or-inapplicable"
     };
     let bit = conn.bit_counts.get();
+    // `None` leaves out an area the family has no read path for (FX5 Y).
     let (sources, scope) = match family {
-        ModelFamily::StandardQ => (["SD292", "SD291", "SD293", "SD294"], "configured-prefix"),
+        ModelFamily::StandardQ => (
+            [Some("SD292"), Some("SD291"), Some("SD293"), Some("SD294")],
+            "configured-prefix",
+        ),
         ModelFamily::StandardR => (
-            ["SD264-265", "SD262-263", "SD274-275", "SD266-267"],
+            [
+                Some("SD264-265"),
+                Some("SD262-263"),
+                Some("SD274-275"),
+                Some("SD266-267"),
+            ],
             "total",
         ),
-        _ => (["", "", "", ""], "unknown"),
+        ModelFamily::Fx5 => (
+            [
+                Some("SD264-265"),
+                None,
+                Some("SD274-275"),
+                Some("SD266-267"),
+            ],
+            "total",
+        ),
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => {
+            ([Some(""), Some(""), Some(""), Some("")], "unknown")
+        }
     };
     for (index, area) in ["M", "Y", "L", "B"].iter().enumerate() {
+        let Some(source) = sources[index] else {
+            continue;
+        };
         result.push(area_count(
-            area,
-            "bit",
-            scope,
-            sources[index],
-            bit[index],
-            bit_reason,
+            area, "bit", scope, source, bit[index], bit_reason,
         ));
     }
     let extra = conn.diagnostic_bit_counts.get();
@@ -187,7 +229,7 @@ fn area_counts(
         ModelFamily::StandardQ => result.push(area_count(
             "X", "bit", "total", "SD290", extra[0], bit_reason,
         )),
-        ModelFamily::StandardR => {
+        ModelFamily::StandardR | ModelFamily::Fx5 => {
             result.push(area_count(
                 "SB",
                 "bit",
@@ -205,7 +247,21 @@ fn area_counts(
                 bit_reason,
             ));
         }
-        _ => {}
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => {}
+    }
+    if family == ModelFamily::Fx5 {
+        result.push(area_count(
+            "R",
+            "word",
+            "total",
+            "SD304-305",
+            conn.fx5_r_count.get(),
+            if conn.fx5_r_sd_refused.get() {
+                "sd-refused"
+            } else {
+                "sd-unavailable-or-inapplicable"
+            },
+        ));
     }
     result
 }
@@ -239,35 +295,39 @@ fn assess_tag_span(
     assess_d_span(model, count, number, points)
 }
 
-/// Same-connection count for a bit area whose SD evidence this guest can hold.
-/// `None` means the area has no such evidence path for this family.
-fn bit_area_count(
-    conn: &SlmpConnection,
-    family: ModelFamily,
-    device: Device,
-) -> Option<PointCount> {
+/// Same-connection count for a bit area, or the FX5 file register R, whose SD
+/// evidence this guest holds outside the D/W handshake counts. `None` means
+/// the area has no such evidence path for this family.
+fn sd_area_count(conn: &SlmpConnection, family: ModelFamily, device: Device) -> Option<PointCount> {
+    let sb_f = matches!(family, ModelFamily::StandardR | ModelFamily::Fx5);
     match device {
         Device::X if family == ModelFamily::StandardQ => Some(conn.diagnostic_bit_counts.get()[0]),
-        Device::SB if family == ModelFamily::StandardR => Some(conn.diagnostic_bit_counts.get()[1]),
-        Device::F if family == ModelFamily::StandardR => Some(conn.diagnostic_bit_counts.get()[2]),
+        Device::SB if sb_f => Some(conn.diagnostic_bit_counts.get()[1]),
+        Device::F if sb_f => Some(conn.diagnostic_bit_counts.get()[2]),
+        Device::R if family == ModelFamily::Fx5 => Some(conn.fx5_r_count.get()),
         Device::M | Device::Y | Device::L | Device::B => Some(write_bit_count(conn, device)),
         _ => None,
     }
 }
 
-/// Read planning skips a bit tag that same-connection SD evidence proves is
-/// beyond an exact configured count. Missing or prefix-only evidence still
-/// permits the explicit one-tag read.
-pub(super) fn bit_span_outside(conn: &SlmpConnection, model: &TypeName, span: ReadSpan) -> bool {
-    bit_area_count(conn, model.family, span.device).is_some_and(|count| {
+/// Read planning skips a bit (or FX5 R) tag that same-connection SD evidence
+/// proves is beyond an exact configured count. Missing or prefix-only evidence
+/// still permits the explicit one-tag read.
+pub(super) fn sd_span_outside(conn: &SlmpConnection, model: &TypeName, span: ReadSpan) -> bool {
+    sd_area_count(conn, model.family, span.device).is_some_and(|count| {
         assess_tag_span(model, span.device, count, span.start, span.count)
             == RangeAssessment::VerifiedOutside
     })
 }
 
+/// Reason a known FX5 model has no usable connection: it answered 0101, but
+/// the frame is not 3E or the destination is not its own station.
+const FX5_ROUTE_REASON: &str = "fx5-requires-3e-own-station";
+
 fn tag_diagnostic(
     conn: &SlmpConnection,
     model: Option<&TypeName>,
+    blocked: Option<&str>,
     d_count: PointCount,
     spec: &TagSpec,
 ) -> diagnostics_v1::TagDiagnostic {
@@ -282,8 +342,9 @@ fn tag_diagnostic(
             Some(model) if model.family == ModelFamily::Unknown => {
                 TagVerdict::Unknown("unsupported-model-name-code-pair".into())
             }
+            Some(_) if blocked.is_some() => TagVerdict::Unknown(blocked.unwrap_or_default().into()),
             Some(model) => {
-                let count = bit_area_count(conn, model.family, device)
+                let count = sd_area_count(conn, model.family, device)
                     .unwrap_or_else(|| read_count(device, d_count, conn.w_count.get()));
                 let range = if model.family == ModelFamily::Q25PrhWireOnly && device == Device::W {
                     if count_guarantees_span(count, number, kind.points()) {
@@ -327,6 +388,9 @@ fn tag_diagnostic(
                             TagVerdict::Unknown("q25prh-general-range-unconfirmed".into())
                         } else if (conn.bit_sd_refused.get() && uses_bit_sd(model.family, device))
                             || (conn.dw_sd_refused.get() && matches!(device, Device::D | Device::W))
+                            || (conn.fx5_r_sd_refused.get()
+                                && model.family == ModelFamily::Fx5
+                                && device == Device::R)
                         {
                             TagVerdict::Unknown("sd-refused".into())
                         } else {
@@ -344,24 +408,30 @@ fn tag_diagnostic(
 }
 
 fn report(conn: &SlmpConnection, specs: &[TagSpec]) -> diagnostics_v1::Report {
-    let (model, d_count) = match &*conn.phase.borrow() {
-        Phase::Ready { model, count } => (Some(model.clone()), *count),
-        Phase::NoRange(model) => (model.clone(), PointCount::Unknown),
-        _ => (None, PointCount::Unknown),
+    let (model, d_count, blocked) = match &*conn.phase.borrow() {
+        Phase::Ready { model, count } => (Some(model.clone()), *count, None),
+        // Only FX5 among the known families stops at NoRange (frame/route).
+        Phase::NoRange(Some(model)) if model.family == ModelFamily::Fx5 => (
+            Some(model.clone()),
+            PointCount::Unknown,
+            Some(FX5_ROUTE_REASON),
+        ),
+        Phase::NoRange(model) => (model.clone(), PointCount::Unknown, None),
+        _ => (None, PointCount::Unknown, None),
     };
     let model_reason = match model.as_ref() {
         None => Some("0101-refused-or-unavailable".into()),
         Some(model) if model.family == ModelFamily::Unknown => {
             Some("unsupported-model-name-code-pair".into())
         }
-        _ => None,
+        Some(_) => blocked.map(str::to_owned),
     };
     let counts = model
         .as_ref()
         .map_or_else(Vec::new, |model| area_counts(conn, model, d_count));
     let tags = specs
         .iter()
-        .map(|spec| tag_diagnostic(conn, model.as_ref(), d_count, spec))
+        .map(|spec| tag_diagnostic(conn, model.as_ref(), blocked, d_count, spec))
         .collect();
     diagnostics_v1::Report {
         model: model.map(|model| diagnostics_v1::ModelInfo {

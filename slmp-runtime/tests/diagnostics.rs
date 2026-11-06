@@ -1272,3 +1272,194 @@ fn validate_accepts_transport_udp_and_rejects_other_values() -> wasmtime::Result
     assert_eq!(errors[0].message, "transport must be tcp or udp");
     Ok(())
 }
+
+/// Binary 3E response to the own station: no serial and no reserved bytes.
+fn response_3e(body: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0xd0, 0, 0, 0xff, 0xff, 3, 0];
+    frame.extend_from_slice(&(u16::try_from(body.len() + 2).unwrap()).to_le_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(body);
+    frame
+}
+
+fn pairs(counts: &[u32]) -> Vec<u8> {
+    counts
+        .iter()
+        .flat_map(|count| count.to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn fx5_reports_its_own_sd_table_r_count_and_unsupported_devices() -> wasmtime::Result<()> {
+    use diagnostic_host::banto::driver::types::Setting;
+    use diagnostic_host::exports::banto::driver::diagnostics_v1::{
+        CountBound, Progress, TagVerdict,
+    };
+
+    let (engine, component) = component()?;
+    let linker = Linker::new(&engine);
+    let mut store = Store::new(&engine, ());
+    let guest =
+        diagnostic_host::DriverWithDiagnosticsV1::instantiate(&mut store, &component, &linker)?;
+    let settings = [
+        ("host", "fixture.invalid"),
+        ("port", "5000"),
+        ("frame", "3e"),
+    ]
+    .map(|(key, value)| Setting {
+        key: key.into(),
+        value: value.into(),
+    });
+    let session = guest.banto_driver_session().connection();
+    let conn = session.call_create(&mut store, &settings)?.expect("create");
+    session
+        .call_handshake_next(&mut store, conn, None)?
+        .expect("0101")
+        .expect("step");
+    let mut model = [b' '; 18];
+    model[..12].copy_from_slice(b"FX5U-32MR/ES");
+    model[16..].copy_from_slice(&0x4a21u16.to_le_bytes());
+    session
+        .call_handshake_next(&mut store, conn, Some(&response_3e(&model)))?
+        .expect("SD280-283")
+        .expect("step");
+    session
+        .call_handshake_next(&mut store, conn, Some(&response_3e(&pairs(&[100, 0x50]))))?
+        .expect("SD304-305")
+        .expect("step");
+    assert!(session
+        .call_handshake_next(&mut store, conn, Some(&response_3e(&pairs(&[1000]))))?
+        .expect("ready")
+        .is_none());
+    let specs = vec![
+        spec("D99", "u16"),
+        spec("D100", "u16"),
+        spec("W4F", "u16"),
+        spec("W50", "u16"),
+        spec("R999", "u16"),
+        spec("R998", "u32"),
+        spec("R999", "u32"),
+        spec("R1000", "u16"),
+        spec("M31", "bit"),
+        spec("M32", "bit"),
+        spec("SB1F", "bit"),
+        spec("X0", "bit"),
+        spec("Y0", "bit"),
+        spec("ZR0", "u16"),
+        spec("LCN0", "i32"),
+        spec("S0", "bit"),
+    ];
+    let diagnostics = guest.banto_driver_diagnostics_v1();
+    let Progress::Send(step) = diagnostics
+        .call_diagnose_next(&mut store, conn, &specs, None)?
+        .expect("diagnose")
+    else {
+        panic!("M/SB need the bit count SD");
+    };
+    // SD262-275 over 3E, Q subcommand, monitoring timer 0000H.
+    assert_eq!(
+        step.send,
+        [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 6, 1, 0, 0xa9, 14, 0]
+    );
+    // SD262-275 pairs: Y, M, B, SB, F, (unused), L.
+    let bits = pairs(&[0x100, 32, 0x10, 0x20, 8, 0, 4]);
+    let Progress::Done(report) = diagnostics
+        .call_diagnose_next(&mut store, conn, &specs, Some(&response_3e(&bits)))?
+        .expect("diagnose result")
+    else {
+        panic!("one bit SD read is enough");
+    };
+    let info = report.model.as_ref().expect("model");
+    assert_eq!(
+        (info.name.as_str(), info.family.as_str()),
+        ("FX5U-32MR/ES", "fx5")
+    );
+    assert_eq!(report.model_reason, None);
+    let kind = |verdict: &TagVerdict| match verdict {
+        TagVerdict::Inside(_) => "inside",
+        TagVerdict::Outside(_) => "outside",
+        TagVerdict::Unknown(_) => "unknown",
+        TagVerdict::Invalid(_) => "invalid",
+        TagVerdict::Unsupported(_) => "unsupported",
+    };
+    let verdicts: Vec<_> = report.tags.iter().map(|tag| kind(&tag.verdict)).collect();
+    assert_eq!(
+        verdicts,
+        [
+            "inside",
+            "outside",
+            "inside",
+            "outside",
+            "inside",
+            "inside",
+            "outside",
+            "outside",
+            "inside",
+            "outside",
+            "inside",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unknown",
+        ]
+    );
+    let areas: Vec<_> = report
+        .counts
+        .iter()
+        .map(|count| {
+            (
+                count.area.as_str(),
+                count.source.as_str(),
+                match count.bound {
+                    CountBound::Exact(value) => Some(value),
+                    _ => None,
+                },
+            )
+        })
+        .collect();
+    // No Y (no FX5 read path) and no X; R comes from SD304-305.
+    assert_eq!(
+        areas,
+        [
+            ("D", "SD280-281", Some(100)),
+            ("W", "SD282-283", Some(0x50)),
+            ("M", "SD264-265", Some(32)),
+            ("L", "SD274-275", Some(4)),
+            ("B", "SD266-267", Some(0x10)),
+            ("SB", "SD268-269", Some(0x20)),
+            ("F", "SD270-271", Some(8)),
+            ("R", "SD304-305", Some(1000)),
+        ]
+    );
+    conn.resource_drop(&mut store)?;
+
+    // An FX5 that answers over 4E is not used and the report says why.
+    let settings = [("host", "fixture.invalid"), ("port", "5000")].map(|(key, value)| Setting {
+        key: key.into(),
+        value: value.into(),
+    });
+    let conn = session.call_create(&mut store, &settings)?.expect("create");
+    session
+        .call_handshake_next(&mut store, conn, None)?
+        .expect("0101")
+        .expect("step");
+    assert!(session
+        .call_handshake_next(&mut store, conn, Some(&response(1, &model)))?
+        .expect("no SD")
+        .is_none());
+    let Progress::Done(report) = diagnostics
+        .call_diagnose_next(&mut store, conn, &specs[..1], None)?
+        .expect("diagnose")
+    else {
+        panic!("no SD read without a usable FX5 connection");
+    };
+    assert_eq!(
+        report.model_reason.as_deref(),
+        Some("fx5-requires-3e-own-station")
+    );
+    assert!(matches!(&report.tags[0].verdict,
+        TagVerdict::Unknown(reason) if reason == "fx5-requires-3e-own-station"));
+    conn.resource_drop(&mut store)?;
+    Ok(())
+}

@@ -1,7 +1,8 @@
 //! 0101/0000 Read Type Name (binary 4E or 3E). The lookup is deliberately limited
 //! to Q (ordinary, process, universal process), MELSEC-L, iQ-R/EN, iQ-R process,
 //! SIL2 process and safety CPU, and MX-R pairs plus the two redundant-CPU
-//! wire-only pairs in the official model-code table.
+//! wire-only pairs in the official model-code table, and MELSEC iQ-F FX5 CPUs
+//! (FX5 code table plus an `FX5` name prefix).
 use alloc::{string::String, vec::Vec};
 
 use crate::{request_head, response_data, ResponseError, Route};
@@ -14,8 +15,26 @@ pub enum ModelFamily {
     /// and SD302/SD303 internal D/W only. Both pairs share the same read and
     /// write rules (2026-11-06 owner decision).
     Q25PrhWireOnly,
+    /// MELSEC iQ-F FX5 (FX5U/FX5UC/FX5UJ/FX5S, G2c): Q wire (0000/0001), its own
+    /// SD260-SD305 count table, 3E and own station only, monitoring timer 0000H.
+    /// Classified by a code in the FX5 table and a name starting with `FX5`;
+    /// the manual has no name-string examples, so the exact name is not paired.
+    Fx5,
     /// Valid 0101 data whose name/code pair is not in the supported table.
     Unknown,
+}
+
+impl ModelFamily {
+    /// Monitoring timer for requests after the model is known. The FX5 SLMP
+    /// manual (JY997D56001 K, printed p.27) specifies 0000H (wait forever) for
+    /// the CPU; the Hub's timeout bounds the wait. Every other family keeps the
+    /// default 0010H, which is also sent with 0101 before any model is known.
+    pub const fn monitoring_timer(self) -> u16 {
+        match self {
+            Self::Fx5 => 0x0000,
+            Self::StandardQ | Self::StandardR | Self::Q25PrhWireOnly | Self::Unknown => 0x0010,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,7 +84,9 @@ pub fn decode_type_name(route: Route, frame: &[u8]) -> Result<TypeName, Response
 // SLMP Reference Manual pp. 139-141 (printed), Q, process, universal process,
 // MELSEC-L, iQ-R/EN, iQ-R process/SIL2 process/safety and MX-R entries plus
 // Q25PRH/Q12PRH wire-only. Codes require an exact listed name. Remote, iQ-L and
-// the RCPU/0360H and MX-R/037EH route fallbacks stay unknown.
+// the RCPU/0360H and MX-R/037EH route fallbacks stay unknown. FX5 uses the FX5
+// SLMP manual JY997D56001 K (printed pp.109-110) code table plus an `FX5` name
+// prefix (G2 owner decision 2).
 fn classify(name: &str, code: u16) -> ModelFamily {
     const Q: &[(&str, u16)] = &[
         ("Q00JCPU", 0x0250),
@@ -159,6 +180,23 @@ fn classify(name: &str, code: u16) -> ModelFamily {
         ("MXR500-128", 0x48ee),
         ("MXR500-256", 0x48ef),
     ];
+    const FX5U: &[u16] = &[
+        0x4a21, 0x4a23, 0x4a24, 0x4a29, 0x4a2b, 0x4a2c, 0x4a31, 0x4a33, 0x4a34, 0x4a41, 0x4a43,
+        0x4a44, 0x4a49, 0x4a4b, 0x4a4c, 0x4a51, 0x4a53, 0x4a54,
+    ];
+    const FX5UC: &[u16] = &[
+        0x4a91, 0x4a92, 0x4a93, 0x4a99, 0x4a9a, 0x4a9b, 0x4aa9, 0x4ab1, 0x4ab9,
+    ];
+    const FX5UJ: &[u16] = &[
+        0x4b0d, 0x4b0e, 0x4b0f, 0x4b14, 0x4b15, 0x4b16, 0x4b1b, 0x4b1c, 0x4b1d,
+    ];
+    const FX5S: &[u16] = &[
+        0x4b4e, 0x4b4f, 0x4b50, 0x4b51, 0x4b55, 0x4b56, 0x4b57, 0x4b58, 0x4b5c, 0x4b5d, 0x4b5e,
+        0x4b5f,
+    ];
+    let fx5_code = [FX5U, FX5UC, FX5UJ, FX5S]
+        .iter()
+        .any(|codes| codes.contains(&code));
     if matches!((name, code), ("Q25PRHCPU", 0x004c) | ("Q12PRHCPU", 0x004b)) {
         // The 0101 table proves these pairs' Q identity, but not SD302's
         // applicability. Never classify it as StandardQ for SD planning.
@@ -167,6 +205,8 @@ fn classify(name: &str, code: u16) -> ModelFamily {
         ModelFamily::StandardQ
     } else if R.contains(&(name, code)) {
         ModelFamily::StandardR
+    } else if fx5_code && name.starts_with("FX5") {
+        ModelFamily::Fx5
     } else {
         ModelFamily::Unknown
     }

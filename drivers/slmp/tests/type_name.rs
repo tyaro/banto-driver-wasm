@@ -349,3 +349,69 @@ fn g2b_mismatched_pairs_and_route_fallbacks_stay_unknown() {
         assert_eq!(classify_pair(name, code), ModelFamily::Unknown, "{name}");
     }
 }
+
+// FX5 SLMP manual JY997D56001 K, printed pp.109-110: FX5U, FX5UC, FX5UJ, FX5S.
+const FX5_CODES: [u16; 48] = [
+    0x4a21, 0x4a23, 0x4a24, 0x4a29, 0x4a2b, 0x4a2c, 0x4a31, 0x4a33, 0x4a34, 0x4a41, 0x4a43, 0x4a44,
+    0x4a49, 0x4a4b, 0x4a4c, 0x4a51, 0x4a53, 0x4a54, 0x4a91, 0x4a92, 0x4a93, 0x4a99, 0x4a9a, 0x4a9b,
+    0x4aa9, 0x4ab1, 0x4ab9, 0x4b0d, 0x4b0e, 0x4b0f, 0x4b14, 0x4b15, 0x4b16, 0x4b1b, 0x4b1c, 0x4b1d,
+    0x4b4e, 0x4b4f, 0x4b50, 0x4b51, 0x4b55, 0x4b56, 0x4b57, 0x4b58, 0x4b5c, 0x4b5d, 0x4b5e, 0x4b5f,
+];
+
+#[test]
+fn g2c_fx5_codes_with_an_fx5_name_are_fx5() {
+    // The manual prints no name strings, so any name starting with FX5 pairs
+    // with any code in the table (G2 owner decision 2).
+    for code in FX5_CODES {
+        for name in [
+            "FX5U-32MR/ES",
+            "FX5UC-32MT/D",
+            "FX5UJ",
+            "FX5S-30MR/ES",
+            "FX5",
+        ] {
+            assert_eq!(
+                classify_pair(name, code),
+                ModelFamily::Fx5,
+                "{name} {code:04X}"
+            );
+        }
+    }
+}
+
+#[test]
+fn g2c_fx5_code_or_name_alone_stays_unknown() {
+    for code in FX5_CODES {
+        for name in ["R04CPU", "FX3U", "fx5u", "XFX5U", "MX-F"] {
+            assert_eq!(
+                classify_pair(name, code),
+                ModelFamily::Unknown,
+                "{name} {code:04X}"
+            );
+        }
+    }
+    // Codes next to the table, and Q/R codes, with an FX5 name.
+    for code in [
+        0x4a20, 0x4a22, 0x4a25, 0x4a55, 0x4a90, 0x4aba, 0x4b0c, 0x4b1e, 0x4b4d, 0x4b52, 0x4b60,
+        0x4801, 0x0263,
+    ] {
+        assert_eq!(
+            classify_pair("FX5U-32MR/ES", code),
+            ModelFamily::Unknown,
+            "{code:04X}"
+        );
+    }
+}
+
+#[test]
+fn g2c_monitoring_timer_is_0000h_only_for_fx5() {
+    assert_eq!(ModelFamily::Fx5.monitoring_timer(), 0x0000);
+    for family in [
+        ModelFamily::StandardQ,
+        ModelFamily::StandardR,
+        ModelFamily::Q25PrhWireOnly,
+        ModelFamily::Unknown,
+    ] {
+        assert_eq!(family.monitoring_timer(), Route::default().timer);
+    }
+}

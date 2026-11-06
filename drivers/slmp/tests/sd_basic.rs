@@ -293,3 +293,94 @@ fn g2a_l_and_qnph_use_the_q_basic_table_and_q12prh_only_sd302_303() {
         assert_eq!(plan_basic_sd(&q12, area), None);
     }
 }
+
+#[test]
+fn g2c_fx5_has_its_own_sd_table_and_q_wire_sd_reads() {
+    let fx5 = model("FX5U-32MR/ES", 0x4a21);
+    assert_eq!(fx5.family, ModelFamily::Fx5);
+    // FX5 application manual JY997D55401 AH, App.2 printed pp.870-871.
+    for (area, sd, words) in [
+        (A::X, 260, 2),
+        (A::Y, 262, 2),
+        (A::M, 264, 2),
+        (A::B, 266, 2),
+        (A::SB, 268, 2),
+        (A::F, 270, 2),
+        (A::L, 274, 2),
+        (A::D, 280, 2),
+        (A::W, 282, 2),
+        (A::SW, 284, 2),
+        (A::T, 288, 2),
+        (A::ST, 290, 2),
+        (A::C, 292, 2),
+        (A::LC, 298, 2),
+        (A::Z, 300, 1),
+        (A::LZ, 302, 1),
+        (A::R, 304, 2),
+    ] {
+        let plan = plan_basic_sd(&fx5, area).unwrap();
+        assert_eq!(
+            (plan.device, plan.start, plan.count),
+            (banto_slmp_read_core::Device::SD, sd, words),
+            "{area:?}"
+        );
+    }
+    // No V, S (fixed 4096 points), LT, LST, ZR, RD or Q internal fields.
+    for area in [
+        A::V,
+        A::S,
+        A::LT,
+        A::LST,
+        A::ZR,
+        A::RD,
+        A::DInternal,
+        A::WInternal,
+    ] {
+        assert_eq!(plan_basic_sd(&fx5, area), None, "{area:?}");
+    }
+    // Q and R have no file register R count field.
+    assert_eq!(plan_basic_sd(&model("R04CPU", 0x4800), A::R), None);
+    assert_eq!(plan_basic_sd(&model("Q02UCPU", 0x0263), A::R), None);
+    // 32-bit pairs are low word first and exact (no Q legacy saturation).
+    assert_eq!(
+        basic_sd_count(&fx5, A::R, confirmed(), Some(&[0x8000, 0x0000])),
+        PointCount::Exact(32768)
+    );
+    assert_eq!(
+        basic_sd_count(&fx5, A::D, confirmed(), Some(&[0x0000, 0x0001])),
+        PointCount::Exact(65536)
+    );
+    assert_eq!(
+        basic_sd_count(&fx5, A::M, confirmed(), Some(&[32768, 0])),
+        PointCount::Exact(32768)
+    );
+    assert_eq!(
+        basic_sd_count(&fx5, A::R, BasicEvidence::default(), Some(&[1, 0])),
+        PointCount::Unknown
+    );
+    assert_eq!(
+        basic_sd_count(&fx5, A::R, confirmed(), Some(&[1])),
+        PointCount::Unknown
+    );
+    assert_eq!(
+        basic_sd_count(&fx5, A::R, confirmed(), None),
+        PointCount::Unknown
+    );
+    // SD280-283 with the Q subcommand, 3-byte number and 1-byte device code.
+    let mut span = plan_basic_sd(&fx5, A::D).unwrap();
+    span.count = 4;
+    let request = encode_read(
+        Route {
+            frame: banto_slmp_read_core::Frame::E3,
+            timer: fx5.family.monitoring_timer(),
+            ..Route::default()
+        },
+        Series::Q,
+        span,
+    )
+    .unwrap();
+    assert_eq!(
+        request,
+        [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 0x18, 1, 0, 0xa9, 4, 0]
+    );
+}
