@@ -83,13 +83,18 @@ fn serial_and_version_uncertainty_never_becomes_a_known_m_b_count() {
 }
 
 #[test]
-fn only_classified_qnudv_models_use_fast_internal_d_w_pairs() {
+fn only_classified_qnudv_and_qnudpv_models_use_fast_internal_d_w_pairs() {
     for (name, code) in [
         ("Q03UDVCPU", 0x0366),
         ("Q04UDVCPU", 0x0367),
         ("Q06UDVCPU", 0x0368),
         ("Q13UDVCPU", 0x036a),
         ("Q26UDVCPU", 0x036c),
+        // 2026-11-06 owner decision: QnUDPV is treated exactly like QnUDV.
+        ("Q04UDPVCPU", 0x0367),
+        ("Q06UDPVCPU", 0x0368),
+        ("Q13UDPVCPU", 0x036a),
+        ("Q26UDPVCPU", 0x036c),
     ] {
         let q = model(name, code);
         for (area, start) in [(A::FastDInternal, 282), (A::FastWInternal, 284)] {
@@ -108,7 +113,6 @@ fn only_classified_qnudv_models_use_fast_internal_d_w_pairs() {
     }
     for (name, code) in [
         ("Q02UCPU", 0x0263),
-        ("Q04UDPVCPU", 0x0367),
         ("Q06PHCPU", 0x0042),
         ("L26CPU", 0x0545),
         ("Q00JCPU", 0x0250),
@@ -116,9 +120,9 @@ fn only_classified_qnudv_models_use_fast_internal_d_w_pairs() {
         ("RCPU", 0x0360),
     ] {
         let q = model(name, code);
-        // QnU (code-based) models, including QnUDPV, may plan SD286-289; the
-        // SD282-285 fast D/W pair stays limited to the QnUDV names.
-        if !matches!(name, "Q02UCPU" | "Q04UDPVCPU") {
+        // QnU (code-based) models may plan SD286-289; the SD282-285 fast D/W
+        // pair is limited to the QnUDV/QnUDPV names.
+        if name != "Q02UCPU" {
             assert_eq!(plan_q_extension(&q, A::MTotal, evidence()), None);
         }
         assert_eq!(plan_q_extension(&q, A::FastDInternal, evidence()), None);
@@ -218,10 +222,16 @@ fn sd310_w_total_is_not_planned_for_other_models() {
 }
 
 #[test]
-fn g2a_qnudpv_plans_m_b_totals_but_not_the_fast_d_w_pair_and_l_plans_nothing() {
+fn g2a_qnudpv_is_treated_like_qnudv_and_l_plans_nothing() {
     let q = model("Q06UDPVCPU", 0x0368);
-    assert_eq!(plan_q_extension(&q, A::FastDInternal, evidence()), None);
-    assert_eq!(plan_q_extension(&q, A::FastWInternal, evidence()), None);
+    for (area, start) in [(A::FastDInternal, 282), (A::FastWInternal, 284)] {
+        let span = plan_q_extension(&q, area, evidence()).unwrap();
+        assert_eq!((span.start, span.count), (start, 2));
+        assert_eq!(
+            decode_q_extension_count(&q, area, evidence(), Some(&[0, 1])),
+            PointCount::Exact(65536)
+        );
+    }
     let m = plan_q_extension(&q, A::MTotal, evidence()).unwrap();
     assert_eq!((m.start, m.count), (286, 2));
     for (name, code) in [
