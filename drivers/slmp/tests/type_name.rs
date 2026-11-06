@@ -128,16 +128,6 @@ fn unknown_pairs_remain_unknown_with_exact_name_and_code_preserved() {
     assert_eq!(parsed.name, "RCPU");
     assert_eq!(parsed.code, 0x0360);
     assert_eq!(parsed.family, ModelFamily::Unknown);
-
-    let mut special_r = Q02UCPU;
-    special_r[15..31].copy_from_slice(b"R08PCPU         ");
-    special_r[31..33].copy_from_slice(&[0x41, 0x48]);
-    assert_eq!(
-        decode_type_name(Route::default(), &special_r)
-            .unwrap()
-            .family,
-        ModelFamily::Unknown
-    );
 }
 
 #[test]
@@ -301,5 +291,61 @@ fn g2a_shared_code_name_mismatches_stay_unknown_and_old_pairs_are_unchanged() {
         ("Q26UDVCPU", 0x036c),
     ] {
         assert_eq!(classify_pair(name, code), ModelFamily::StandardQ, "{name}");
+    }
+}
+
+const G2B_PAIRS: [(&str, u16); 21] = [
+    ("R08PCPU", 0x4841),
+    ("R16PCPU", 0x4842),
+    ("R32PCPU", 0x4843),
+    ("R120PCPU", 0x4844),
+    ("R08PSFCPU", 0x4851),
+    ("R16PSFCPU", 0x4852),
+    ("R32PSFCPU", 0x4853),
+    ("R120PSFCPU", 0x4854),
+    ("R08SFCPU", 0x4891),
+    ("R16SFCPU", 0x4892),
+    ("R32SFCPU", 0x4893),
+    ("R120SFCPU", 0x4894),
+    ("MXR300-16", 0x48e9),
+    ("MXR300-32", 0x48ea),
+    ("MXR300-64", 0x48eb),
+    ("MXR500-128", 0x48ee),
+    ("MXR500-256", 0x48ef),
+    // Standard R pairs next to them stay as they were.
+    ("R08CPU", 0x4801),
+    ("R120CPU", 0x4804),
+    ("R04ENCPU", 0x4805),
+    ("R120ENCPU", 0x4809),
+];
+
+#[test]
+fn g2b_process_sil2_safety_and_mxr_pairs_are_standard_r() {
+    for (name, code) in G2B_PAIRS {
+        assert_eq!(classify_pair(name, code), ModelFamily::StandardR, "{name}");
+    }
+}
+
+#[test]
+fn g2b_mismatched_pairs_and_route_fallbacks_stay_unknown() {
+    for (name, code) in [
+        // Name and code from different groups.
+        ("R08PCPU", 0x4851),
+        ("R08PCPU", 0x4842),
+        ("R08PSFCPU", 0x4841),
+        ("R08SFCPU", 0x4801),
+        ("R16SFCPU", 0x4891),
+        ("R120PSFCPU", 0x4894),
+        ("MXR300-16", 0x48ea),
+        ("MXR500-256", 0x48ee),
+        ("MXR300-16", 0x4801),
+        // Not in the table.
+        ("MXR500-64", 0x48ec),
+        ("R04PCPU", 0x4840),
+        // Route fallbacks when the connected station is not iQ-R / MX.
+        ("MX-R", 0x037e),
+        ("RCPU", 0x0360),
+    ] {
+        assert_eq!(classify_pair(name, code), ModelFamily::Unknown, "{name}");
     }
 }

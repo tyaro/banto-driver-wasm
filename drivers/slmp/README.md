@@ -61,6 +61,8 @@ This stage changes no WIT, Hub, D/u16 write gate, gap optimization, or real PLC 
 
 Stage G2a (2026-11-05) adds exact 0101 name/code pairs from the [SLMP Reference Manual SH-080956ENG N, printed p.139](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141): the Q process CPUs (Q02PH–Q25PH, sharing the QnH codes) as standard non-U Q, the universal process CPUs (Q04UDPV–Q26UDPV, sharing the QnUDV codes) as QnU treated exactly like QnUDV (2026-11-06 owner decision), including the D2 ZR and D3 SD310–311 rules and the SD282–285 fast D/W pair, and MELSEC-L (L02S, L02, L06, L26, L26-BT and their -P variants, 0541H–0545H) as standard Q with only the basic SD290–304 table. Per the 2026-11-06 owner decision L is treated exactly like standard Q (it reads ZR; SD310–311 stays QnU-by-name only, so L has none; U0–UFF reads and the Q write gates are unchanged). Q12PRHCPU/004BH is fully equivalent to Q25PRHCPU/004CH: the same SD302–303 internal D/W reads, the same SD302-proven allowlisted D writes, and the same D3010–D3013 test-write opt-in. Name/code mismatches stay unknown. No WIT or Hub change; Hub acceptance and physical PLC reads are not done.
 
+Stage G2b (2026-11-06) adds exact 0101 name/code pairs from the same table (printed p.139) as standard R with the same wire, SD260–SD309 table and read/write rules: the iQ-R process CPUs (R08P–R120P, 4841H–4844H), the SIL2 process CPUs (R08PSF–R120PSF, 4851H–4854H), the safety CPUs (R08SF–R120SF, 4891H–4894H) and MX-R (MXR300-16/-32/-64, MXR500-128/-256, 48E9H–48EFH). The only difference is S (step relay): the SIL2 process, safety and MX-R CPUs have none, so an `S` tag is `Unsupported` in `read.plan`; standard R and the process CPU keep S. Safety devices (SA\D and so on) cannot be specified over SLMP and are not in the grammar; writes the PLC refuses (SAFETY MODE, safety CPU external-write protection) come back as `device`. `MX-R`/037EH and `RCPU`/0360H (route fallbacks when the connected station is not iQ-R/MX) stay unknown. For redundant iQ-R configurations (R6RFM) the guest only talks to its own fixed destination, and a write issued during a system switchover may be lost (SH-082493ENG F, printed p.443). No WIT or Hub change; Hub acceptance and physical PLC reads are not done.
+
 The WIT `word-count` for a long timer `i32` remains two for the typed value; the additional response words are protocol status, not tag width.
 
 ## Optional contiguous D/u16 write prototype
@@ -139,7 +141,7 @@ R の S 点数は R00/R01/R02CPU または Rn(EN)CPU の確認済み firmware 12
 
 経由局が iQ-R 系以外の場合、RCPU への 0101 は `RCPU / 0360H` に丸められることがある。この組から個別の R 型式、ENCPU か否か、機種固有の SD 対応範囲を推定しない。再確認手段が決まるまでは必要な型式固有判定を `unknown` にする。[MC p.167](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080008/sh080008ab.pdf#page=169)、[SLMP p.140](https://dl.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engn.pdf#page=141)。
 
-以下の表は標準 Q / iQ-R CPU・ENCPU の候補マップである。安全 CPU、プロセス/二重化 CPU、リモートヘッド、L/FX/MX 等に流用しない。型名・型コード・機能版/シリアル・経路と対象 SD の対応が確認できないときは別途機種対応を設計する。
+以下の表は標準 Q / iQ-R CPU・ENCPU の候補マップである。リモートヘッド、FX 等に流用しない（Q のプロセス CPU・L、iQ-R のプロセス/SIL2/安全 CPU・MX-R は G2a/G2b の名前と型式コードの組で個別に判別する）。型名・型コード・機能版/シリアル・経路と対象 SD の対応が確認できないときは別途機種対応を設計する。
 
 ## Q: SD の実設定点数
 

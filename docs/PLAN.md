@@ -136,6 +136,8 @@ G2a の結果（2026-11-05）: 上の設計どおりに実装した。0101 の�
   - 扱い: 標準 R と同じ規則で読書きする。S を持たない機種群（SIL2・安全・MX-R）は S のタグを送る前に `Unsupported` とする。安全デバイス（SA\D など）は SLMP で指定できない（SLMP 参照マニュアル 印刷 pp.36–37・p.78）ので、文法にも足さない。SAFETY MODE の安全デバイスの書込み禁止と、安全 CPU（ファームウェア 32 以降）の外部からの書込み禁止範囲は PLC が終了コードで断るので、ゲストは既存の書込みと同じく `device` で返す。MX-R の Ethernet ポートはバイナリだけで、今のゲストもバイナリだけなので差はない。0101 の `MX-R`/037EH（接続局が iQ-R・MX 以外のときの代わりの応答）は `RCPU`/0360H と同じく `Unknown`。冗長構成（R6RFM）は自局の固定宛先だけを扱い、系切替の間の書込みが失われうることを設定の説明に書く（[SH-082493ENG F 印刷 p.443](https://www.mitsubishielectric.com/dl/fa/document/manual/plc/sh082493eng/sh082493engf.pdf#page=445)）。
   - 残る確認: 各機種群の実機（特に MX-R の大きい既定点数で SD が正しく読めること）。
 
+G2b の結果（2026-11-06）: 上の設計どおりに実装した。0101 の判別にプロセス CPU 4 組・SIL2 プロセス CPU 4 組・安全 CPU 4 組・MX-R 5 組を足してどれも `StandardR`（名前とコードの組が一致しないものは従来どおり `Unknown`。`MX-R`/037EH と `RCPU`/0360H も `Unknown` のまま）。配線・SD260–SD309 の表・読書きの規則は標準 R と同じで、新しい `ModelFamily` は足していない。S だけが違い、SIL2・安全・MX-R の名前とコードの組（`r_lacks_step_relay`）では `read.plan` が S のタグを項目ごとの `Unsupported` にする（プロセス CPU は標準 R と同じく S を読む。書込みの許可は D/W/M/Y/L/B だけなので S の書込み経路はなく、診断も S を報告しないので変更はない）。冗長構成（R6RFM）は自局の固定宛先だけを扱い、系切替中の書込みが失われうることを SLMP の README に書いた。ゲスト単体・Wasmtime 試験・CI のみで、Hub 模擬受入れと実機は未実施。
+
 - G2c（FX5。配線・SD 表・デバイスが違う新しい機種群）:
   - 根拠はすべて [FX5 ユーザーズマニュアル（SLMP 編）JY997D56001 K](https://dl.mitsubishielectric.com/dl/fa/document/manual/plcf/jy997d56001/jy997d56001k.pdf) と [FX5 ユーザーズマニュアル（応用編）JY997D55401 AH](https://dl.mitsubishielectric.com/dl/fa/document/manual/plcf/jy997d55401/jy997d55401ah.pdf)。
   - 対象: FX5U・FX5UC・FX5UJ・FX5S の CPU（0101 の型式コード 4A21H〜4B5FH の表、SLMP 編 印刷 pp.109–110）。型名の文字列はマニュアルに例がないので、コードの表と型名の先頭 `FX5` の両方で判別する（作者決定）。実機で型名を記録する。

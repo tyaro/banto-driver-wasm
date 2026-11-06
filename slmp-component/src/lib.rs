@@ -1319,6 +1319,29 @@ fn is_redundant_q_pair(model: &TypeName) -> bool {
         )
 }
 
+/// SIL2 process (RnPSFCPU), safety (RnSFCPU) and MX-R CPUs have no S (step
+/// relay); standard R and the process CPU (RnPCPU) do. These are standard R
+/// by family, so the exact name/code pairs are matched here (G2b).
+fn r_lacks_step_relay(model: &TypeName) -> bool {
+    model.family == ModelFamily::StandardR
+        && matches!(
+            (model.name.as_str(), model.code),
+            ("R08PSFCPU", 0x4851)
+                | ("R16PSFCPU", 0x4852)
+                | ("R32PSFCPU", 0x4853)
+                | ("R120PSFCPU", 0x4854)
+                | ("R08SFCPU", 0x4891)
+                | ("R16SFCPU", 0x4892)
+                | ("R32SFCPU", 0x4893)
+                | ("R120SFCPU", 0x4894)
+                | ("MXR300-16", 0x48e9)
+                | ("MXR300-32", 0x48ea)
+                | ("MXR300-64", 0x48eb)
+                | ("MXR500-128", 0x48ee)
+                | ("MXR500-256", 0x48ef)
+        )
+}
+
 /// `U<h>\G<n>` has a path on standard Q (`U0`-`UFF`) and standard R (also the
 /// CPU buffer `U3E0`-`U3E3`). Q25PRH and unknown models have none, like ZR.
 fn unit_buffer_read_allowed(model: &TypeName, module: u16) -> bool {
@@ -1437,6 +1460,7 @@ fn checked_read_target(
                 | Device::RD
         ) && model.family != ModelFamily::StandardR))
         || (device == Device::ZR && !zr_read_allowed(model))
+        || (device == Device::S && r_lacks_step_relay(model))
     {
         return Err(FatalError::InvalidConfig(
             "device is unsupported for this CPU family".into(),
@@ -6198,6 +6222,58 @@ mod tests {
             assert_rejected(&short, &items, name);
         }
         assert_eq!(frames[0], frames[1]);
+    }
+
+    #[test]
+    fn g2b_s_is_unsupported_on_sil2_safety_and_mxr_but_not_on_r_or_process() {
+        let s = TagSpec {
+            address: "S10".into(),
+            data_type: "bit".into(),
+            string_words: None,
+        };
+        let none = (PointCount::Unknown, PointCount::Unknown);
+        for (name, code) in [
+            ("R08PSFCPU", 0x4851),
+            ("R120PSFCPU", 0x4854),
+            ("R08SFCPU", 0x4891),
+            ("R120SFCPU", 0x4894),
+            ("MXR300-16", 0x48e9),
+            ("MXR500-256", 0x48ef),
+        ] {
+            let m = named(ModelFamily::StandardR, name, code);
+            assert!(checked_read_span(&s, &m, none.0, none.1).is_err(), "{name}");
+        }
+        for (name, code) in [
+            ("R08PCPU", 0x4841),
+            ("R120PCPU", 0x4844),
+            ("R08CPU", 0x4801),
+            ("R04ENCPU", 0x4805),
+        ] {
+            let m = named(ModelFamily::StandardR, name, code);
+            let span = checked_read_span(&s, &m, none.0, none.1).expect(name);
+            assert_eq!((span.device, span.start, span.count), (Device::S, 10, 1));
+        }
+    }
+
+    #[test]
+    fn g2b_d_read_on_safety_cpu_plans_like_standard_r() {
+        let d = TagSpec {
+            address: "D100".into(),
+            data_type: "u16".into(),
+            string_words: None,
+        };
+        let none = (PointCount::Unknown, PointCount::Unknown);
+        let std_r = named(ModelFamily::StandardR, "R08CPU", 0x4801);
+        let expected = checked_read_span(&d, &std_r, none.0, none.1).unwrap();
+        for (name, code) in [("R08SFCPU", 0x4891), ("MXR300-16", 0x48e9)] {
+            let m = named(ModelFamily::StandardR, name, code);
+            let span = checked_read_span(&d, &m, none.0, none.1).expect(name);
+            assert_eq!(
+                (span.device, span.start, span.count),
+                (expected.device, expected.start, expected.count),
+                "{name}"
+            );
+        }
     }
 }
 
