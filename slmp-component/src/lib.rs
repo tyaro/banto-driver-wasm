@@ -21,6 +21,13 @@
 //! monitoring timer 0000H once identified, takes its ranges from its own SD
 //! table, reads the decimal file register `R<n>` (read-only), and has no X/Y,
 //! V, LT/LST, ZR, RD, LCN or `U\G` path here.
+//! A global label tag (G3, `@<name>`, see `label`) is read with 041C and
+//! written with 141B only on a 0101-confirmed iQ-R CPU (standard R family).
+//! Labels go in their own 041C requests, split to the 1920-byte send limit,
+//! and never share a write request with device tags. A label write is two
+//! steps: a 041C that checks every label's data type ID and length against
+//! its tag (any mismatch refuses the whole request before writing), then one
+//! 141B with every item, judged by its end code only.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -38,7 +45,13 @@ use banto_slmp_read_core::{
 };
 use exports::banto::driver::{address, config, diagnostics_v1, read, session, write_v1};
 mod diagnostics;
+mod label;
 mod write_policy;
+use banto_slmp_read_core::{
+    decode_label_read, encode_label_read, encode_label_write, label_read_data_len,
+    label_write_data_len, LabelWrite, LABEL_SEND_DATA_LIMIT,
+};
+use label::{is_label, parse_label, Label, LABEL_ALLOWLIST_KEY};
 use write_policy::{WritePolicy, ALLOWLIST_KEY, MODE_KEY};
 
 wit_bindgen::generate!({ path: "../wit", world: "driver-with-write-and-diagnostics-v1" });
@@ -119,6 +132,13 @@ enum PendingWrite {
         route: Route,
         run: WriteRun,
     },
+    /// Global label write; `route` is the request awaiting a response.
+    Labels {
+        route: Route,
+        labels: Vec<Label>,
+        data: Vec<Vec<u8>>,
+        stage: LabelStage,
+    },
     /// Word-bit read-modify-write; `route` is the request awaiting a response.
     Rmw {
         route: Route,
@@ -154,6 +174,13 @@ impl BitRmw {
     }
 }
 
+/// Label write steps: the 041C type check, then the one 141B.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabelStage {
+    Check,
+    Write,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RmwStage {
     Read,
@@ -186,7 +213,17 @@ struct WriteRun {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingRead {
+enum PendingRead {
+    Device(DeviceRead),
+    /// One 041C; `labels[i]` is the parsed tag of `covers[i]`.
+    Labels {
+        covers: Vec<u32>,
+        labels: Vec<Label>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeviceRead {
     span: ReadSpan,
     covers: Vec<u32>,
     /// `U<h>` module of a `U\G` read; such a read has exactly one cover.
@@ -447,9 +484,10 @@ impl SlmpConnection {
             },
             q25prh_test_write_enabled: setting(settings, "q25prh_d3010_3013_test_write")
                 == Some("enabled"),
-            write_policy: WritePolicy::parse(
+            write_policy: WritePolicy::parse_with_labels(
                 setting(settings, MODE_KEY),
                 setting(settings, ALLOWLIST_KEY),
+                setting(settings, LABEL_ALLOWLIST_KEY),
             )
             .expect("settings validated above"),
             timer: Cell::new(Route::default().timer),
@@ -710,6 +748,7 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
                 | "q25prh_d3010_3013_test_write"
                 | MODE_KEY
                 | ALLOWLIST_KEY
+                | LABEL_ALLOWLIST_KEY
         ) {
             errors.push(config::FieldError {
                 key: item.key.clone(),
@@ -761,9 +800,10 @@ fn validate_settings(settings: &[session::Setting]) -> Vec<config::FieldError> {
             message: "Q25PRH test write must be disabled or explicitly enabled".into(),
         });
     }
-    if let Err((key, message)) = WritePolicy::parse(
+    if let Err((key, message)) = WritePolicy::parse_with_labels(
         setting(settings, MODE_KEY),
         setting(settings, ALLOWLIST_KEY),
+        setting(settings, LABEL_ALLOWLIST_KEY),
     ) {
         errors.push(config::FieldError {
             key: key.into(),
@@ -1940,160 +1980,7 @@ impl read::Guest for Component {
         conn: read::ConnectionBorrow<'_>,
         specs: Vec<TagSpec>,
     ) -> Result<Vec<read::Planned>, FatalError> {
-        let conn = conn.get::<SlmpConnection>();
-        if conn.pending_write.borrow().is_some()
-            || conn.write_poisoned.get()
-            || conn.pending_diagnostic.borrow().is_some()
-            || conn.diagnostic_poisoned.get()
-        {
-            return Err(FatalError::Protocol("write response is pending".into()));
-        }
-        if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
-            return Err(FatalError::Protocol(
-                "diagnostic response is pending; reconnect".into(),
-            ));
-        }
-        if conn.base_route.frame == Frame::E3 && !conn.pending.borrow().is_empty() {
-            // Without a serial number a late answer to an earlier read would be
-            // indistinguishable from the answer to a new one.
-            return Err(FatalError::Protocol(
-                "3E read is pending; responses cannot be matched".into(),
-            ));
-        }
-        let phase = conn.phase.borrow();
-        let Phase::Ready { model, count } = &*phase else {
-            return Err(FatalError::Protocol(
-                "configured range is unresolved".into(),
-            ));
-        };
-        let series = known_series(model).expect("ready model has series");
-        // An unsupported tag is left uncovered: FrameSession returns its own
-        // per-item Unsupported result without dropping the connection.
-        let eligible = specs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, spec)| {
-                let (span, module) = checked_read_target(
-                    spec,
-                    model,
-                    *count,
-                    conn.w_count.get(),
-                    conn.q_w_total.get(),
-                )
-                .ok()?;
-                if diagnostics::sd_span_outside(conn, model, span) {
-                    return None;
-                }
-                encode_span(conn.route_with_serial(0), series, span, module).ok()?;
-                Some((
-                    u32::try_from(index).ok()?,
-                    span,
-                    module,
-                    assess_conn_span(conn, model, *count, span.device, span.start, span.count)
-                        == RangeAssessment::VerifiedInside,
-                ))
-            })
-            .collect::<Vec<_>>();
-        let mut groups: Vec<PendingRead> = Vec::new();
-        for (cover, span, module, verified) in eligible {
-            // Preserve input order. A duplicate, a gap in either specs or D
-            // addresses, or an unverified range starts a separate request.
-            // A U\G read has an Unknown range, so it is never verified and
-            // never joins another tag.
-            let joined = if verified && module.is_none() {
-                groups.last_mut().is_some_and(|last| {
-                    if last.span.device != span.device
-                        || assess_conn_span(
-                            conn,
-                            model,
-                            *count,
-                            span.device,
-                            last.span.start,
-                            last.span.count,
-                        ) != RangeAssessment::VerifiedInside
-                    {
-                        return false;
-                    }
-                    // Never merge across the internal/extended W boundary.
-                    let region = |span: ReadSpan| {
-                        q_w_region(
-                            model,
-                            span.device,
-                            conn.w_count.get(),
-                            conn.q_w_total.get(),
-                            span.start,
-                            span.count,
-                        )
-                    };
-                    if region(last.span) != region(span) {
-                        return false;
-                    }
-                    let Some(next_cover) = last.covers.last().and_then(|n| n.checked_add(1)) else {
-                        return false;
-                    };
-                    let Some(next_d) = last.span.start.checked_add(u32::from(last.span.count))
-                    else {
-                        return false;
-                    };
-                    let Some(next_count) = last.span.count.checked_add(span.count) else {
-                        return false;
-                    };
-                    let candidate = ReadSpan {
-                        count: next_count,
-                        ..last.span
-                    };
-                    if next_cover != cover
-                        || next_d != span.start
-                        || encode_read(conn.route_with_serial(0), series, candidate).is_err()
-                    {
-                        return false;
-                    }
-                    last.span = candidate;
-                    last.covers.push(cover);
-                    true
-                })
-            } else {
-                false
-            };
-            if !joined {
-                groups.push(PendingRead {
-                    span,
-                    covers: vec![cover],
-                    module,
-                });
-            }
-        }
-        if groups.len() > usize::from(u16::MAX) + 1 {
-            return Err(FatalError::Protocol("SLMP serial space exhausted".into()));
-        }
-        let mut serial = conn.next_serial.get();
-        let pending = conn.pending.borrow();
-        let mut plans = Vec::with_capacity(groups.len());
-        let mut new_pending = Vec::with_capacity(groups.len());
-        for group in groups {
-            if pending.contains_key(&serial) {
-                return Err(FatalError::Protocol(
-                    "SLMP serial reused while a read is pending".into(),
-                ));
-            }
-            let route = conn.route_with_serial(serial);
-            let send = encode_span(route, series, group.span, group.module)
-                .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-            let step = read_step(route.frame, send, group.span);
-            plans.push(read::Planned {
-                step,
-                covers: group.covers.clone(),
-            });
-            new_pending.push((serial, group));
-            serial = serial.wrapping_add(1);
-        }
-        drop(pending);
-        conn.read_order
-            .borrow_mut()
-            .extend(new_pending.iter().map(|(serial, _)| *serial));
-        conn.pending.borrow_mut().extend(new_pending);
-        conn.next_serial.set(serial);
-        Ok(plans)
+        plan_on(conn.get::<SlmpConnection>(), specs)
     }
 
     fn decode(
@@ -2102,19 +1989,198 @@ impl read::Guest for Component {
         specs: Vec<TagSpec>,
         response: Vec<u8>,
     ) -> Result<Vec<Result<Value, ItemError>>, FatalError> {
-        let conn = conn.get::<SlmpConnection>();
-        if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
+        decode_on(conn.get::<SlmpConnection>(), p, specs, response)
+    }
+}
+
+fn plan_on(conn: &SlmpConnection, specs: Vec<TagSpec>) -> Result<Vec<read::Planned>, FatalError> {
+    if conn.pending_write.borrow().is_some()
+        || conn.write_poisoned.get()
+        || conn.pending_diagnostic.borrow().is_some()
+        || conn.diagnostic_poisoned.get()
+    {
+        return Err(FatalError::Protocol("write response is pending".into()));
+    }
+    if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
+        return Err(FatalError::Protocol(
+            "diagnostic response is pending; reconnect".into(),
+        ));
+    }
+    if conn.base_route.frame == Frame::E3 && !conn.pending.borrow().is_empty() {
+        // Without a serial number a late answer to an earlier read would be
+        // indistinguishable from the answer to a new one.
+        return Err(FatalError::Protocol(
+            "3E read is pending; responses cannot be matched".into(),
+        ));
+    }
+    let phase = conn.phase.borrow();
+    let Phase::Ready { model, count } = &*phase else {
+        return Err(FatalError::Protocol(
+            "configured range is unresolved".into(),
+        ));
+    };
+    let series = known_series(model).expect("ready model has series");
+    // An unsupported tag is left uncovered: FrameSession returns its own
+    // per-item Unsupported result without dropping the connection.
+    let eligible = specs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, spec)| {
+            // Labels are planned separately below.
+            if is_label(&spec.address) {
+                return None;
+            }
+            let (span, module) = checked_read_target(
+                spec,
+                model,
+                *count,
+                conn.w_count.get(),
+                conn.q_w_total.get(),
+            )
+            .ok()?;
+            if diagnostics::sd_span_outside(conn, model, span) {
+                return None;
+            }
+            encode_span(conn.route_with_serial(0), series, span, module).ok()?;
+            Some((
+                u32::try_from(index).ok()?,
+                span,
+                module,
+                assess_conn_span(conn, model, *count, span.device, span.start, span.count)
+                    == RangeAssessment::VerifiedInside,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut groups: Vec<DeviceRead> = Vec::new();
+    for (cover, span, module, verified) in eligible {
+        // Preserve input order. A duplicate, a gap in either specs or D
+        // addresses, or an unverified range starts a separate request.
+        // A U\G read has an Unknown range, so it is never verified and
+        // never joins another tag.
+        let joined = if verified && module.is_none() {
+            groups.last_mut().is_some_and(|last| {
+                if last.span.device != span.device
+                    || assess_conn_span(
+                        conn,
+                        model,
+                        *count,
+                        span.device,
+                        last.span.start,
+                        last.span.count,
+                    ) != RangeAssessment::VerifiedInside
+                {
+                    return false;
+                }
+                // Never merge across the internal/extended W boundary.
+                let region = |span: ReadSpan| {
+                    q_w_region(
+                        model,
+                        span.device,
+                        conn.w_count.get(),
+                        conn.q_w_total.get(),
+                        span.start,
+                        span.count,
+                    )
+                };
+                if region(last.span) != region(span) {
+                    return false;
+                }
+                let Some(next_cover) = last.covers.last().and_then(|n| n.checked_add(1)) else {
+                    return false;
+                };
+                let Some(next_d) = last.span.start.checked_add(u32::from(last.span.count)) else {
+                    return false;
+                };
+                let Some(next_count) = last.span.count.checked_add(span.count) else {
+                    return false;
+                };
+                let candidate = ReadSpan {
+                    count: next_count,
+                    ..last.span
+                };
+                if next_cover != cover
+                    || next_d != span.start
+                    || encode_read(conn.route_with_serial(0), series, candidate).is_err()
+                {
+                    return false;
+                }
+                last.span = candidate;
+                last.covers.push(cover);
+                true
+            })
+        } else {
+            false
+        };
+        if !joined {
+            groups.push(DeviceRead {
+                span,
+                covers: vec![cover],
+                module,
+            });
+        }
+    }
+    // Global labels only on a 0101-confirmed iQ-R (standard R family);
+    // elsewhere they stay uncovered (item-level Unsupported).
+    let label_groups = if model.family == ModelFamily::StandardR {
+        plan_label_groups(&specs)
+    } else {
+        Vec::new()
+    };
+    let groups = groups
+        .into_iter()
+        .map(PendingRead::Device)
+        .chain(label_groups)
+        .collect::<Vec<_>>();
+    if groups.len() > usize::from(u16::MAX) + 1 {
+        return Err(FatalError::Protocol("SLMP serial space exhausted".into()));
+    }
+    let mut serial = conn.next_serial.get();
+    let pending = conn.pending.borrow();
+    let mut plans = Vec::with_capacity(groups.len());
+    let mut new_pending = Vec::with_capacity(groups.len());
+    for group in groups {
+        if pending.contains_key(&serial) {
             return Err(FatalError::Protocol(
-                "diagnostic response is pending; reconnect".into(),
+                "SLMP serial reused while a read is pending".into(),
             ));
         }
-        let phase = conn.phase.borrow();
-        let Phase::Ready { model, count } = &*phase else {
-            return Err(FatalError::Protocol(
-                "configured range is unresolved".into(),
-            ));
-        };
-        let serial = match conn.base_route.frame {
+        let route = conn.route_with_serial(serial);
+        let step = pending_read_step(route, series, &group)?;
+        plans.push(read::Planned {
+            step,
+            covers: group.covers().to_vec(),
+        });
+        new_pending.push((serial, group));
+        serial = serial.wrapping_add(1);
+    }
+    drop(pending);
+    conn.read_order
+        .borrow_mut()
+        .extend(new_pending.iter().map(|(serial, _)| *serial));
+    conn.pending.borrow_mut().extend(new_pending);
+    conn.next_serial.set(serial);
+    Ok(plans)
+}
+
+fn decode_on(
+    conn: &SlmpConnection,
+    p: read::Planned,
+    specs: Vec<TagSpec>,
+    response: Vec<u8>,
+) -> Result<Vec<Result<Value, ItemError>>, FatalError> {
+    if conn.pending_diagnostic.borrow().is_some() || conn.diagnostic_poisoned.get() {
+        return Err(FatalError::Protocol(
+            "diagnostic response is pending; reconnect".into(),
+        ));
+    }
+    let phase = conn.phase.borrow();
+    let Phase::Ready { model, count } = &*phase else {
+        return Err(FatalError::Protocol(
+            "configured range is unresolved".into(),
+        ));
+    };
+    let serial =
+        match conn.base_route.frame {
             Frame::E4 => {
                 let serial_bytes: [u8; 2] = p
                     .step
@@ -2132,121 +2198,258 @@ impl read::Guest for Component {
                 FatalError::Protocol("plan is not pending on this connection".into())
             })?,
         };
-        let route = conn.route_with_serial(serial);
-        let pending = conn
-            .pending
-            .borrow()
-            .get(&route.serial)
-            .cloned()
-            .ok_or_else(|| FatalError::Protocol("plan is not pending on this connection".into()))?;
-        if p.covers != pending.covers || p.covers.is_empty() {
-            return Err(FatalError::Protocol(
-                "plan covers do not match pending read".into(),
-            ));
+    let route = conn.route_with_serial(serial);
+    let pending = conn
+        .pending
+        .borrow()
+        .get(&route.serial)
+        .cloned()
+        .ok_or_else(|| FatalError::Protocol("plan is not pending on this connection".into()))?;
+    let pending = match pending {
+        PendingRead::Device(pending) => pending,
+        PendingRead::Labels { covers, labels } => {
+            return decode_labels(conn, &p, &specs, route, &covers, &labels, &response)
         }
-        let mut word_offset = 0u16;
-        let mut first_region = None;
-        for (position, cover) in p.covers.iter().enumerate() {
-            let spec = specs
-                .get(*cover as usize)
-                .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
-            let (tag, tag_module) = checked_read_target(
-                spec,
-                model,
-                *count,
-                conn.w_count.get(),
-                conn.q_w_total.get(),
-            )?;
-            let region = q_w_region(
-                model,
-                tag.device,
-                conn.w_count.get(),
-                conn.q_w_total.get(),
-                tag.start,
-                tag.count,
-            );
-            if position == 0 {
-                first_region = region;
-            }
-            let expected_d = pending
-                .span
-                .start
-                .checked_add(u32::from(word_offset))
-                .ok_or_else(|| FatalError::Protocol("batch address overflow".into()))?;
-            if tag.device != pending.span.device
-                || tag_module != pending.module
-                || tag.start != expected_d
-                || (p.covers.len() > 1
-                    && (assess_conn_span(conn, model, *count, tag.device, tag.start, tag.count)
-                        != RangeAssessment::VerifiedInside
-                        || region != first_region))
-            {
-                return Err(FatalError::Protocol("plan does not match specs".into()));
-            }
-            word_offset = word_offset
-                .checked_add(tag.count)
-                .ok_or_else(|| FatalError::Protocol("batch word count overflow".into()))?;
+    };
+    if p.covers != pending.covers || p.covers.is_empty() {
+        return Err(FatalError::Protocol(
+            "plan covers do not match pending read".into(),
+        ));
+    }
+    let mut word_offset = 0u16;
+    let mut first_region = None;
+    for (position, cover) in p.covers.iter().enumerate() {
+        let spec = specs
+            .get(*cover as usize)
+            .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
+        let (tag, tag_module) = checked_read_target(
+            spec,
+            model,
+            *count,
+            conn.w_count.get(),
+            conn.q_w_total.get(),
+        )?;
+        let region = q_w_region(
+            model,
+            tag.device,
+            conn.w_count.get(),
+            conn.q_w_total.get(),
+            tag.start,
+            tag.count,
+        );
+        if position == 0 {
+            first_region = region;
         }
-        if word_offset != pending.span.count {
-            return Err(FatalError::Protocol(
-                "plan word count does not match specs".into(),
-            ));
-        }
-        let series = known_series(model).expect("ready model has series");
-        let expected = encode_span(route, series, pending.span, pending.module)
-            .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
-        if p.step.send != expected
-            || p.step.max_len != read_step(route.frame, expected, pending.span).max_len
+        let expected_d = pending
+            .span
+            .start
+            .checked_add(u32::from(word_offset))
+            .ok_or_else(|| FatalError::Protocol("batch address overflow".into()))?;
+        if tag.device != pending.span.device
+            || tag_module != pending.module
+            || tag.start != expected_d
+            || (p.covers.len() > 1
+                && (assess_conn_span(conn, model, *count, tag.device, tag.start, tag.count)
+                    != RangeAssessment::VerifiedInside
+                    || region != first_region))
         {
-            return Err(FatalError::Protocol("plan bytes do not match spec".into()));
+            return Err(FatalError::Protocol("plan does not match specs".into()));
         }
-        conn.pending.borrow_mut().remove(&route.serial);
-        conn.read_order
-            .borrow_mut()
-            .retain(|serial| *serial != route.serial);
-        match decode_read(route, pending.span, &response) {
-            Ok(Values::Words(words)) if !pending.span.device.is_bit() => {
-                let mut offset = 0usize;
-                let mut results = Vec::with_capacity(p.covers.len());
-                for cover in &p.covers {
-                    let spec = &specs[*cover as usize];
-                    let (_, _, kind) =
-                        parse_read_address(&spec.address, &spec.data_type, spec.string_words)
-                            .map_err(FatalError::Protocol)?;
-                    let end = offset + usize::from(kind.points());
-                    let tag_words = words
-                        .get(offset..end)
-                        .ok_or_else(|| FatalError::Protocol("tag words exceed response".into()))?;
-                    results.push(Ok(kind.decode_words(tag_words, conn.word_order)?));
-                    offset = end;
-                }
-                if offset != words.len() {
-                    return Err(FatalError::Protocol("response words exceed covers".into()));
-                }
-                Ok(results)
+        word_offset = word_offset
+            .checked_add(tag.count)
+            .ok_or_else(|| FatalError::Protocol("batch word count overflow".into()))?;
+    }
+    if word_offset != pending.span.count {
+        return Err(FatalError::Protocol(
+            "plan word count does not match specs".into(),
+        ));
+    }
+    let series = known_series(model).expect("ready model has series");
+    let expected = encode_span(route, series, pending.span, pending.module)
+        .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
+    if p.step.send != expected
+        || p.step.max_len != read_step(route.frame, expected, pending.span).max_len
+    {
+        return Err(FatalError::Protocol("plan bytes do not match spec".into()));
+    }
+    conn.pending.borrow_mut().remove(&route.serial);
+    conn.read_order
+        .borrow_mut()
+        .retain(|serial| *serial != route.serial);
+    match decode_read(route, pending.span, &response) {
+        Ok(Values::Words(words)) if !pending.span.device.is_bit() => {
+            let mut offset = 0usize;
+            let mut results = Vec::with_capacity(p.covers.len());
+            for cover in &p.covers {
+                let spec = &specs[*cover as usize];
+                let (_, _, kind) =
+                    parse_read_address(&spec.address, &spec.data_type, spec.string_words)
+                        .map_err(FatalError::Protocol)?;
+                let end = offset + usize::from(kind.points());
+                let tag_words = words
+                    .get(offset..end)
+                    .ok_or_else(|| FatalError::Protocol("tag words exceed response".into()))?;
+                results.push(Ok(kind.decode_words(tag_words, conn.word_order)?));
+                offset = end;
             }
-            Ok(Values::Bits(bits)) if pending.span.device.is_bit() => {
-                if bits.len() != p.covers.len() {
-                    return Err(FatalError::Protocol(
-                        "bit response does not match covers".into(),
-                    ));
-                }
-                Ok(bits.into_iter().map(Value::Bool).map(Ok).collect())
+            if offset != words.len() {
+                return Err(FatalError::Protocol("response words exceed covers".into()));
             }
-            Ok(_) => Err(FatalError::Protocol(
-                "read response has wrong device unit".into(),
-            )),
-            Err(ResponseError::EndCode(code)) => Ok((0..pending.covers.len())
-                .map(|_| {
-                    Err(ItemError::Device(banto::driver::types::DeviceError {
-                        code: u32::from(code),
-                        message: format!("SLMP end code 0x{code:04X}"),
-                    }))
-                })
-                .collect()),
-            Err(error) => Err(response_error(error)),
+            Ok(results)
+        }
+        Ok(Values::Bits(bits)) if pending.span.device.is_bit() => {
+            if bits.len() != p.covers.len() {
+                return Err(FatalError::Protocol(
+                    "bit response does not match covers".into(),
+                ));
+            }
+            Ok(bits.into_iter().map(Value::Bool).map(Ok).collect())
+        }
+        Ok(_) => Err(FatalError::Protocol(
+            "read response has wrong device unit".into(),
+        )),
+        Err(ResponseError::EndCode(code)) => Ok((0..pending.covers.len())
+            .map(|_| {
+                Err(ItemError::Device(banto::driver::types::DeviceError {
+                    code: u32::from(code),
+                    message: format!("SLMP end code 0x{code:04X}"),
+                }))
+            })
+            .collect()),
+        Err(error) => Err(response_error(error)),
+    }
+}
+
+impl PendingRead {
+    fn covers(&self) -> &[u32] {
+        match self {
+            Self::Device(read) => &read.covers,
+            Self::Labels { covers, .. } => covers,
         }
     }
+}
+
+fn pending_read_step(
+    route: Route,
+    series: Series,
+    read: &PendingRead,
+) -> Result<session::Step, FatalError> {
+    match read {
+        PendingRead::Device(group) => {
+            let send = encode_span(route, series, group.span, group.module)
+                .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
+            Ok(read_step(route.frame, send, group.span))
+        }
+        PendingRead::Labels { labels, .. } => label_read_step(route, labels),
+    }
+}
+
+fn label_read_step(route: Route, labels: &[Label]) -> Result<session::Step, FatalError> {
+    let names = labels.iter().map(Label::utf16).collect::<Vec<_>>();
+    let refs = names.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let send = encode_label_read(route, &refs)
+        .map_err(|_| FatalError::Protocol("invalid label read".into()))?;
+    let mut step = frame_step(route.frame, send);
+    step.max_len = label::read_max_len(route.frame, labels);
+    Ok(step)
+}
+
+/// Pack readable label tags, in input order, into 041C requests that each
+/// fit the 1920-byte send data limit. Unparsable labels stay uncovered.
+fn plan_label_groups(specs: &[TagSpec]) -> Vec<PendingRead> {
+    let mut groups = Vec::new();
+    let mut covers: Vec<u32> = Vec::new();
+    let mut labels: Vec<Label> = Vec::new();
+    let mut units: Vec<usize> = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
+        if !is_label(&spec.address) {
+            continue;
+        }
+        let Ok(label) = parse_label(&spec.address, &spec.data_type, spec.string_words) else {
+            continue;
+        };
+        let Ok(cover) = u32::try_from(index) else {
+            continue;
+        };
+        let name_units = label.utf16().len();
+        if !labels.is_empty()
+            && (labels.len() == usize::from(u16::MAX)
+                || label_read_data_len(units.iter().copied().chain([name_units]))
+                    > LABEL_SEND_DATA_LIMIT)
+        {
+            groups.push(PendingRead::Labels {
+                covers: std::mem::take(&mut covers),
+                labels: std::mem::take(&mut labels),
+            });
+            units.clear();
+        }
+        covers.push(cover);
+        labels.push(label);
+        units.push(name_units);
+    }
+    if !labels.is_empty() {
+        groups.push(PendingRead::Labels { covers, labels });
+    }
+    groups
+}
+
+/// Decode one 041C read. Each label's data type ID and length must match its
+/// tag exactly; a mismatch fails only that item with `rejected`.
+fn decode_labels(
+    conn: &SlmpConnection,
+    p: &read::Planned,
+    specs: &[TagSpec],
+    route: Route,
+    covers: &[u32],
+    labels: &[Label],
+    response: &[u8],
+) -> Result<Vec<Result<Value, ItemError>>, FatalError> {
+    if p.covers != covers || covers.is_empty() || covers.len() != labels.len() {
+        return Err(FatalError::Protocol(
+            "plan covers do not match pending read".into(),
+        ));
+    }
+    for (cover, label) in covers.iter().zip(labels) {
+        let spec = specs
+            .get(*cover as usize)
+            .ok_or_else(|| FatalError::Protocol("cover outside specs".into()))?;
+        if parse_label(&spec.address, &spec.data_type, spec.string_words).as_ref() != Ok(label) {
+            return Err(FatalError::Protocol("plan does not match specs".into()));
+        }
+    }
+    let expected = label_read_step(route, labels)?;
+    if p.step.send != expected.send || p.step.max_len != expected.max_len {
+        return Err(FatalError::Protocol("plan bytes do not match spec".into()));
+    }
+    conn.pending.borrow_mut().remove(&route.serial);
+    conn.read_order
+        .borrow_mut()
+        .retain(|serial| *serial != route.serial);
+    match decode_label_read(route, labels.len(), response) {
+        Ok(entries) => labels
+            .iter()
+            .zip(entries)
+            .map(|(label, entry)| {
+                Ok(match label.ty.mismatch(entry.type_id, entry.data.len()) {
+                    Some(message) => Err(ItemError::Rejected(message)),
+                    None => Ok(label.ty.decode(&entry.data)?),
+                })
+            })
+            .collect(),
+        Err(ResponseError::EndCode(code)) => Ok(device_error_values(covers.len(), code)),
+        Err(error) => Err(response_error(error)),
+    }
+}
+
+fn device_error_values(len: usize, code: u16) -> Vec<Result<Value, ItemError>> {
+    (0..len)
+        .map(|_| {
+            Err(ItemError::Device(banto::driver::types::DeviceError {
+                code: u32::from(code),
+                message: format!("SLMP end code 0x{code:04X}"),
+            }))
+        })
+        .collect()
 }
 
 impl write_v1::Guest for Component {
@@ -2277,6 +2480,12 @@ fn write_next_on(
         })?;
         let (route, pending_run) = match pending {
             PendingWrite::Run { route, run } => (route, run),
+            PendingWrite::Labels {
+                route,
+                labels,
+                data,
+                stage,
+            } => return label_response(conn, &items, route, labels, data, stage, &response),
             PendingWrite::Rmw {
                 route,
                 series,
@@ -2318,6 +2527,9 @@ fn write_next_on(
         return Err(FatalError::InvalidConfig(
             "write requires at least one supported item".into(),
         ));
+    }
+    if items.iter().any(|item| is_label(&item.spec.address)) {
+        return label_preflight(conn, &items);
     }
     let (model, count) = match &*conn.phase.borrow() {
         Phase::Ready { model, count } => (model.clone(), *count),
@@ -2417,6 +2629,169 @@ fn write_next_on(
         step: frame_step(route.frame, send),
         covers: all_covers(items.len()),
     }))
+}
+
+/// Parse every label write item and encode its write data. A label named
+/// twice in one request is refused: one 141B would write it twice.
+fn parse_label_writes(items: &[write_v1::WriteItem]) -> Result<(Vec<Label>, Vec<Vec<u8>>), String> {
+    let mut labels: Vec<Label> = Vec::with_capacity(items.len());
+    let mut data = Vec::with_capacity(items.len());
+    for item in items {
+        let label = parse_label(
+            &item.spec.address,
+            &item.spec.data_type,
+            item.spec.string_words,
+        )?;
+        if labels
+            .iter()
+            .any(|earlier| earlier.canonical() == label.canonical())
+        {
+            return Err("a label is named twice in one write request".into());
+        }
+        data.push(label.ty.encode(&item.value)?);
+        labels.push(label);
+    }
+    Ok((labels, data))
+}
+
+/// Check a label write request before anything is sent, then send step (1):
+/// the 041C type check of every label.
+fn label_preflight(
+    conn: &SlmpConnection,
+    items: &[write_v1::WriteItem],
+) -> Result<write_v1::WriteProgress, FatalError> {
+    let len = items.len();
+    if !items.iter().all(|item| is_label(&item.spec.address)) {
+        return Ok(rejected_write_count(
+            len,
+            "labels and device tags cannot be mixed in one write request",
+        ));
+    }
+    match &*conn.phase.borrow() {
+        Phase::Ready { model, .. } if model.family == ModelFamily::StandardR => {}
+        Phase::Ready { .. } | Phase::NoRange(_) => {
+            return Ok(unsupported_write_count(
+                len,
+                "labels require a 0101-confirmed iQ-R CPU",
+            ))
+        }
+        _ => return Ok(rejected_write_count(len, "discovery is incomplete")),
+    }
+    let (labels, data) = match parse_label_writes(items) {
+        Ok(parsed) => parsed,
+        Err(message) => return Ok(rejected_write_count(len, &message)),
+    };
+    if !labels
+        .iter()
+        .all(|label| conn.write_policy.allows_label(label))
+    {
+        return Ok(rejected_write_count(
+            len,
+            "label is outside the enabled connection label allowlist",
+        ));
+    }
+    let size = label_write_data_len(
+        labels
+            .iter()
+            .zip(&data)
+            .map(|(label, data)| (label.utf16().len(), data.len())),
+    );
+    if size > LABEL_SEND_DATA_LIMIT {
+        return Ok(rejected_write_count(
+            len,
+            "label write exceeds the 1920-byte SLMP send data limit",
+        ));
+    }
+    let route = conn.route();
+    let step = label_read_step(route, &labels)?;
+    *conn.pending_write.borrow_mut() = Some(PendingWrite::Labels {
+        route,
+        labels,
+        data,
+        stage: LabelStage::Check,
+    });
+    Ok(write_v1::WriteProgress::Send(read::Planned {
+        step,
+        covers: all_covers(len),
+    }))
+}
+
+/// One label write response. The caller has consumed the pending step and
+/// poisoned writes; only a final outcome or a PLC refusal clears the poison.
+fn label_response(
+    conn: &SlmpConnection,
+    items: &[write_v1::WriteItem],
+    route: Route,
+    labels: Vec<Label>,
+    data: Vec<Vec<u8>>,
+    stage: LabelStage,
+    response: &[u8],
+) -> Result<write_v1::WriteProgress, FatalError> {
+    if parse_label_writes(items).ok() != Some((labels.clone(), data.clone())) {
+        return Err(FatalError::Protocol("write item changed after send".into()));
+    }
+    let len = items.len();
+    if stage == LabelStage::Write {
+        // Success is the end code alone; there is no read-back.
+        return match decode_write_ack(route, response) {
+            Ok(()) => {
+                conn.write_poisoned.set(false);
+                Ok(write_v1::WriteProgress::Done(
+                    (0..len).map(|_| Ok(())).collect(),
+                ))
+            }
+            Err(ResponseError::EndCode(code)) => {
+                conn.write_poisoned.set(false);
+                Ok(device_error_results(len, code))
+            }
+            Err(error) => Err(response_error(error)),
+        };
+    }
+    let entries = match decode_label_read(route, labels.len(), response) {
+        Ok(entries) => entries,
+        Err(ResponseError::EndCode(code)) => {
+            // Refused before anything was written.
+            conn.write_poisoned.set(false);
+            return Ok(device_error_results(len, code));
+        }
+        Err(error) => return Err(response_error(error)),
+    };
+    if let Some(message) = labels.iter().zip(&entries).find_map(|(label, entry)| {
+        label
+            .ty
+            .mismatch(entry.type_id, entry.data.len())
+            .map(|why| format!("{}: {why}; nothing was written", label.canonical()))
+    }) {
+        conn.write_poisoned.set(false);
+        return Ok(rejected_write_count(len, &message));
+    }
+    let next = conn.route();
+    let names = labels.iter().map(Label::utf16).collect::<Vec<_>>();
+    let writes = names
+        .iter()
+        .zip(&data)
+        .map(|(name, data)| LabelWrite { name, data })
+        .collect::<Vec<_>>();
+    let send = encode_label_write(next, &writes)
+        .map_err(|_| FatalError::Protocol("validated label write cannot be encoded".into()))?;
+    *conn.pending_write.borrow_mut() = Some(PendingWrite::Labels {
+        route: next,
+        labels,
+        data,
+        stage: LabelStage::Write,
+    });
+    Ok(write_v1::WriteProgress::Send(read::Planned {
+        step: frame_step(next.frame, send),
+        covers: all_covers(len),
+    }))
+}
+
+fn unsupported_write_count(len: usize, message: &str) -> write_v1::WriteProgress {
+    write_v1::WriteProgress::Done(
+        (0..len)
+            .map(|_| Err(ItemError::Unsupported(message.into())))
+            .collect(),
+    )
 }
 
 fn all_covers(len: usize) -> Vec<u32> {
@@ -2767,6 +3142,9 @@ impl address::Guest for Component {
         data_type: String,
         string_words: Option<u32>,
     ) -> Result<address::Parsed, String> {
+        if is_label(&text) {
+            return parse_label(&text, &data_type, string_words).map(|l| label::parsed_label(&l));
+        }
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
         let module = unit_buffer_module(&text);
         let parsed = address::Parsed {
@@ -2848,6 +3226,9 @@ impl address::Guest for Component {
         string_words: Option<u32>,
         n: i64,
     ) -> Result<String, String> {
+        if is_label(&text) {
+            return label::offset_label(&text, &data_type, string_words, n);
+        }
         let (device, number, kind) = parse_read_address(&text, &data_type, string_words)?;
         let module = unit_buffer_module(&text);
         let next = if let ReadKind::WordBit(bit) = kind {
@@ -2895,6 +3276,10 @@ impl address::Guest for Component {
     }
 
     fn offset_words(text: String, n: i64) -> Result<String, String> {
+        // A label's element width is its type, which this call does not carry.
+        if is_label(&text) {
+            return Err("offset_words is undefined for labels".into());
+        }
         if ["LTS", "LTC", "LSTS", "LSTC", "LTN", "LSTN", "LCN"]
             .iter()
             .any(|prefix| text.starts_with(prefix))
@@ -2927,7 +3312,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and decimal ZR. Q ZR (decimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only. An FX5 (iQ-F) CPU needs frame 3e and its own station; it reads M/L/F/B/S/D/W/SB/SW/SM/SD/Z, T/ST/C contacts, coils and current values and LCS/LCC with ranges from its own SD table, and the decimal file register Rn as a read-only word tag (Rn is FX5 only). FX5 X/Y, V, LT/LST, LCN, ZR, RD and U\\G are not supported, and FX5 writes follow the standard R rules for D/W and M/L/B only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and decimal ZR. Q ZR (decimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only. An FX5 (iQ-F) CPU needs frame 3e and its own station; it reads M/L/F/B/S/D/W/SB/SW/SM/SD/Z, T/ST/C contacts, coils and current values and LCS/LCC with ranges from its own SD table, and the decimal file register Rn as a read-only word tag (Rn is FX5 only). FX5 X/Y, V, LT/LST, LCN, ZR, RD and U\\G are not supported, and FX5 writes follow the standard R rules for D/W and M/L/B only. A GX Works3 global label is @ followed by its name as written (case kept, sent in UTF-16; structure members with ., arrays with up to three decimal subscripts such as @Arr[3] or @M[1,2]); it needs \"Access from External Device\" enabled in GX Works3 and is read with 041C and written with 141B on an iQ-R CPU only, as bit, u16, i16, u32, i32, f32, f64 or string (string_words) matching the label's data type exactly (no 64-bit integers, bit specification @X.3 or digit specification). A label write checks every label's data type first and writes nothing on a mismatch; it needs the SLMP write mode, a label_write_allowlist entry and a matching Host gate, and labels never share a write request with device tags"
             .into()
     }
 
@@ -3102,7 +3487,7 @@ impl config::Guest for Component {
             SettingField {
                 key: MODE_KEY.into(),
                 label: "SLMP write mode".into(),
-                help: Some("D/W numeric and string, M/Y/L/B bool and D/W word-bit writes require one explicit connection allowlist, same-connection area SD proof, and a separate Host write gate. Default is disabled. Unknown ranges reject writes.".into()),
+                help: Some("D/W numeric and string, M/Y/L/B bool and D/W word-bit writes require one explicit connection allowlist, same-connection area SD proof, and a separate Host write gate. Global label writes (iQ-R only) require a label_write_allowlist entry instead. Enabling needs at least one of the two allowlists. Default is disabled. Unknown ranges reject writes.".into()),
                 kind: FieldKind::Choice(vec![
                     ChoiceOption {
                         value: "disabled".into(),
@@ -3124,6 +3509,18 @@ impl config::Guest for Component {
                 kind: FieldKind::Text(TextSpec {
                     max_len: Some(256),
                     placeholder: Some("D3010-D3013,W1A-W1F".into()),
+                }),
+                required: false,
+                default: Some(SettingValue::Text(String::new())),
+                group: FieldGroup::Advanced,
+            },
+            SettingField {
+                key: LABEL_ALLOWLIST_KEY.into(),
+                label: "SLMP writable labels".into(),
+                help: Some("Semicolon-separated global labels that may be written on an iQ-R CPU when the SLMP write mode is enabled, such as @Tank1.Level;@Arr[0-9];@M[1,0-15]. Each entry is a canonical label (@ and the name as written, decimal subscripts without leading zeros) or a range of its last subscript (start-end, start not above end). No spaces, prefixes or wildcards; matching is case-sensitive. Up to 32 entries and 2048 characters; empty or duplicate entries are refused. A label write first reads every label to check its data type and writes nothing on a mismatch, then writes all items in one request judged by its end code (no read-back). A separate Host gate is required.".into()),
+                kind: FieldKind::Text(TextSpec {
+                    max_len: Some(2048),
+                    placeholder: Some("@Tank1.Level;@Arr[0-9]".into()),
                 }),
                 required: false,
                 default: Some(SettingValue::Text(String::new())),
@@ -6929,6 +7326,635 @@ mod tests {
         // Write mode disabled.
         let (conn, _) = fx5_ready(&[], Some([8000, 0x200]), Some(0), None);
         assert_rejected(&conn, &[word_write("D100", 1)], "disabled");
+    }
+
+    // ---- G3 global labels ----
+
+    const LABEL_ALLOW: &str = "@Tank1.Level;@Arr[0-9];@M[1,0-15];@S;@タンク.水位";
+
+    fn label_conn(extra: &[(&str, &str)], family: ModelFamily) -> SlmpConnection {
+        let mut settings = vec![
+            ("d_u16_write_mode", "enabled"),
+            ("label_write_allowlist", LABEL_ALLOW),
+        ];
+        for (key, value) in extra {
+            settings.retain(|(existing, _)| existing != key);
+            settings.push((key, value));
+        }
+        let conn = SlmpConnection::new(&route_settings(&settings)).expect("valid settings");
+        *conn.phase.borrow_mut() = Phase::Ready {
+            model: model(family),
+            count: PointCount::Unknown,
+        };
+        conn
+    }
+
+    fn label_write(address: &str, data_type: &str, value: Value) -> write_v1::WriteItem {
+        write_v1::WriteItem {
+            spec: tag(address, data_type),
+            value,
+        }
+    }
+
+    /// Label name length and UTF-16LE name, as in a 041C/141B request.
+    fn wire_name(name: &str) -> Vec<u8> {
+        let units = name.encode_utf16().collect::<Vec<_>>();
+        let mut out = (units.len() as u16).to_le_bytes().to_vec();
+        out.extend(units.iter().flat_map(|unit| unit.to_le_bytes()));
+        out
+    }
+
+    /// 4E request to the own station with the default timer.
+    fn own_4e_request(serial: u16, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x54, 0];
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 3, 0]);
+        out.extend_from_slice(&u16::try_from(body.len() + 2).unwrap().to_le_bytes());
+        out.extend_from_slice(&[0x10, 0]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// One 041C response entry: type ID, spare byte, length, data.
+    fn label_entry(type_id: u8, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![type_id, 0xee];
+        out.extend_from_slice(&u16::try_from(data.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn label_body(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = u16::try_from(entries.len()).unwrap().to_le_bytes().to_vec();
+        for entry in entries {
+            out.extend_from_slice(entry);
+        }
+        out
+    }
+
+    /// A label write step: its bytes (the 141B ack bound stays 64, the 041C
+    /// check uses the label response bound).
+    fn label_sent(progress: Result<write_v1::WriteProgress, FatalError>, len: usize) -> Vec<u8> {
+        let Ok(write_v1::WriteProgress::Send(plan)) = progress else {
+            panic!("label write step must send")
+        };
+        assert_eq!(plan.covers, all_covers(len));
+        let header = if plan.step.send[0] == 0x54 { 15 } else { 11 };
+        let send = &plan.step.send;
+        if send[header..header + 2] == [0x1c, 0x04] {
+            let labels = u16::from_le_bytes([send[header + 4], send[header + 5]]);
+            assert_eq!(
+                plan.step.max_len,
+                header as u32 + 2 + u32::from(labels) * (4 + 512)
+            );
+        } else {
+            assert_eq!(plan.step.max_len, 64);
+        }
+        plan.step.send
+    }
+
+    fn values_debug(results: &[Result<Value, ItemError>]) -> Vec<String> {
+        results.iter().map(|result| format!("{result:?}")).collect()
+    }
+
+    #[test]
+    fn g3_label_addresses_parse_offset_and_declare_metadata() {
+        let parse = |text: &str, data_type: &str, words| {
+            <Component as address::Guest>::parse(text.into(), data_type.into(), words)
+        };
+        for (text, data_type, words, canonical, word_count) in [
+            ("@Tank1.Level", "f32", None, "@Tank1.Level", 2),
+            ("@Arr[03]", "bit", None, "@Arr[3]", 1),
+            ("@M[1,02]", "u16", None, "@M[1,2]", 1),
+            ("@C[1,2,3]", "i32", None, "@C[1,2,3]", 2),
+            ("@St.Arr[2].x", "f64", None, "@St.Arr[2].x", 4),
+            ("@タンク.水位", "i16", None, "@タンク.水位", 1),
+            ("@Name", "string", Some(5), "@Name", 5),
+        ] {
+            let parsed = parse(text, data_type, words).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(parsed.canonical, canonical);
+            assert_eq!(parsed.area, "@");
+            assert_eq!(parsed.index, None);
+            assert_eq!(parsed.bit, None);
+            assert!(parsed.writable_area);
+            assert_eq!(parsed.word_count, word_count, "{text}");
+        }
+        for (text, data_type) in [
+            ("@", "u16"),
+            ("@A B", "u16"),
+            ("@X.3", "bit"),
+            ("@A", "i64"),
+            ("@A", "u64"),
+            ("@Arr[1", "u16"),
+            ("@Arr[1,2,3,4]", "u16"),
+        ] {
+            assert!(parse(text, data_type, None).is_err(), "{text}");
+        }
+        let long = format!("@{}", "A".repeat(953));
+        assert!(parse(&long, "u16", None).is_err());
+        let offset = |text: &str, n| {
+            <Component as address::Guest>::offset(text.into(), "u16".into(), None, n)
+        };
+        assert_eq!(offset("@Arr[3]", 2).as_deref(), Ok("@Arr[5]"));
+        assert_eq!(offset("@M[1,2]", 1).as_deref(), Ok("@M[1,3]"));
+        assert!(offset("@Arr[3]", -4).is_err());
+        assert!(offset("@Tank1.Level", 1).is_err());
+        assert!(<Component as address::Guest>::offset_words("@Arr[3]".into(), 1).is_err());
+        // Device syntax is unchanged.
+        assert_eq!(parse("D100", "u16", None).unwrap().area, "D");
+    }
+
+    #[test]
+    fn g3_r_read_packs_labels_into_one_041c_and_decodes_exact_types() {
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let specs = vec![
+            tag("@Tank1.Level", "f32"),
+            tag("D10", "u16"),
+            tag("@タ", "i32"),
+            tag("@Flag", "bit"),
+            string_spec("@Name", 2),
+            tag("@Bad.3", "bit"),
+        ];
+        let plans = plan_on(&conn, specs.clone()).expect("plan");
+        assert_eq!(plans.len(), 2, "D10 and one label request");
+        assert_eq!(plans[0].covers, vec![1]);
+        let label_plan = plans[1].clone();
+        assert_eq!(
+            label_plan.covers,
+            vec![0, 2, 3, 4],
+            "@Bad.3 stays uncovered"
+        );
+        let mut body = vec![0x1c, 0x04, 0, 0, 4, 0, 0, 0];
+        for name in ["Tank1.Level", "タ", "Flag", "Name"] {
+            body.extend(wire_name(name));
+        }
+        assert_eq!(label_plan.step.send, own_4e_request(2, &body));
+        assert_eq!(label_plan.step.max_len, 15 + 2 + 4 * (4 + 512));
+        let response = reply(
+            &conn,
+            2,
+            0,
+            &label_body(&[
+                label_entry(6, &1.5f32.to_le_bytes()),
+                label_entry(5, &(-2i32).to_le_bytes()),
+                label_entry(1, &[1, 0]),
+                label_entry(9, b"AB\0\0"),
+            ]),
+        );
+        let results = decode_on(&conn, label_plan, specs, response).expect("decode");
+        assert_eq!(
+            values_debug(&results),
+            [
+                "Ok(Value::Float(1.5))",
+                "Ok(Value::Int(-2))",
+                "Ok(Value::Bool(true))",
+                &format!(
+                    "{:?}",
+                    Ok::<Value, ItemError>(Value::Bytes(b"AB\0\0".to_vec()))
+                ),
+            ]
+        );
+        assert_eq!(conn.pending.borrow().len(), 1, "only D10 remains");
+    }
+
+    #[test]
+    fn g3_read_type_or_length_mismatch_rejects_only_that_item() {
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let specs = vec![
+            tag("@A", "u16"),
+            tag("@B", "u16"),
+            string_spec("@S", 2),
+            tag("@C", "i32"),
+        ];
+        let plan = plan_on(&conn, specs.clone()).unwrap().remove(0);
+        let response = reply(
+            &conn,
+            1,
+            0,
+            &label_body(&[
+                label_entry(4, &[1, 0]),
+                label_entry(2, &[7, 0]),
+                label_entry(9, b"ABCDEF"),
+                label_entry(5, &[0xff; 4]),
+            ]),
+        );
+        let results = decode_on(&conn, plan, specs, response).unwrap();
+        assert!(
+            matches!(&results[0], Err(ItemError::Rejected(m))
+                if m == "label data type ID is 4, tag type u16 needs ID 2"),
+            "{:?}",
+            results[0]
+        );
+        assert!(matches!(results[1], Ok(Value::Uint(7))));
+        assert!(matches!(&results[2], Err(ItemError::Rejected(m))
+                if m == "label data length is 6 bytes, tag type string needs 4 bytes"));
+        assert!(matches!(results[3], Ok(Value::Int(-1))));
+    }
+
+    #[test]
+    fn g3_read_end_code_is_device_for_the_frame_and_bad_shapes_are_fatal() {
+        let specs = vec![tag("@A", "u16"), tag("@B", "bit")];
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let plan = plan_on(&conn, specs.clone()).unwrap().remove(0);
+        let results = decode_on(&conn, plan, specs.clone(), reply(&conn, 1, 0x40c0, &[])).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| matches!(result,
+            Err(ItemError::Device(error)) if error.code == 0x40c0)));
+        for body in [
+            label_body(&[label_entry(2, &[1, 0])]),
+            label_body(&[label_entry(2, &[1, 0]), label_entry(1, &[2, 0])]),
+            label_body(&[label_entry(2, &[1, 0]), label_entry(1, &[1])]),
+            [
+                label_body(&[label_entry(2, &[1, 0]), label_entry(1, &[1, 0])]),
+                vec![0],
+            ]
+            .concat(),
+        ] {
+            let conn = label_conn(&[], ModelFamily::StandardR);
+            let plan = plan_on(&conn, specs.clone()).unwrap().remove(0);
+            assert!(
+                decode_on(&conn, plan, specs.clone(), reply(&conn, 1, 0, &body)).is_err(),
+                "{body:?}"
+            );
+        }
+        // A plan that does not match the pending request is refused.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let mut plan = plan_on(&conn, specs.clone()).unwrap().remove(0);
+        plan.step.max_len += 1;
+        assert!(decode_on(&conn, plan, specs.clone(), reply(&conn, 1, 0x40c0, &[])).is_err());
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let plan = plan_on(&conn, specs.clone()).unwrap().remove(0);
+        let changed = vec![tag("@A", "i16"), tag("@B", "bit")];
+        assert!(decode_on(&conn, plan, changed, reply(&conn, 1, 0x40c0, &[])).is_err());
+    }
+
+    #[test]
+    fn g3_3e_routed_read_uses_the_route_and_issue_order() {
+        let conn = label_conn(
+            &[("frame", "3e"), ("network_no", "1"), ("station_no", "2")],
+            ModelFamily::StandardR,
+        );
+        let specs = vec![tag("@A", "u16")];
+        let plan = plan_on(&conn, specs.clone()).unwrap().remove(0);
+        let mut expected = vec![0x50, 0, 1, 2, 0xff, 3, 0, 14, 0, 0x10, 0];
+        expected.extend_from_slice(&[0x1c, 0x04, 0, 0, 1, 0, 0, 0]);
+        expected.extend(wire_name("A"));
+        assert_eq!(plan.step.send, expected);
+        assert_eq!(plan.step.max_len, 11 + 2 + 4 + 512);
+        // 3E: a second read waits for the first answer.
+        assert!(plan_on(&conn, specs.clone()).is_err());
+        let response = reply(&conn, 0, 0, &label_body(&[label_entry(2, &[9, 0])]));
+        let results = decode_on(&conn, plan, specs.clone(), response).unwrap();
+        assert!(matches!(results[0], Ok(Value::Uint(9))));
+        // A response echoing another route is malformed.
+        let plan = plan_on(&conn, specs.clone()).unwrap().remove(0);
+        let mut wrong = reply(&conn, 0, 0, &label_body(&[label_entry(2, &[9, 0])]));
+        wrong[3] = 3;
+        assert!(decode_on(&conn, plan, specs, wrong).is_err());
+    }
+
+    #[test]
+    fn g3_read_splits_labels_at_the_1920_byte_send_limit() {
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        // 400-unit names: 10 + 2 x 802 = 1614 fits, a third would be 2416.
+        let specs = (0..5)
+            .map(|i| tag(&format!("@{}{i}", "A".repeat(399)), "u16"))
+            .collect::<Vec<_>>();
+        let plans = plan_on(&conn, specs).unwrap();
+        let covers = plans.iter().map(|p| p.covers.clone()).collect::<Vec<_>>();
+        assert_eq!(covers, vec![vec![0, 1], vec![2, 3], vec![4]]);
+        // Exactly 1920: 10 + (2 + 2 x 953) + (2 + 0) is impossible, so use
+        // 476 + 477 units: 10 + 954 + 956 = 1920.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let specs = vec![
+            tag(&format!("@{}", "B".repeat(476)), "u16"),
+            tag(&format!("@{}", "C".repeat(477)), "u16"),
+            tag("@D", "u16"),
+        ];
+        let plans = plan_on(&conn, specs).unwrap();
+        assert_eq!(plans[0].covers, vec![0, 1]);
+        assert_eq!(
+            u16::from_le_bytes([plans[0].step.send[11], plans[0].step.send[12]]),
+            1920
+        );
+        assert_eq!(plans[1].covers, vec![2]);
+    }
+
+    #[test]
+    fn g3_labels_are_unsupported_on_q_q25prh_fx5_and_unknown_models() {
+        let specs = vec![tag("@A", "u16"), tag("D0", "u16")];
+        for family in [
+            ModelFamily::StandardQ,
+            ModelFamily::Q25PrhWireOnly,
+            ModelFamily::Fx5,
+        ] {
+            let conn = label_conn(&[], family);
+            let plans = plan_on(&conn, specs.clone()).unwrap();
+            assert!(
+                plans.iter().all(|plan| !plan.covers.contains(&0)),
+                "{family:?}: the label stays uncovered"
+            );
+            let conn = label_conn(&[], family);
+            let results = done(write_next_on(
+                &conn,
+                vec![label_write("@Tank1.Level", "u16", Value::Uint(1))],
+                None,
+            ));
+            assert!(
+                matches!(&results[0], Err(ItemError::Unsupported(_))),
+                "{family:?}"
+            );
+            assert_eq!(conn.next_serial.get(), 1, "{family:?}: nothing sent");
+        }
+        // An unknown or refused 0101 model never reaches Ready.
+        for unknown in [None, Some(model(ModelFamily::Unknown))] {
+            let conn = label_conn(&[], ModelFamily::StandardR);
+            *conn.phase.borrow_mut() = Phase::NoRange(unknown);
+            let results = done(write_next_on(
+                &conn,
+                vec![label_write("@Tank1.Level", "u16", Value::Uint(1))],
+                None,
+            ));
+            assert!(matches!(&results[0], Err(ItemError::Unsupported(_))));
+            assert_eq!(conn.next_serial.get(), 1);
+        }
+    }
+
+    #[test]
+    fn g3_r_4e_write_checks_types_then_writes_all_in_one_141b() {
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let items = vec![
+            label_write("@Tank1.Level", "f32", Value::Float(1.5)),
+            label_write("@Arr[3]", "bit", Value::Bool(true)),
+            label_write("@タンク.水位", "i16", Value::Int(-2)),
+        ];
+        let check = label_sent(write_next_on(&conn, items.clone(), None), 3);
+        let mut body = vec![0x1c, 0x04, 0, 0, 3, 0, 0, 0];
+        for name in ["Tank1.Level", "Arr[3]", "タンク.水位"] {
+            body.extend(wire_name(name));
+        }
+        assert_eq!(check, own_4e_request(1, &body));
+        let types = label_body(&[
+            label_entry(6, &[0; 4]),
+            label_entry(1, &[0, 0]),
+            label_entry(4, &[0, 0]),
+        ]);
+        let write = label_sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &types))),
+            3,
+        );
+        let mut body = vec![0x1b, 0x14, 0, 0, 3, 0, 0, 0];
+        body.extend(wire_name("Tank1.Level"));
+        body.extend_from_slice(&[4, 0]);
+        body.extend_from_slice(&1.5f32.to_le_bytes());
+        body.extend(wire_name("Arr[3]"));
+        body.extend_from_slice(&[2, 0, 1, 0]);
+        body.extend(wire_name("タンク.水位"));
+        body.extend_from_slice(&[2, 0, 0xfe, 0xff]);
+        assert_eq!(write, own_4e_request(2, &body));
+        let results = done(write_next_on(
+            &conn,
+            items.clone(),
+            Some(reply(&conn, 2, 0, &[])),
+        ));
+        assert!(results.iter().all(Result::is_ok));
+        assert!(!conn.write_poisoned.get());
+        assert!(conn.pending_write.borrow().is_none());
+        // A string label writes the Host's bytes as given.
+        let items = vec![string_write("@S", 2, b"AB\0\0")];
+        label_sent(write_next_on(&conn, items.clone(), None), 1);
+        let write = label_sent(
+            write_next_on(
+                &conn,
+                items.clone(),
+                Some(reply(
+                    &conn,
+                    3,
+                    0,
+                    &label_body(&[label_entry(9, b"xy\0\0")]),
+                )),
+            ),
+            1,
+        );
+        assert_eq!(&write[write.len() - 6..], &[4, 0, b'A', b'B', 0, 0]);
+    }
+
+    #[test]
+    fn g3_write_type_mismatch_rejects_everything_and_sends_no_141b() {
+        for types in [
+            vec![label_entry(5, &[0; 4]), label_entry(1, &[0, 0])],
+            vec![label_entry(6, &[0; 4]), label_entry(2, &[0, 0])],
+            vec![label_entry(6, &[0; 8]), label_entry(1, &[0, 0])],
+        ] {
+            let conn = label_conn(&[], ModelFamily::StandardR);
+            let items = vec![
+                label_write("@Tank1.Level", "f32", Value::Float(1.5)),
+                label_write("@Arr[3]", "bit", Value::Bool(true)),
+            ];
+            label_sent(write_next_on(&conn, items.clone(), None), 2);
+            let results = done(write_next_on(
+                &conn,
+                items,
+                Some(reply(&conn, 1, 0, &label_body(&types))),
+            ));
+            assert!(results.iter().all(|result| matches!(result,
+                Err(ItemError::Rejected(m)) if m.ends_with("nothing was written"))));
+            assert_eq!(conn.next_serial.get(), 2, "no 141B was issued");
+            assert!(conn.pending_write.borrow().is_none());
+            assert!(!conn.write_poisoned.get());
+        }
+    }
+
+    #[test]
+    fn g3_write_end_codes_map_per_step_and_bad_responses_are_fatal() {
+        let items = vec![label_write("@Tank1.Level", "u16", Value::Uint(5))];
+        let ok_types = label_body(&[label_entry(2, &[0, 0])]);
+        // (1) refused: device for every item, nothing written.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        label_sent(write_next_on(&conn, items.clone(), None), 1);
+        let results = done(write_next_on(
+            &conn,
+            items.clone(),
+            Some(reply(&conn, 1, 0x4031, &[])),
+        ));
+        assert!(matches!(&results[0], Err(ItemError::Device(e)) if e.code == 0x4031));
+        assert_eq!(conn.next_serial.get(), 2);
+        assert!(!conn.write_poisoned.get());
+        // (2) refused: device for every item.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        label_sent(write_next_on(&conn, items.clone(), None), 1);
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &ok_types))),
+            1,
+        );
+        let results = done(write_next_on(
+            &conn,
+            items.clone(),
+            Some(reply(&conn, 2, 0xc05c, &[])),
+        ));
+        assert!(matches!(&results[0], Err(ItemError::Device(e)) if e.code == 0xc05c));
+        assert!(!conn.write_poisoned.get());
+        // A malformed (1) response is fatal.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        label_sent(write_next_on(&conn, items.clone(), None), 1);
+        assert!(write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[1, 0]))).is_err());
+        // A malformed (2) response is fatal and refuses writes until reconnect.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        label_sent(write_next_on(&conn, items.clone(), None), 1);
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &ok_types))),
+            1,
+        );
+        assert!(write_next_on(&conn, items.clone(), Some(reply(&conn, 2, 0, &[0]))).is_err());
+        assert!(conn.write_poisoned.get());
+        assert!(write_next_on(&conn, items.clone(), None).is_err());
+        // A (2) answer with another serial is malformed.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        label_sent(write_next_on(&conn, items.clone(), None), 1);
+        sent(
+            write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &ok_types))),
+            1,
+        );
+        assert!(write_next_on(&conn, items.clone(), Some(reply(&conn, 1, 0, &[]))).is_err());
+        // Items changed between steps are fatal.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        label_sent(write_next_on(&conn, items.clone(), None), 1);
+        let changed = vec![label_write("@Tank1.Level", "u16", Value::Uint(6))];
+        assert!(write_next_on(&conn, changed, Some(reply(&conn, 1, 0, &ok_types))).is_err());
+    }
+
+    #[test]
+    fn g3_3e_routed_write_uses_the_route_for_both_steps() {
+        let conn = label_conn(
+            &[("frame", "3e"), ("network_no", "1"), ("station_no", "2")],
+            ModelFamily::StandardR,
+        );
+        let items = vec![label_write("@S", "u16", Value::Uint(0x1234))];
+        let check = label_sent(write_next_on(&conn, items.clone(), None), 1);
+        assert_eq!(&check[..9], &[0x50, 0, 1, 2, 0xff, 3, 0, 14, 0]);
+        let write = label_sent(
+            write_next_on(
+                &conn,
+                items.clone(),
+                Some(reply(&conn, 0, 0, &label_body(&[label_entry(2, &[0, 0])]))),
+            ),
+            1,
+        );
+        let mut expected = vec![0x50, 0, 1, 2, 0xff, 3, 0, 18, 0, 0x10, 0];
+        expected.extend_from_slice(&[0x1b, 0x14, 0, 0, 1, 0, 0, 0]);
+        expected.extend(wire_name("S"));
+        expected.extend_from_slice(&[2, 0, 0x34, 0x12]);
+        assert_eq!(write, expected);
+        let results = done(write_next_on(&conn, items, Some(reply(&conn, 0, 0, &[]))));
+        assert!(results[0].is_ok());
+    }
+
+    #[test]
+    fn g3_label_writes_are_refused_before_send() {
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        let ok = label_write("@Tank1.Level", "u16", Value::Uint(1));
+        assert_rejected(&conn, &[ok.clone(), word_write("D100", 1)], "mixed");
+        assert_rejected(&conn, &[word_write("D100", 1), ok.clone()], "mixed");
+        assert_rejected(
+            &conn,
+            &[label_write("@Arr[10]", "u16", Value::Uint(1))],
+            "outside range",
+        );
+        assert_rejected(
+            &conn,
+            &[label_write("@tank1.level", "u16", Value::Uint(1))],
+            "case-sensitive",
+        );
+        assert_rejected(
+            &conn,
+            &[label_write("@M[2,0]", "u16", Value::Uint(1))],
+            "other leading subscript",
+        );
+        assert_rejected(&conn, &[ok.clone(), ok.clone()], "duplicate");
+        assert_rejected(
+            &conn,
+            &[label_write("@Arr[1]", "u16", Value::Uint(65536))],
+            "value",
+        );
+        assert_rejected(
+            &conn,
+            &[label_write("@Arr[1]", "bit", Value::Uint(1))],
+            "bool",
+        );
+        assert_rejected(
+            &conn,
+            &[label_write("@Arr[1]", "i64", Value::Int(1))],
+            "i64",
+        );
+        assert_rejected(
+            &conn,
+            &[string_write("@S", 2, b"ABCD")],
+            "string without NUL",
+        );
+        // Total 141B size: eight 128-word strings exceed 1920 bytes.
+        let big = (0..8)
+            .map(|i| string_write(&format!("@Arr[{i}]"), 128, &[0; 256]))
+            .collect::<Vec<_>>();
+        assert_rejected(&conn, &big, "1920 bytes");
+        assert!(matches!(
+            write_next_on(&conn, big[..7].to_vec(), None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        // Mode disabled, or only a device allowlist.
+        let disabled = label_conn(&[("d_u16_write_mode", "disabled")], ModelFamily::StandardR);
+        assert_rejected(&disabled, std::slice::from_ref(&ok), "disabled");
+        let device_only = label_conn(
+            &[
+                ("label_write_allowlist", ""),
+                ("d_u16_write_allowlist", "D100-D105"),
+            ],
+            ModelFamily::StandardR,
+        );
+        assert_rejected(
+            &device_only,
+            std::slice::from_ref(&ok),
+            "no label allowlist",
+        );
+        // Discovery not finished.
+        let conn = label_conn(&[], ModelFamily::StandardR);
+        *conn.phase.borrow_mut() = Phase::Start;
+        assert_rejected(&conn, &[ok], "discovery");
+    }
+
+    #[test]
+    fn g3_label_allowlist_setting_is_validated_and_declared() {
+        let messages = |extra: &[(&str, &str)]| route_messages(extra);
+        assert!(messages(&[
+            ("d_u16_write_mode", "enabled"),
+            ("label_write_allowlist", "@A;@B[0-3]")
+        ])
+        .is_empty());
+        assert!(messages(&[("label_write_allowlist", "@A")]).is_empty());
+        let errors = messages(&[("d_u16_write_mode", "enabled")]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, ALLOWLIST_KEY);
+        for bad in ["@A;", "@A;@A", "@A; @B", "@B[3-1]", "@B[*]", "B"] {
+            let errors = messages(&[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", "D10-D10"),
+                ("label_write_allowlist", bad),
+            ]);
+            assert!(
+                errors.iter().any(|(key, _)| key == LABEL_ALLOWLIST_KEY),
+                "{bad}: {errors:?}"
+            );
+        }
+        let schema = <Component as config::Guest>::schema();
+        let field = schema
+            .iter()
+            .find(|field| field.key == LABEL_ALLOWLIST_KEY)
+            .expect("label allowlist field");
+        assert!(matches!(&field.kind, config::FieldKind::Text(spec)
+            if spec.max_len == Some(2048)));
+        assert!(
+            matches!(&field.default, Some(config::SettingValue::Text(value)) if value.is_empty())
+        );
+        assert!(!field.required);
+        assert!(<Component as address::Guest>::help().contains("label_write_allowlist"));
     }
 }
 
