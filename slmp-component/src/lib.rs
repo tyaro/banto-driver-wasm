@@ -17,6 +17,10 @@
 //! `U<h>\G<n>` reads unit buffer memory (Q/R `U0`-`UFF`, plus R CPU buffer
 //! `U3E0`-`U3E3`) through the 0401 device extension. It is read-only, has no
 //! configured range (Unknown) and is always a request of its own.
+//! An FX5 (G2c) uses the Q wire over 3E to its own station only, sends the
+//! monitoring timer 0000H once identified, takes its ranges from its own SD
+//! table, reads the decimal file register `R<n>` (read-only), and has no X/Y,
+//! V, LT/LST, ZR, RD, LCN or `U\G` path here.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -64,6 +68,13 @@ enum Phase {
         d_count: PointCount,
         span: ReadSpan,
     },
+    /// FX5 only: SD304-305 (file register R count), after SD280-283.
+    AwaitFileRegisterSd {
+        route: Route,
+        model: TypeName,
+        d_count: PointCount,
+        span: ReadSpan,
+    },
     Ready {
         model: TypeName,
         count: PointCount,
@@ -73,6 +84,9 @@ enum Phase {
 
 struct SlmpConnection {
     base_route: Route,
+    /// Monitoring timer of every request; set from the family once 0101
+    /// identifies the model (FX5 0000H, otherwise the default 0010H).
+    timer: Cell<u16>,
     word_order: WordOrder,
     q25prh_test_write_enabled: bool,
     write_policy: WritePolicy,
@@ -84,6 +98,9 @@ struct SlmpConnection {
     q_w_total: Cell<Option<u32>>,
     bit_counts: Cell<[PointCount; 4]>, // M, Y, L, B; only same-connection SD evidence.
     diagnostic_bit_counts: Cell<[PointCount; 3]>, // X, SB, F; never a write grant.
+    /// FX5 SD304-305 file register R count; read path only (R is read-only).
+    fx5_r_count: Cell<PointCount>,
+    fx5_r_sd_refused: Cell<bool>,
     pending: RefCell<BTreeMap<u16, PendingRead>>,
     /// Pending read keys in issue order. 3E decodes only the front entry.
     read_order: RefCell<VecDeque<u16>>,
@@ -435,6 +452,7 @@ impl SlmpConnection {
                 setting(settings, ALLOWLIST_KEY),
             )
             .expect("settings validated above"),
+            timer: Cell::new(Route::default().timer),
             q25prh_internal_d_count: Cell::new(PointCount::Unknown),
             next_serial: Cell::new(1),
             phase: RefCell::new(Phase::Start),
@@ -442,6 +460,8 @@ impl SlmpConnection {
             q_w_total: Cell::new(None),
             bit_counts: Cell::new([PointCount::Unknown; 4]),
             diagnostic_bit_counts: Cell::new([PointCount::Unknown; 3]),
+            fx5_r_count: Cell::new(PointCount::Unknown),
+            fx5_r_sd_refused: Cell::new(false),
             pending: RefCell::new(BTreeMap::new()),
             read_order: RefCell::new(VecDeque::new()),
             pending_write: RefCell::new(None),
@@ -459,28 +479,11 @@ impl SlmpConnection {
         model: TypeName,
         d_count: PointCount,
     ) -> Result<Option<session::Step>, FatalError> {
-        if self.write_policy.has_bit_ranges()
-            && matches!(
-                model.family,
-                ModelFamily::StandardQ | ModelFamily::StandardR
-            )
-        {
-            let span = if model.family == ModelFamily::StandardQ {
-                ReadSpan {
-                    device: Device::SD,
-                    start: 290,
-                    count: 5,
-                }
-            } else {
-                ReadSpan {
-                    device: Device::SD,
-                    start: 262,
-                    count: 14,
-                }
-            };
+        let span = diagnostics::bit_count_span(&model);
+        if let Some(span) = span.filter(|_| self.write_policy.has_bit_ranges()) {
             self.bit_sd_attempted.set(true);
             let route = self.route();
-            let series = known_series(&model).expect("standard Q/R model");
+            let series = known_series(&model).expect("standard Q/R or FX5 model");
             let send = encode_read(route, series, span)
                 .map_err(|_| FatalError::Protocol("invalid bit-count SD span".into()))?;
             *self.phase.borrow_mut() = Phase::AwaitBitSd {
@@ -499,13 +502,57 @@ impl SlmpConnection {
         }
     }
 
+    /// After the D/W SD step (read or refused): FX5 also reads SD304-305
+    /// for its file register R count; every other family is done with D/W.
+    fn after_dw_discovery(
+        &self,
+        model: TypeName,
+        d_count: PointCount,
+    ) -> Result<Option<session::Step>, FatalError> {
+        match model.family {
+            ModelFamily::Fx5 => {
+                let span = plan_basic_sd(&model, BasicArea::R).expect("FX5 has an R count SD");
+                let route = self.route();
+                let send = encode_read(route, Series::Q, span)
+                    .map_err(|_| FatalError::Protocol("invalid R count SD span".into()))?;
+                *self.phase.borrow_mut() = Phase::AwaitFileRegisterSd {
+                    route,
+                    model,
+                    d_count,
+                    span,
+                };
+                Ok(Some(frame_step(route.frame, send)))
+            }
+            ModelFamily::StandardQ
+            | ModelFamily::StandardR
+            | ModelFamily::Q25PrhWireOnly
+            | ModelFamily::Unknown => self.finish_dw_discovery(model, d_count),
+        }
+    }
+
+    /// This connection's route with `serial` and the current monitoring timer.
+    fn route_with_serial(&self, serial: u16) -> Route {
+        Route {
+            serial,
+            timer: self.timer.get(),
+            ..self.base_route
+        }
+    }
+
     fn route(&self) -> Route {
         let serial = self.next_serial.get();
         self.next_serial.set(serial.wrapping_add(1));
-        Route {
-            serial,
-            ..self.base_route
-        }
+        self.route_with_serial(serial)
+    }
+
+    /// FX5 answers only 3E to its own station (network 00H, station FFH,
+    /// I/O 03FFH; FX5 SLMP manual printed pp.8, 23-24).
+    fn fx5_route_supported(&self) -> bool {
+        self.base_route.frame == Frame::E3
+            && self.base_route.network == 0
+            && self.base_route.pc == 0xff
+            && self.base_route.io == 0x03ff
+            && self.base_route.station == 0
     }
 }
 
@@ -935,6 +982,10 @@ fn parse_read_address(
         (Device::Z, 10, digits)
     } else if let Some(digits) = text.strip_prefix("RD") {
         (Device::RD, 10, digits)
+    } else if let Some(digits) = text.strip_prefix('R') {
+        // FX5 file register (decimal). After RD so RDn keeps its own device;
+        // whether a CPU has R is decided with the model in `read.plan`.
+        (Device::R, 10, digits)
     } else {
         return Err("unsupported word device address".into());
     };
@@ -1102,6 +1153,7 @@ fn canonical_read(device: Device, number: i64) -> Result<String, String> {
         Device::S => Ok(format!("S{number}")),
         Device::Z => Ok(format!("Z{number}")),
         Device::RD => Ok(format!("RD{number}")),
+        Device::R => Ok(format!("R{number}")),
         Device::UG => Err("U\\G needs a module number".into()),
     }
 }
@@ -1116,7 +1168,8 @@ fn canonical_read_tag(device: Device, number: i64, kind: ReadKind) -> Result<Str
 
 fn known_series(model: &TypeName) -> Option<Series> {
     match model.family {
-        ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly => Some(Series::Q),
+        // FX5 uses the Q layout: subcommands 0000/0001, 3-byte number.
+        ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly | ModelFamily::Fx5 => Some(Series::Q),
         ModelFamily::StandardR => Some(Series::R),
         ModelFamily::Unknown => None,
     }
@@ -1144,9 +1197,13 @@ fn assess_d_span(model: &TypeName, count: PointCount, number: u32, words: u16) -
     match count {
         PointCount::Exact(limit) if last < limit => RangeAssessment::VerifiedInside,
         PointCount::AtLeast(prefix) if last < prefix => RangeAssessment::VerifiedInside,
-        // R SD280-281 is the full D count. Q SD302 covers internal D only;
-        // an address beyond it may belong to extended D.
-        PointCount::Exact(limit) if model.family == ModelFamily::StandardR && last >= limit => {
+        // R and FX5 SD280-281 (and FX5 SD282-283 W, SD304-305 R) are full
+        // counts. Q SD302 covers internal D only; an address beyond it may
+        // belong to extended D.
+        PointCount::Exact(limit)
+            if matches!(model.family, ModelFamily::StandardR | ModelFamily::Fx5)
+                && last >= limit =>
+        {
             RangeAssessment::VerifiedOutside
         }
         _ => RangeAssessment::Unknown,
@@ -1287,7 +1344,35 @@ fn read_count(device: Device, d_count: PointCount, w_count: PointCount) -> Point
         | Device::S
         | Device::Z
         | Device::RD
+        // The FX5 R count lives on the connection; see `assess_conn_span`.
+        | Device::R
         | Device::UG => PointCount::Unknown,
+    }
+}
+
+/// `assess_read_span` with this connection's counts, plus the FX5 file
+/// register R from SD304-305. R has a read path on FX5 only.
+fn assess_conn_span(
+    conn: &SlmpConnection,
+    model: &TypeName,
+    d_count: PointCount,
+    device: Device,
+    number: u32,
+    words: u16,
+) -> RangeAssessment {
+    match (model.family, device) {
+        (ModelFamily::Fx5, Device::R) => {
+            assess_d_span(model, conn.fx5_r_count.get(), number, words)
+        }
+        _ => assess_read_span(
+            model,
+            device,
+            d_count,
+            conn.w_count.get(),
+            conn.q_w_total.get(),
+            number,
+            words,
+        ),
     }
 }
 
@@ -1304,7 +1389,57 @@ fn zr_read_allowed(model: &TypeName) -> bool {
             (model.name.as_str(), model.code),
             ("Q00JCPU", 0x0250) | ("Q00UJCPU", 0x0260)
         ),
-        _ => false,
+        // FX5 has no ZR (FX5 SLMP manual printed pp.66-67).
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Fx5 | ModelFamily::Unknown => false,
+    }
+}
+
+/// Devices with an FX5 read path (G2c). X/Y are left out until their binary
+/// numbering is confirmed on hardware (the manual contradicts itself); V, LT,
+/// LST and ZR do not exist; 0401 cannot read LCN; RD is iQ-R only; Q's
+/// SS/SC/SN names are not FX5's ST names; `U\G` is outside G2c.
+fn fx5_reads_device(device: Device) -> bool {
+    match device {
+        Device::M
+        | Device::L
+        | Device::F
+        | Device::B
+        | Device::S
+        | Device::D
+        | Device::W
+        | Device::SB
+        | Device::SW
+        | Device::SM
+        | Device::SD
+        | Device::Z
+        | Device::TS
+        | Device::TC
+        | Device::TN
+        | Device::STS
+        | Device::STC
+        | Device::STN
+        | Device::CS
+        | Device::CC
+        | Device::CN
+        | Device::LCS
+        | Device::LCC
+        | Device::R => true,
+        Device::X
+        | Device::Y
+        | Device::V
+        | Device::SS
+        | Device::SC
+        | Device::SN
+        | Device::LTS
+        | Device::LTC
+        | Device::LSTS
+        | Device::LSTC
+        | Device::LTN
+        | Device::LSTN
+        | Device::LCN
+        | Device::ZR
+        | Device::RD
+        | Device::UG => false,
     }
 }
 
@@ -1348,7 +1483,8 @@ fn unit_buffer_read_allowed(model: &TypeName, module: u16) -> bool {
     match model.family {
         ModelFamily::StandardR => module <= 0xff || (0x3e0..=0x3e3).contains(&module),
         ModelFamily::StandardQ => module <= 0xff,
-        _ => false,
+        // FX5 U\G is outside the G2c design.
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Fx5 | ModelFamily::Unknown => false,
     }
 }
 
@@ -1428,56 +1564,82 @@ fn checked_read_target(
     let (device, number, kind) =
         parse_read_address(&spec.address, &spec.data_type, spec.string_words)
             .map_err(FatalError::InvalidConfig)?;
-    // Q25PRH has only its separately checked internal-D map. The standard
-    // timer/counter and file-register maps must not be borrowed for it.
-    if !matches!(
-        device,
-        Device::D
-            | Device::W
-            | Device::SW
-            | Device::SD
-            | Device::M
-            | Device::X
-            | Device::Y
-            | Device::B
-            | Device::L
-            | Device::F
-            | Device::V
-            | Device::SB
-            | Device::SM
-    ) && (model.family == ModelFamily::Q25PrhWireOnly
-        || (matches!(
-            device,
-            Device::LTS
-                | Device::LTC
-                | Device::LSTS
-                | Device::LSTC
-                | Device::LTN
-                | Device::LSTN
-                | Device::LCN
-                | Device::LCS
-                | Device::LCC
-                | Device::RD
-        ) && model.family != ModelFamily::StandardR))
-        || (device == Device::ZR && !zr_read_allowed(model))
-        || (device == Device::S && r_lacks_step_relay(model))
-    {
-        return Err(FatalError::InvalidConfig(
-            "device is unsupported for this CPU family".into(),
-        ));
-    }
-    if (matches!(device, Device::SS | Device::SC | Device::SN)
-        && model.family != ModelFamily::StandardQ)
-        || (matches!(device, Device::STS | Device::STC | Device::STN)
-            && model.family != ModelFamily::StandardR)
-    {
-        return Err(FatalError::InvalidConfig(
-            "retentive timer name does not match CPU series".into(),
-        ));
+    match model.family {
+        // FX5 has its own device set; none of the Q/R rules below apply.
+        ModelFamily::Fx5 if !fx5_reads_device(device) => {
+            return Err(FatalError::InvalidConfig(
+                "device is unsupported for this CPU family".into(),
+            ));
+        }
+        ModelFamily::Fx5 => {}
+        // The file register R (AFH) is an FX5 device only.
+        ModelFamily::StandardQ
+        | ModelFamily::StandardR
+        | ModelFamily::Q25PrhWireOnly
+        | ModelFamily::Unknown
+            if device == Device::R =>
+        {
+            return Err(FatalError::InvalidConfig(
+                "device is unsupported for this CPU family".into(),
+            ));
+        }
+        ModelFamily::StandardQ
+        | ModelFamily::StandardR
+        | ModelFamily::Q25PrhWireOnly
+        | ModelFamily::Unknown => {
+            // Q25PRH has only its separately checked internal-D map. The standard
+            // timer/counter and file-register maps must not be borrowed for it.
+            if !matches!(
+                device,
+                Device::D
+                    | Device::W
+                    | Device::SW
+                    | Device::SD
+                    | Device::M
+                    | Device::X
+                    | Device::Y
+                    | Device::B
+                    | Device::L
+                    | Device::F
+                    | Device::V
+                    | Device::SB
+                    | Device::SM
+            ) && (model.family == ModelFamily::Q25PrhWireOnly
+                || (matches!(
+                    device,
+                    Device::LTS
+                        | Device::LTC
+                        | Device::LSTS
+                        | Device::LSTC
+                        | Device::LTN
+                        | Device::LSTN
+                        | Device::LCN
+                        | Device::LCS
+                        | Device::LCC
+                        | Device::RD
+                ) && model.family != ModelFamily::StandardR))
+                || (device == Device::ZR && !zr_read_allowed(model))
+                || (device == Device::S && r_lacks_step_relay(model))
+            {
+                return Err(FatalError::InvalidConfig(
+                    "device is unsupported for this CPU family".into(),
+                ));
+            }
+            if (matches!(device, Device::SS | Device::SC | Device::SN)
+                && model.family != ModelFamily::StandardQ)
+                || (matches!(device, Device::STS | Device::STC | Device::STN)
+                    && model.family != ModelFamily::StandardR)
+            {
+                return Err(FatalError::InvalidConfig(
+                    "retentive timer name does not match CPU series".into(),
+                ));
+            }
+        }
     }
     if device == Device::W {
         match model.family {
-            ModelFamily::StandardR => {}
+            // Complete W counts; the outside check below applies.
+            ModelFamily::StandardR | ModelFamily::Fx5 => {}
             ModelFamily::StandardQ
                 if matches!(
                     classify_q_w(w_count, w_total, number, kind.points()),
@@ -1560,25 +1722,32 @@ impl session::GuestConnection for SlmpConnection {
                     }
                     Err(error) => return Err(response_error(error)),
                 };
-                let area = match model.family {
-                    ModelFamily::StandardQ => BasicArea::DInternal,
-                    ModelFamily::StandardR => BasicArea::D,
-                    ModelFamily::Q25PrhWireOnly => BasicArea::DInternal,
+                // Read each family's adjacent D/W count fields in one snapshot.
+                let (area, words) = match model.family {
+                    // SD302-303: 16-bit internal D and W counts.
+                    ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly => {
+                        (BasicArea::DInternal, 2)
+                    }
+                    // SD280-283: 32-bit D and W counts.
+                    ModelFamily::StandardR => (BasicArea::D, 4),
+                    // An FX5 answers only 3E to its own station. Any other
+                    // frame or route has no confirmed FX5 path: treat it like
+                    // an unknown model (no SD read, no tag read or write).
+                    ModelFamily::Fx5 if !self.fx5_route_supported() => {
+                        *self.phase.borrow_mut() = Phase::NoRange(Some(model));
+                        return Ok(None);
+                    }
+                    // FX5 SD280-283: 32-bit D and W counts.
+                    ModelFamily::Fx5 => (BasicArea::D, 4),
                     ModelFamily::Unknown => {
                         *self.phase.borrow_mut() = Phase::NoRange(Some(model));
                         return Ok(None);
                     }
                 };
                 let mut span = plan_basic_sd(&model, area).expect("known model has D count SD");
-                // Read each family's adjacent D/W count fields in one snapshot.
-                if model.family == ModelFamily::StandardR {
-                    span.count = 4; // SD280-283: 32-bit D and W counts.
-                } else if matches!(
-                    model.family,
-                    ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly
-                ) {
-                    span.count = 2; // SD302-303: 16-bit internal D and W counts.
-                }
+                span.count = words;
+                // Every request after 0101 uses the family's monitoring timer.
+                self.timer.set(model.family.monitoring_timer());
                 let sd_route = self.route();
                 let series = known_series(&model).expect("known model has series");
                 let send = encode_read(sd_route, series, span)
@@ -1597,52 +1766,36 @@ impl session::GuestConnection for SlmpConnection {
                         // A PLC refusal leaves the count unknown, but the confirmed
                         // model still gives us a supported wire format for explicit reads.
                         self.dw_sd_refused.set(true);
-                        return self.finish_dw_discovery(model, PointCount::Unknown);
+                        return self.after_dw_discovery(model, PointCount::Unknown);
                     }
                     Err(error) => return Err(response_error(error)),
                     Ok(Values::Bits(_)) => {
                         return Err(FatalError::Protocol("SD read returned bits".into()));
                     }
                 };
-                let area = if matches!(
-                    model.family,
-                    ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly
-                ) {
-                    BasicArea::DInternal
-                } else {
-                    BasicArea::D
-                };
                 let evidence = BasicEvidence {
                     route_confirmed: true,
                     r_firmware: None,
                 };
                 let count = match model.family {
-                    ModelFamily::StandardR => {
+                    // R and FX5 tables both hold 32-bit D/W totals at SD280-283.
+                    ModelFamily::StandardR | ModelFamily::Fx5 => {
                         self.w_count.set(basic_sd_count(
                             &model,
                             BasicArea::W,
                             evidence,
                             words.get(2..4),
                         ));
-                        basic_sd_count(&model, area, evidence, words.get(0..2))
+                        basic_sd_count(&model, BasicArea::D, evidence, words.get(0..2))
                     }
-                    ModelFamily::StandardQ => {
+                    ModelFamily::StandardQ | ModelFamily::Q25PrhWireOnly => {
                         self.w_count.set(basic_sd_count(
                             &model,
                             BasicArea::WInternal,
                             evidence,
                             words.get(1..2),
                         ));
-                        basic_sd_count(&model, area, evidence, words.get(0..1))
-                    }
-                    ModelFamily::Q25PrhWireOnly => {
-                        self.w_count.set(basic_sd_count(
-                            &model,
-                            BasicArea::WInternal,
-                            evidence,
-                            words.get(1..2),
-                        ));
-                        basic_sd_count(&model, area, evidence, words.get(0..1))
+                        basic_sd_count(&model, BasicArea::DInternal, evidence, words.get(0..1))
                     }
                     ModelFamily::Unknown => unreachable!("unknown model does not plan SD"),
                 };
@@ -1667,9 +1820,37 @@ impl session::GuestConnection for SlmpConnection {
                     };
                     return Ok(Some(frame_step(route.frame, send)));
                 } else {
-                    return self.finish_dw_discovery(model, count);
+                    return self.after_dw_discovery(model, count);
                 }
                 Ok(None)
+            }
+            (
+                Phase::AwaitFileRegisterSd {
+                    route,
+                    model,
+                    d_count,
+                    span,
+                },
+                Some(frame),
+            ) => {
+                match decode_read(route, span, &frame) {
+                    Ok(Values::Words(words)) => self.fx5_r_count.set(basic_sd_count(
+                        &model,
+                        BasicArea::R,
+                        BasicEvidence {
+                            route_confirmed: true,
+                            r_firmware: None,
+                        },
+                        Some(&words),
+                    )),
+                    // A refusal only leaves the R range unknown.
+                    Err(ResponseError::EndCode(_)) => self.fx5_r_sd_refused.set(true),
+                    Err(error) => return Err(response_error(error)),
+                    Ok(Values::Bits(_)) => {
+                        return Err(FatalError::Protocol("SD read returned bits".into()));
+                    }
+                }
+                self.finish_dw_discovery(model, d_count)
             }
             (
                 Phase::AwaitWTotal {
@@ -1800,23 +1981,16 @@ impl read::Guest for Component {
                     conn.q_w_total.get(),
                 )
                 .ok()?;
-                if diagnostics::bit_span_outside(conn, model, span) {
+                if diagnostics::sd_span_outside(conn, model, span) {
                     return None;
                 }
-                encode_span(conn.base_route, series, span, module).ok()?;
+                encode_span(conn.route_with_serial(0), series, span, module).ok()?;
                 Some((
                     u32::try_from(index).ok()?,
                     span,
                     module,
-                    assess_read_span(
-                        model,
-                        span.device,
-                        *count,
-                        conn.w_count.get(),
-                        conn.q_w_total.get(),
-                        span.start,
-                        span.count,
-                    ) == RangeAssessment::VerifiedInside,
+                    assess_conn_span(conn, model, *count, span.device, span.start, span.count)
+                        == RangeAssessment::VerifiedInside,
                 ))
             })
             .collect::<Vec<_>>();
@@ -1829,12 +2003,11 @@ impl read::Guest for Component {
             let joined = if verified && module.is_none() {
                 groups.last_mut().is_some_and(|last| {
                     if last.span.device != span.device
-                        || assess_read_span(
+                        || assess_conn_span(
+                            conn,
                             model,
-                            span.device,
                             *count,
-                            conn.w_count.get(),
-                            conn.q_w_total.get(),
+                            span.device,
                             last.span.start,
                             last.span.count,
                         ) != RangeAssessment::VerifiedInside
@@ -1871,7 +2044,7 @@ impl read::Guest for Component {
                     };
                     if next_cover != cover
                         || next_d != span.start
-                        || encode_read(conn.base_route, series, candidate).is_err()
+                        || encode_read(conn.route_with_serial(0), series, candidate).is_err()
                     {
                         return false;
                     }
@@ -1903,10 +2076,7 @@ impl read::Guest for Component {
                     "SLMP serial reused while a read is pending".into(),
                 ));
             }
-            let route = Route {
-                serial,
-                ..conn.base_route
-            };
+            let route = conn.route_with_serial(serial);
             let send = encode_span(route, series, group.span, group.module)
                 .map_err(|_| FatalError::Protocol("invalid D read span".into()))?;
             let step = read_step(route.frame, send, group.span);
@@ -1962,10 +2132,7 @@ impl read::Guest for Component {
                 FatalError::Protocol("plan is not pending on this connection".into())
             })?,
         };
-        let route = Route {
-            serial,
-            ..conn.base_route
-        };
+        let route = conn.route_with_serial(serial);
         let pending = conn
             .pending
             .borrow()
@@ -2010,15 +2177,8 @@ impl read::Guest for Component {
                 || tag_module != pending.module
                 || tag.start != expected_d
                 || (p.covers.len() > 1
-                    && (assess_read_span(
-                        model,
-                        tag.device,
-                        *count,
-                        conn.w_count.get(),
-                        conn.q_w_total.get(),
-                        tag.start,
-                        tag.count,
-                    ) != RangeAssessment::VerifiedInside
+                    && (assess_conn_span(conn, model, *count, tag.device, tag.start, tag.count)
+                        != RangeAssessment::VerifiedInside
                         || region != first_region))
             {
                 return Err(FatalError::Protocol("plan does not match specs".into()));
@@ -2168,11 +2328,13 @@ fn write_next_on(
     // opt-in (2026-11-06 owner decision).
     let q25prh = is_redundant_q_pair(&model);
     let q25prh_test = q25prh && conn.q25prh_test_write_enabled;
-    if !matches!(
-        model.family,
-        ModelFamily::StandardR | ModelFamily::StandardQ
-    ) && !q25prh
-    {
+    let family_writes = match model.family {
+        // FX5 follows the standard R rules (G2c) on the Q wire.
+        ModelFamily::StandardR | ModelFamily::StandardQ | ModelFamily::Fx5 => true,
+        ModelFamily::Q25PrhWireOnly => q25prh,
+        ModelFamily::Unknown => false,
+    };
+    if !family_writes {
         return Ok(rejected_write_count(
             items.len(),
             "write requires a confirmed Q/R model",
@@ -2191,6 +2353,14 @@ fn write_next_on(
     let device = run.device;
     let number = run.number;
     let points = run.payload.points();
+    // FX5 X/Y are not handled until their numbering is confirmed on hardware;
+    // the file register R never reaches here (it is not a write device).
+    if model.family == ModelFamily::Fx5 && device == Device::Y {
+        return Ok(rejected_write_count(
+            items.len(),
+            "Y is not supported on FX5",
+        ));
+    }
     if q25prh_test
         && (device != Device::D
             || number != 3010
@@ -2221,6 +2391,7 @@ fn write_next_on(
             "device span is not within the same-connection SD range",
         ));
     }
+    let series = known_series(&model).expect("write family has a series");
     let route = conn.route();
     let send = if q25prh_test {
         // This opt-in never upgrades Q's unknown configured D count.
@@ -2230,22 +2401,14 @@ fn write_next_on(
         let words: [u16; 4] = values.as_slice().try_into().expect("checked Q test width");
         encode_q25prh_d3010_3013_test_write(route, words)
     } else {
-        match &run.payload {
-            WritePayload::Words(values) if model.family == ModelFamily::StandardR => {
+        match (&run.payload, series) {
+            (WritePayload::Words(values), Series::R) => {
                 encode_r_dw_words(route, device, number, values)
             }
-            WritePayload::Words(values) => encode_q_dw_words(route, device, number, values),
-            WritePayload::Bits(bits) => encode_bits(
-                route,
-                if model.family == ModelFamily::StandardR {
-                    Series::R
-                } else {
-                    Series::Q
-                },
-                device,
-                number,
-                bits,
-            ),
+            (WritePayload::Words(values), Series::Q) => {
+                encode_q_dw_words(route, device, number, values)
+            }
+            (WritePayload::Bits(bits), series) => encode_bits(route, series, device, number, bits),
         }
         .map_err(|_| FatalError::Protocol("validated write span cannot be encoded".into()))?
     };
@@ -2275,6 +2438,7 @@ fn device_error_results(len: usize, code: u16) -> write_v1::WriteProgress {
 
 /// Same-connection SD evidence for a word or bit-device write span. Standard
 /// Q D has no write proof (SD302 counts internal D only); Q W uses SD303.
+/// FX5 uses its SD280-283 D/W and SD262-275 bit totals like standard R.
 fn write_span_proven(
     conn: &SlmpConnection,
     model: &TypeName,
@@ -2287,9 +2451,9 @@ fn write_span_proven(
     if device.is_bit() {
         matches!(
             model.family,
-            ModelFamily::StandardQ | ModelFamily::StandardR
+            ModelFamily::StandardQ | ModelFamily::StandardR | ModelFamily::Fx5
         ) && count_guarantees_span(write_bit_count(conn, device), number, points as u16)
-    } else if model.family == ModelFamily::StandardR {
+    } else if matches!(model.family, ModelFamily::StandardR | ModelFamily::Fx5) {
         let area_count = if device == Device::D {
             count
         } else {
@@ -2368,9 +2532,9 @@ fn rmw_preflight(
     len: usize,
 ) -> Result<write_v1::WriteProgress, FatalError> {
     let series = match model.family {
-        ModelFamily::StandardQ => Series::Q,
+        ModelFamily::StandardQ | ModelFamily::Fx5 => Series::Q,
         ModelFamily::StandardR => Series::R,
-        _ => {
+        ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => {
             return Ok(rejected_write_count(
                 len,
                 "word-bit write requires a confirmed standard Q/R model",
@@ -2646,6 +2810,7 @@ impl address::Guest for Component {
                 Device::S => "S",
                 Device::Z => "Z",
                 Device::RD => "RD",
+                Device::R => "R",
                 Device::UG => "UG",
             }
             .into(),
@@ -2762,7 +2927,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and decimal ZR. Q ZR (decimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and decimal ZR. Q ZR (decimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only. An FX5 (iQ-F) CPU needs frame 3e and its own station; it reads M/L/F/B/S/D/W/SB/SW/SM/SD/Z, T/ST/C contacts, coils and current values and LCS/LCC with ranges from its own SD table, and the decimal file register Rn as a read-only word tag (Rn is FX5 only). FX5 X/Y, V, LT/LST, LCN, ZR, RD and U\\G are not supported, and FX5 writes follow the standard R rules for D/W and M/L/B only"
             .into()
     }
 
@@ -2847,7 +3012,7 @@ impl config::Guest for Component {
             SettingField {
                 key: "frame".into(),
                 label: "SLMP frame".into(),
-                help: Some("Binary frame header. 4E echoes a serial number in each response. 3E has no serial number, so responses are matched by order and a new read is refused while an earlier one is unanswered. Over UDP, 3E can take a duplicated or delayed datagram as a later answer and yield a stale value; prefer 4E over UDP.".into()),
+                help: Some("Binary frame header. 4E echoes a serial number in each response. 3E has no serial number, so responses are matched by order and a new read is refused while an earlier one is unanswered. Over UDP, 3E can take a duplicated or delayed datagram as a later answer and yield a stale value; prefer 4E over UDP. An FX5 (iQ-F) CPU requires 3E: it has no 4E, so with 4E it does not answer 0101 and its model cannot be confirmed.".into()),
                 kind: FieldKind::Choice(vec![
                     ChoiceOption {
                         value: "4e".into(),
@@ -3362,7 +3527,10 @@ mod tests {
             ("LTS1", "u16"),
             ("LCS1A", "bit"),
             ("LCN1", "u32"),
-            ("R1", "u16"),
+            // R (FX5 file register) is a decimal word device: no bit form.
+            ("R1", "bit"),
+            ("R1.0", "bit"),
+            ("R1A", "u16"),
         ] {
             assert!(
                 parse_read_address(text, kind, None).is_err(),
@@ -6274,6 +6442,493 @@ mod tests {
                 "{name}"
             );
         }
+    }
+    const FX5_NAME: &str = "FX5U-32MR/ES";
+    const FX5_CODE: u16 = 0x4a21;
+
+    fn fx5_model_body() -> Vec<u8> {
+        let mut body = vec![b' '; 18];
+        body[..FX5_NAME.len()].copy_from_slice(FX5_NAME.as_bytes());
+        body[16..].copy_from_slice(&FX5_CODE.to_le_bytes());
+        body
+    }
+
+    fn pairs(counts: &[u32]) -> Vec<u8> {
+        counts
+            .iter()
+            .flat_map(|count| count.to_le_bytes())
+            .collect()
+    }
+
+    fn handshake(conn: &SlmpConnection, response: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        <SlmpConnection as session::GuestConnection>::handshake_next(conn, response)
+            .expect("handshake step")
+            .map(|step| step.send)
+    }
+
+    /// 3E FX5 handshake to Ready. `dw`/`r` are SD280-283 and SD304-305
+    /// counts (`None` answers with a PLC refusal); `bits` answers the
+    /// SD262-275 request when M/L/B ranges are allowlisted. Returns the
+    /// connection and every request sent.
+    fn fx5_ready(
+        extra: &[(&str, &str)],
+        dw: Option<[u32; 2]>,
+        r: Option<u32>,
+        bits: Option<[u32; 7]>,
+    ) -> (SlmpConnection, Vec<Vec<u8>>) {
+        let mut settings = vec![("frame", "3e")];
+        settings.extend_from_slice(extra);
+        let conn = SlmpConnection::new(&route_settings(&settings)).expect("valid settings");
+        let mut sent = vec![handshake(&conn, None).expect("0101")];
+        sent.push(handshake(&conn, Some(reply(&conn, 1, 0, &fx5_model_body()))).expect("SD280"));
+        let dw_reply = match dw {
+            Some(counts) => reply(&conn, 2, 0, &pairs(&counts)),
+            None => reply(&conn, 2, 0xc05b, &[]),
+        };
+        sent.push(handshake(&conn, Some(dw_reply)).expect("SD304"));
+        let r_reply = match r {
+            Some(count) => reply(&conn, 3, 0, &pairs(&[count])),
+            None => reply(&conn, 3, 0xc05b, &[]),
+        };
+        if let Some(bit_sd) = handshake(&conn, Some(r_reply)) {
+            sent.push(bit_sd);
+            let counts = bits.expect("bit SD answer");
+            assert!(handshake(&conn, Some(reply(&conn, 4, 0, &pairs(&counts)))).is_none());
+        }
+        assert!(matches!(&*conn.phase.borrow(), Phase::Ready { model, .. }
+            if model.family == ModelFamily::Fx5));
+        (conn, sent)
+    }
+
+    fn fx5() -> TypeName {
+        named(ModelFamily::Fx5, FX5_NAME, FX5_CODE)
+    }
+
+    fn tag(address: &str, data_type: &str) -> TagSpec {
+        TagSpec {
+            address: address.into(),
+            data_type: data_type.into(),
+            string_words: None,
+        }
+    }
+
+    #[test]
+    fn g2c_fx5_handshake_sends_0101_with_0010h_then_every_sd_read_with_0000h() {
+        let (conn, sent) = fx5_ready(&[], Some([8000, 0x200]), Some(32768), None);
+        // 0101 goes out before the model is known, with the default timer.
+        assert_eq!(
+            sent[0],
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 6, 0, 0x10, 0, 1, 1, 0, 0]
+        );
+        // SD280-283 and SD304-305: Q subcommand 0000, 3-byte number, SD A9H,
+        // monitoring timer 0000H.
+        assert_eq!(
+            sent[1],
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 0x18, 1, 0, 0xa9, 4, 0]
+        );
+        assert_eq!(
+            sent[2],
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 0x30, 1, 0, 0xa9, 2, 0]
+        );
+        assert_eq!(sent.len(), 3, "no bit SD without M/L/B ranges");
+        assert!(
+            matches!(&*conn.phase.borrow(), Phase::Ready { count, .. } if *count == PointCount::Exact(8000))
+        );
+        assert_eq!(conn.w_count.get(), PointCount::Exact(0x200));
+        assert_eq!(conn.fx5_r_count.get(), PointCount::Exact(32768));
+        assert_eq!(conn.route().timer, 0);
+        // Another family keeps 0010H after identification.
+        let q = SlmpConnection::new(&route_settings(&[("frame", "3e")])).unwrap();
+        handshake(&q, None);
+        let mut body = vec![b' '; 18];
+        body[..7].copy_from_slice(b"Q02UCPU");
+        body[16..].copy_from_slice(&0x0263u16.to_le_bytes());
+        let sd = handshake(&q, Some(reply(&q, 1, 0, &body))).unwrap();
+        assert_eq!(&sd[9..11], &[0x10, 0]);
+        assert_eq!(q.route().timer, 0x0010);
+    }
+
+    #[test]
+    fn g2c_refused_fx5_sd_reads_leave_counts_unknown() {
+        let (conn, sent) = fx5_ready(&[], None, None, None);
+        assert_eq!(
+            sent.len(),
+            3,
+            "the R count is still asked after a D/W refusal"
+        );
+        assert!(
+            matches!(&*conn.phase.borrow(), Phase::Ready { count, .. } if *count == PointCount::Unknown)
+        );
+        assert_eq!(conn.w_count.get(), PointCount::Unknown);
+        assert_eq!(conn.fx5_r_count.get(), PointCount::Unknown);
+        assert!(conn.dw_sd_refused.get() && conn.fx5_r_sd_refused.get());
+    }
+
+    #[test]
+    fn g2c_fx5_over_4e_or_a_non_own_route_has_no_range_and_sends_nothing_more() {
+        for extra in [
+            &[("frame", "4e")][..],
+            &[][..],
+            &[("frame", "3e"), ("network_no", "1"), ("station_no", "1")][..],
+            &[("frame", "3e"), ("target_cpu", "cpu1")][..],
+            &[
+                ("frame", "3e"),
+                ("target_cpu", "own"),
+                ("network_no", "2"),
+                ("station_no", "3"),
+            ][..],
+        ] {
+            let mut settings = vec![
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", "D100-D105"),
+            ];
+            settings.extend_from_slice(extra);
+            let conn = SlmpConnection::new(&route_settings(&settings)).expect("valid settings");
+            assert!(handshake(&conn, None).is_some());
+            assert!(
+                handshake(&conn, Some(reply(&conn, 1, 0, &fx5_model_body()))).is_none(),
+                "{extra:?}: no SD read"
+            );
+            assert!(
+                matches!(&*conn.phase.borrow(), Phase::NoRange(Some(model))
+                if model.family == ModelFamily::Fx5),
+                "{extra:?}"
+            );
+            assert_eq!(conn.timer.get(), 0x0010, "{extra:?}");
+            assert_rejected(
+                &conn,
+                &[word_write("D100", 1)],
+                "FX5 without 3E own station",
+            );
+        }
+    }
+
+    #[test]
+    fn g2c_fx5_reads_its_device_set_and_refuses_the_rest_in_read_plan() {
+        let m = fx5();
+        let none = (PointCount::Unknown, PointCount::Unknown);
+        for (address, data_type) in [
+            ("M0", "bit"),
+            ("L0", "bit"),
+            ("F0", "bit"),
+            ("B1F", "bit"),
+            ("S10", "bit"),
+            ("D100", "u16"),
+            ("D100", "f64"),
+            ("W1F", "u32"),
+            ("D10.F", "bit"),
+            ("W1A.3", "bit"),
+            ("SB1", "bit"),
+            ("SW1", "u16"),
+            ("SM400", "bit"),
+            ("SD260", "u16"),
+            ("Z0", "u16"),
+            ("TS0", "bit"),
+            ("TC0", "bit"),
+            ("TN0", "u16"),
+            ("STS0", "bit"),
+            ("STC0", "bit"),
+            ("STN0", "u16"),
+            ("CS0", "bit"),
+            ("CC0", "bit"),
+            ("CN0", "u16"),
+            ("LCS0", "bit"),
+            ("LCC0", "bit"),
+            ("R0", "u16"),
+            ("R32767", "i32"),
+        ] {
+            let spec = tag(address, data_type);
+            let span = checked_read_span(&spec, &m, none.0, none.1)
+                .unwrap_or_else(|_| panic!("{address}/{data_type}"));
+            assert_eq!(
+                span.start,
+                parse_read_address(address, data_type, None).unwrap().1
+            );
+        }
+        for (address, data_type) in [
+            ("X0", "bit"),
+            ("Y0", "bit"),
+            ("LTS0", "bit"),
+            ("LTC0", "bit"),
+            ("LTN0", "i32"),
+            ("LSTS0", "bit"),
+            ("LSTC0", "bit"),
+            ("LSTN0", "i32"),
+            ("LCN0", "i32"),
+            ("ZR0", "u16"),
+            ("RD0", "u16"),
+            ("SS0", "bit"),
+            ("SC0", "bit"),
+            ("SN0", "u16"),
+            ("U0\\G0", "u16"),
+            ("U3E0\\G0", "u16"),
+        ] {
+            assert!(
+                checked_read_target(&tag(address, data_type), &m, none.0, none.1, None).is_err(),
+                "{address}/{data_type}"
+            );
+        }
+        // V is refused for every model at parse; LZ needs 0403.
+        assert!(parse_read_address("V0", "bit", None).is_err());
+        assert!(parse_read_address("LZ0", "i32", None).is_err());
+    }
+
+    #[test]
+    fn g2c_file_register_r_is_decimal_read_only_and_fx5_only() {
+        let parsed = <Component as address::Guest>::parse("R0100".into(), "u32".into(), None)
+            .expect("R parses on every model");
+        assert_eq!(parsed.canonical, "R100");
+        assert_eq!(parsed.area, "R");
+        assert_eq!(parsed.index, Some(100));
+        assert_eq!(parsed.word_count, 2);
+        assert!(!parsed.writable_area, "R is never statically writable");
+        assert_eq!(
+            <Component as address::Guest>::offset("R10".into(), "u32".into(), None, 2).unwrap(),
+            "R14"
+        );
+        assert_eq!(
+            <Component as address::Guest>::offset_words("R10".into(), 3).unwrap(),
+            "R13"
+        );
+        // RD keeps its own device; R accepts no hex, bit or string form.
+        assert_eq!(
+            parse_read_address("RD5", "u16", None).unwrap().0,
+            Device::RD
+        );
+        assert_eq!(parse_read_address("R5", "u16", None).unwrap().0, Device::R);
+        assert!(parse_read_address("R1F", "u16", None).is_err());
+        assert!(parse_read_address("R", "u16", None).is_err());
+        assert!(parse_read_address("R1", "string", Some(2)).is_err());
+        let none = (PointCount::Unknown, PointCount::Unknown);
+        let r = tag("R10", "u16");
+        for m in [
+            model(ModelFamily::StandardQ),
+            model(ModelFamily::StandardR),
+            model(ModelFamily::Q25PrhWireOnly),
+            model(ModelFamily::Unknown),
+            named(ModelFamily::StandardR, "R08CPU", 0x4801),
+        ] {
+            assert!(
+                checked_read_span(&r, &m, none.0, none.1).is_err(),
+                "{:?}",
+                m.family
+            );
+        }
+        let span = checked_read_span(&r, &fx5(), none.0, none.1).unwrap();
+        assert_eq!((span.device, span.start, span.count), (Device::R, 10, 1));
+        // The guest never writes R, on FX5 or anywhere else.
+        let (conn, _) = fx5_ready(
+            &[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", "D100-D105"),
+            ],
+            Some([8000, 0x200]),
+            Some(32768),
+            None,
+        );
+        assert_rejected(&conn, &[word_write("R10", 1)], "R write");
+        assert!(
+            WritePolicy::parse(Some("enabled"), Some("R0-R10")).is_err(),
+            "no R allowlist entry"
+        );
+    }
+
+    #[test]
+    fn g2c_fx5_r_range_comes_from_sd304_and_the_d_w_range_from_sd280() {
+        let (conn, _) = fx5_ready(&[], Some([100, 0x50]), Some(1000), None);
+        let m = fx5();
+        let d = PointCount::Exact(100);
+        let assess = |device, number, words| assess_conn_span(&conn, &m, d, device, number, words);
+        assert_eq!(assess(Device::R, 999, 1), RangeAssessment::VerifiedInside);
+        assert_eq!(assess(Device::R, 998, 2), RangeAssessment::VerifiedInside);
+        assert_eq!(assess(Device::R, 999, 2), RangeAssessment::VerifiedOutside);
+        assert_eq!(assess(Device::R, 1000, 1), RangeAssessment::VerifiedOutside);
+        assert_eq!(assess(Device::D, 99, 1), RangeAssessment::VerifiedInside);
+        assert_eq!(assess(Device::D, 100, 1), RangeAssessment::VerifiedOutside);
+        assert_eq!(assess(Device::W, 0x4f, 1), RangeAssessment::VerifiedInside);
+        assert_eq!(assess(Device::W, 0x50, 1), RangeAssessment::VerifiedOutside);
+        let span = |device, start| ReadSpan {
+            device,
+            start,
+            count: 1,
+        };
+        assert!(diagnostics::sd_span_outside(
+            &conn,
+            &m,
+            span(Device::R, 1000)
+        ));
+        assert!(!diagnostics::sd_span_outside(
+            &conn,
+            &m,
+            span(Device::R, 999)
+        ));
+        // Outside D/W tags are refused in read.plan like standard R.
+        assert!(checked_read_span(&tag("D100", "u16"), &m, d, conn.w_count.get()).is_err());
+        assert!(checked_read_span(&tag("W50", "u16"), &m, d, conn.w_count.get()).is_err());
+        assert!(checked_read_span(&tag("W4F", "u16"), &m, d, conn.w_count.get()).is_ok());
+        // No Q W extension, Q ZR or SD310-311 path applies to FX5.
+        assert_eq!(
+            q_w_region(
+                &m,
+                Device::W,
+                PointCount::Exact(0x50),
+                Some(0x1000),
+                0x60,
+                1
+            ),
+            None
+        );
+        assert!(!zr_read_allowed(&m));
+        assert_eq!(banto_slmp_read_core::plan_q_w_total(&m), None);
+        assert!(!is_redundant_q_pair(&m));
+    }
+
+    const FX5_WRITES: &str = "D100-D105,W10-W1F,M0-M7,L0-L7,B0-B7,Y0-Y7,D200.0-D200.F";
+
+    fn fx5_writer() -> SlmpConnection {
+        // SD262-275: Y, M, B, SB, F, (unused), L.
+        fx5_ready(
+            &[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", FX5_WRITES),
+            ],
+            Some([8000, 0x200]),
+            Some(32768),
+            Some([0x100, 8000, 0x100, 0x200, 128, 0, 8000]),
+        )
+        .0
+    }
+
+    #[test]
+    fn g2c_fx5_bit_sd_reads_sd262_275_with_0000h_and_keeps_y_unknown() {
+        let (conn, sent) = fx5_ready(
+            &[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", FX5_WRITES),
+            ],
+            Some([8000, 0x200]),
+            Some(32768),
+            Some([0x100, 8000, 0x100, 0x200, 128, 0, 8000]),
+        );
+        assert_eq!(
+            sent[3],
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 6, 1, 0, 0xa9, 14, 0]
+        );
+        assert_eq!(
+            conn.bit_counts.get(),
+            [
+                PointCount::Exact(8000),
+                PointCount::Unknown,
+                PointCount::Exact(8000),
+                PointCount::Exact(0x100),
+            ]
+        );
+        assert_eq!(
+            conn.diagnostic_bit_counts.get(),
+            [
+                PointCount::Unknown,
+                PointCount::Exact(0x200),
+                PointCount::Exact(128)
+            ]
+        );
+    }
+
+    #[test]
+    fn g2c_fx5_writes_follow_the_standard_r_gates_on_the_q_wire_with_0000h() {
+        // D u16 x 2: 1401/0000, 3-byte number, D A8H.
+        let conn = fx5_writer();
+        let send = sent(
+            write_next_on(
+                &conn,
+                vec![word_write("D100", 1), word_write("D101", 2)],
+                None,
+            ),
+            2,
+        );
+        assert_eq!(
+            send,
+            [
+                0x50, 0, 0, 0xff, 0xff, 3, 0, 16, 0, 0, 0, 1, 0x14, 0, 0, 100, 0, 0, 0xa8, 2, 0, 1,
+                0, 2, 0
+            ]
+        );
+        let conn = fx5_writer();
+        let send = sent(write_next_on(&conn, vec![word_write("W1F", 7)], None), 1);
+        assert_eq!(&send[9..21], &[0, 0, 1, 0x14, 0, 0, 0x1f, 0, 0, 0xb4, 1, 0]);
+        // Bits: 1401/0001.
+        for (address, code) in [("M7", 0x90), ("L0", 0x92), ("B7", 0xa0)] {
+            let conn = fx5_writer();
+            let send = sent(
+                write_next_on(&conn, vec![bit_write(address, true)], None),
+                1,
+            );
+            assert_eq!(&send[9..15], &[0, 0, 1, 0x14, 1, 0], "{address}");
+            assert_eq!(send[18], code, "{address}");
+            assert_eq!(&send[19..], &[1, 0, 0x10], "{address}");
+        }
+        // A string is one Q word write.
+        let conn = fx5_writer();
+        let send = sent(
+            write_next_on(&conn, vec![string_write("D102", 2, b"ABCD")], None),
+            1,
+        );
+        assert_eq!(&send[11..21], &[1, 0x14, 0, 0, 102, 0, 0, 0xa8, 2, 0]);
+        // A word bit is a Q read-modify-write; its first step is a 0401 read.
+        let conn = fx5_writer();
+        let send = sent(
+            write_next_on(&conn, vec![bit_write("D200.3", true)], None),
+            1,
+        );
+        assert_eq!(
+            send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 200, 0, 0, 0xa8, 1, 0]
+        );
+        // Y, X and R are never written on FX5, even when allowlisted.
+        assert_rejected(&fx5_writer(), &[bit_write("Y0", true)], "FX5 Y");
+        assert_rejected(&fx5_writer(), &[bit_write("X0", true)], "FX5 X");
+        assert_rejected(&fx5_writer(), &[word_write("R0", 1)], "FX5 R");
+        // Outside the allowlist or the SD-proven range.
+        assert_rejected(&fx5_writer(), &[word_write("D106", 1)], "allowlist");
+        assert_rejected(&fx5_writer(), &[bit_write("M8", true)], "allowlist");
+    }
+
+    #[test]
+    fn g2c_fx5_writes_need_same_connection_sd_proof() {
+        // D/W SD refused: no D/W proof. No bit SD answer: no M/L/B proof.
+        let (conn, _) = fx5_ready(
+            &[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", "D100-D105,W10-W1F"),
+            ],
+            None,
+            Some(32768),
+            None,
+        );
+        assert_rejected(&conn, &[word_write("D100", 1)], "refused SD280");
+        assert_rejected(&conn, &[word_write("W10", 1)], "refused SD282");
+        // D count below the allowlisted span.
+        let (conn, _) = fx5_ready(
+            &[
+                ("d_u16_write_mode", "enabled"),
+                ("d_u16_write_allowlist", "D100-D105,M0-M7"),
+            ],
+            Some([101, 0x200]),
+            Some(0),
+            Some([0, 4, 0, 0, 0, 0, 0]),
+        );
+        assert_rejected(
+            &conn,
+            &[word_write("D100", 1), word_write("D101", 1)],
+            "D101",
+        );
+        assert_rejected(&conn, &[bit_write("M4", true)], "M4");
+        assert!(matches!(
+            write_next_on(&conn, vec![bit_write("M3", true)], None),
+            Ok(write_v1::WriteProgress::Send(_))
+        ));
+        // Write mode disabled.
+        let (conn, _) = fx5_ready(&[], Some([8000, 0x200]), Some(0), None);
+        assert_rejected(&conn, &[word_write("D100", 1)], "disabled");
     }
 }
 

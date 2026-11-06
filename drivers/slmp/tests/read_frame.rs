@@ -327,3 +327,27 @@ fn q_zr_uses_word_unit_b0_and_the_24_bit_limit() {
         Ok(Values::Words(vec![0x1234, 0xbeef]))
     );
 }
+
+#[test]
+fn fx5_file_register_r_is_device_code_afh_on_the_q_layout() {
+    // FX5 SLMP manual JY997D56001 K, printed pp.66-67: R (file register) AFH,
+    // decimal. 3E, own station, monitoring timer 0000H, R100 x 2 words.
+    let route = Route {
+        frame: banto_slmp_read_core::Frame::E3,
+        timer: 0,
+        ..Route::default()
+    };
+    let request = encode_read(route, Series::Q, span(Device::R, 100, 2)).unwrap();
+    assert_eq!(
+        request,
+        [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 100, 0, 0, 0xaf, 2, 0]
+    );
+    assert!(!Device::R.is_bit());
+    let response = [
+        0xd0, 0, 0, 0xff, 0xff, 3, 0, 6, 0, 0, 0, 0x34, 0x12, 0x78, 0x56,
+    ];
+    assert_eq!(
+        decode_read(route, span(Device::R, 100, 2), &response),
+        Ok(Values::Words(vec![0x1234, 0x5678]))
+    );
+}

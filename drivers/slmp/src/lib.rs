@@ -1,4 +1,5 @@
 //! Binary 4E or 3E SLMP read (0401) and bounded Q/R word or bit write (1401) framing.
+//! FX5 uses the Q layout (subcommands 0000/0001) over 3E only.
 //! This core does no I/O or configured-range lookup; the guest gates writes.
 //! 3E has no serial number, so the caller must match its responses by order.
 #![no_std]
@@ -70,6 +71,8 @@ pub enum Device {
     S,
     Z,
     RD,
+    /// FX5 file register (AFH, decimal). Read-only in the guest and FX5 only.
+    R,
     /// Unit/CPU buffer memory (`U<h>\G<n>`), read through the 0401 device
     /// extension. Its module number is not part of `ReadSpan`; use `UnitBufferSpan`.
     UG,
@@ -112,6 +115,7 @@ impl Device {
             Self::S => 0x98,
             Self::Z => 0xcc,
             Self::RD => 0x2c,
+            Self::R => 0xaf,
             Self::UG => 0xab,
         }
     }

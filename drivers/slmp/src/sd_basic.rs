@@ -1,4 +1,5 @@
-//! Read-only SD point-count planning for the basic standard Q/R maps.
+//! Read-only SD point-count planning for the basic standard Q/R maps and the
+//! FX5 map (FX5 application manual JY997D55401 AH, App.2 printed pp.870-871).
 //! A decoded count is not a device address, a wire read limit, or a tag verdict.
 use crate::{Device, ModelFamily, ReadSpan, TypeName};
 use banto_register_codec::{decode_u32, WordOrder};
@@ -33,6 +34,8 @@ pub enum BasicArea {
     LZ,
     ZR,
     RD,
+    /// FX5 file register R (SD304-305). Absent from the Q and R maps.
+    R,
 }
 
 /// Evidence that a later connection workflow must obtain independently.
@@ -61,6 +64,7 @@ pub fn plan_basic_sd(model: &TypeName, area: BasicArea) -> Option<ReadSpan> {
         ModelFamily::Q25PrhWireOnly if area == BasicArea::DInternal => (302, 1),
         ModelFamily::Q25PrhWireOnly if area == BasicArea::WInternal => (303, 1),
         ModelFamily::StandardR => r_sd(area)?,
+        ModelFamily::Fx5 => fx5_sd(area)?,
         ModelFamily::Q25PrhWireOnly | ModelFamily::Unknown => return None,
     };
     Some(ReadSpan {
@@ -145,7 +149,8 @@ fn q_sd(area: BasicArea) -> Option<u16> {
         | BasicArea::Z
         | BasicArea::LZ
         | BasicArea::ZR
-        | BasicArea::RD => return None,
+        | BasicArea::RD
+        | BasicArea::R => return None,
     })
 }
 
@@ -174,5 +179,39 @@ fn r_sd(area: BasicArea) -> Option<(u16, u16)> {
         BasicArea::LZ => (302, 1),
         BasicArea::ZR => (306, 2),
         BasicArea::RD => (308, 2),
+        BasicArea::R => return None,
+    })
+}
+
+/// FX5 SD260-SD305 (32-bit low/high pairs, Z and LZ one word). The numbers are
+/// close to iQ-R but not the same (SD304-305 is R), so this is its own table.
+/// S is fixed at 4096 points with no SD; FX5 has no V, LT, LST, ZR or RD.
+fn fx5_sd(area: BasicArea) -> Option<(u16, u16)> {
+    Some(match area {
+        BasicArea::X => (260, 2),
+        BasicArea::Y => (262, 2),
+        BasicArea::M => (264, 2),
+        BasicArea::B => (266, 2),
+        BasicArea::SB => (268, 2),
+        BasicArea::F => (270, 2),
+        BasicArea::L => (274, 2),
+        BasicArea::D => (280, 2),
+        BasicArea::W => (282, 2),
+        BasicArea::SW => (284, 2),
+        BasicArea::T => (288, 2),
+        BasicArea::ST => (290, 2),
+        BasicArea::C => (292, 2),
+        BasicArea::LC => (298, 2),
+        BasicArea::Z => (300, 1),
+        BasicArea::LZ => (302, 1),
+        BasicArea::R => (304, 2),
+        BasicArea::V
+        | BasicArea::S
+        | BasicArea::DInternal
+        | BasicArea::WInternal
+        | BasicArea::LT
+        | BasicArea::LST
+        | BasicArea::ZR
+        | BasicArea::RD => return None,
     })
 }

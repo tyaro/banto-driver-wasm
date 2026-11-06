@@ -5989,4 +5989,185 @@ mod tests {
         conn.resource_drop(&mut store)?;
         Ok(())
     }
+
+    fn fx5_spec(address: &str, data_type: &str) -> banto::driver::types::TagSpec {
+        banto::driver::types::TagSpec {
+            address: address.into(),
+            data_type: data_type.into(),
+            string_words: None,
+        }
+    }
+
+    /// 3E FX5 handshake: 0101 (timer 0010H), SD280-283 and SD304-305 (timer 0000H).
+    fn ready_fx5_3e(
+        store: &mut Store<()>,
+        driver: &Driver,
+        d: u32,
+        w: u32,
+        r: u32,
+    ) -> wasmtime::Result<exports::banto::driver::session::Connection> {
+        let session = driver.banto_driver_session().connection();
+        let conn = session
+            .call_create(&mut *store, &settings_3e())?
+            .expect("3E settings");
+        let type_step = session
+            .call_handshake_next(&mut *store, conn, None)?
+            .expect("handshake")
+            .expect("0101");
+        assert_eq!(
+            type_step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 6, 0, 0x10, 0, 1, 1, 0, 0]
+        );
+        let sd280 = feed(
+            store,
+            driver,
+            conn,
+            &response_3e(&model_data("FX5U-32MR/ES", 0x4a21)),
+        )?
+        .expect("SD280-283");
+        assert_eq!(
+            sd280.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 0x18, 1, 0, 0xa9, 4, 0]
+        );
+        let mut dw = d.to_le_bytes().to_vec();
+        dw.extend_from_slice(&w.to_le_bytes());
+        let sd304 = feed(store, driver, conn, &response_3e(&dw))?.expect("SD304-305");
+        assert_eq!(
+            sd304.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 0x30, 1, 0, 0xa9, 2, 0]
+        );
+        assert!(feed(store, driver, conn, &response_3e(&r.to_le_bytes()))?.is_none());
+        Ok(conn)
+    }
+
+    #[test]
+    fn fx5_3e_handshake_then_q_wire_reads_with_timer_0000h() -> wasmtime::Result<()> {
+        use banto::driver::types::Value;
+        let (mut store, driver) = load()?;
+        let conn = ready_fx5_3e(&mut store, &driver, 100, 0x50, 1000)?;
+        let specs = [
+            fx5_spec("D10", "u16"),
+            fx5_spec("D11", "u16"),
+            fx5_spec("R998", "u16"),
+            fx5_spec("R999", "u16"),
+            fx5_spec("M7", "bit"),
+            // Unsupported on FX5, or outside the SD-proven range: uncovered.
+            fx5_spec("X0", "bit"),
+            fx5_spec("Y0", "bit"),
+            fx5_spec("ZR0", "u16"),
+            fx5_spec("LCN0", "i32"),
+            fx5_spec("U0\\G0", "u16"),
+            fx5_spec("R1000", "u16"),
+            fx5_spec("D100", "u16"),
+            fx5_spec("W50", "u16"),
+        ];
+        let plans = driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &specs)?
+            .expect("FX5 plans");
+        let covers: Vec<_> = plans.iter().map(|plan| plan.covers.clone()).collect();
+        assert_eq!(covers, [vec![0, 1], vec![2, 3], vec![4]]);
+        // Q subcommands, 3-byte numbers, D A8H / R AFH / M 90H, timer 0000H.
+        assert_eq!(
+            plans[0].step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 10, 0, 0, 0xa8, 2, 0]
+        );
+        assert_eq!(
+            plans[1].step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 0, 0, 0xe6, 3, 0, 0xaf, 2, 0]
+        );
+        assert_eq!(
+            plans[2].step.send,
+            [0x50, 0, 0, 0xff, 0xff, 3, 0, 12, 0, 0, 0, 1, 4, 1, 0, 7, 0, 0, 0x90, 1, 0]
+        );
+        let read = driver.banto_driver_read();
+        let d = read
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[0],
+                &specs,
+                &response_3e(&[1, 0, 2, 0]),
+            )?
+            .expect("D");
+        assert!(matches!(
+            d.as_slice(),
+            [Ok(Value::Uint(1)), Ok(Value::Uint(2))]
+        ));
+        let r = read
+            .call_decode(
+                &mut store,
+                conn,
+                &plans[1],
+                &specs,
+                &response_3e(&[0x34, 0x12, 0x78, 0x56]),
+            )?
+            .expect("R");
+        assert!(matches!(
+            r.as_slice(),
+            [Ok(Value::Uint(0x1234)), Ok(Value::Uint(0x5678))]
+        ));
+        let m = read
+            .call_decode(&mut store, conn, &plans[2], &specs, &response_3e(&[0x10]))?
+            .expect("M");
+        assert!(matches!(m.as_slice(), [Ok(Value::Bool(true))]));
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fx5_over_4e_or_a_routed_3e_destination_reads_no_sd_and_plans_nothing() -> wasmtime::Result<()>
+    {
+        let (mut store, driver) = load()?;
+        // Default 4E: an FX5 has no 4E; if one answered, it is still not used.
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &settings())?
+            .expect("settings");
+        assert!(driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .is_some());
+        assert!(feed(
+            &mut store,
+            &driver,
+            conn,
+            &model_response("FX5U-32MR/ES", 0x4a21)
+        )?
+        .is_none());
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &[fx5_spec("D0", "u16")])?
+            .is_err());
+        conn.resource_drop(&mut store)?;
+        // 3E to another station.
+        let conn = driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut store, &routed_settings("3e"))?
+            .expect("routed settings");
+        let start = driver
+            .banto_driver_session()
+            .connection()
+            .call_handshake_next(&mut store, conn, None)?
+            .expect("start")
+            .expect("0101");
+        let route: [u8; 5] = start.send[2..7].try_into().unwrap();
+        assert!(feed(
+            &mut store,
+            &driver,
+            conn,
+            &response_3e_with_route(route, &model_data("FX5UC-32MT/D", 0x4a91))
+        )?
+        .is_none());
+        assert!(driver
+            .banto_driver_read()
+            .call_plan(&mut store, conn, &[fx5_spec("D0", "u16")])?
+            .is_err());
+        conn.resource_drop(&mut store)?;
+        Ok(())
+    }
 }
