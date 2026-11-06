@@ -10,7 +10,8 @@ pub enum ModelFamily {
     StandardQ,
     StandardR,
     /// Exact Q25PRHCPU/004CH and Q12PRHCPU/004BH redundant-CPU pairs: Q wire
-    /// and SD302/SD303 internal D/W only. Writes exist only for Q25PRH.
+    /// and SD302/SD303 internal D/W only. Both pairs share the same read and
+    /// write rules (2026-11-06 owner decision).
     Q25PrhWireOnly,
     /// Valid 0101 data whose name/code pair is not in the supported table.
     Unknown,
