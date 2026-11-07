@@ -2,6 +2,7 @@
 //! FX5 uses the Q layout (subcommands 0000/0001) over 3E only.
 //! Global labels (G3) use 041C/141B framing in `label`.
 //! The iQ-R clock set (H) writes only SD210-SD216 and SM210, in `clock`.
+//! The Q/R clock read (H3) reads only SM210-SM213 and SD210 onward, in `clock_read`.
 //! This core does no I/O or configured-range lookup; the guest gates writes.
 //! 3E has no serial number, so the caller must match its responses by order.
 #![no_std]
@@ -28,6 +29,13 @@ mod clock;
 pub use clock::{
     encode_r_clock_data_write, encode_r_clock_set_request, encode_r_clock_status_read,
     CLOCK_STATUS_SPAN,
+};
+
+mod clock_read;
+pub use clock_read::{
+    clock_data_span, decode_q_clock_data, decode_r_clock_data, encode_clock_data_read,
+    encode_clock_read_status, ClockData, NotBcd, CLOCK_READ_STATUS_SPAN, Q_CLOCK_DATA_SPAN,
+    R_CLOCK_DATA_SPAN,
 };
 
 mod q_extension;

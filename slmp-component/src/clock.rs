@@ -39,12 +39,12 @@ const SM211_DEVICE_CODE: u32 = 211;
 /// The Host's civil time as passed to `set-clock-next`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Civil {
-    year: u16,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
+    pub(super) year: u16,
+    pub(super) month: u8,
+    pub(super) day: u8,
+    pub(super) hour: u8,
+    pub(super) minute: u8,
+    pub(super) second: u8,
 }
 
 impl From<clock_v1::CivilTime> for Civil {
@@ -74,8 +74,9 @@ const fn days_in_month(year: u16, month: u8) -> u8 {
 }
 
 impl Civil {
-    /// The iQ-R clock range (1980-2079) and a real calendar date.
-    fn validate(&self) -> Result<(), String> {
+    /// The iQ-R and Q clock range (1980-2079) and a real calendar date.
+    /// Also checks a clock read (H3).
+    pub(super) fn validate(&self) -> Result<(), String> {
         if !(1980..=2079).contains(&self.year) {
             return Err(format!("year {} is outside 1980-2079", self.year));
         }
@@ -150,9 +151,10 @@ pub(super) struct PendingClock {
 }
 
 impl SlmpConnection {
-    /// A clock response is awaited, or a clock response was malformed.
+    /// A clock set or clock read (H3) response is awaited, or one was
+    /// malformed.
     pub(super) fn clock_busy(&self) -> bool {
-        self.pending_clock.borrow().is_some() || self.clock_poisoned.get()
+        self.pending_clock.borrow().is_some() || self.clock_poisoned.get() || self.clock_read_busy()
     }
 }
 
@@ -346,6 +348,7 @@ pub(super) fn set_clock_next_on(
         || !conn.pending.borrow().is_empty()
         || conn.pending_diagnostic.borrow().is_some()
         || conn.diagnostic_poisoned.get()
+        || conn.clock_read_busy()
     {
         return Err(FatalError::Protocol(
             "another response is pending on this connection".into(),
