@@ -1,6 +1,7 @@
 //! Binary 4E or 3E SLMP read (0401) and bounded Q/R word or bit write (1401) framing.
 //! FX5 uses the Q layout (subcommands 0000/0001) over 3E only.
 //! Global labels (G3) use 041C/141B framing in `label`.
+//! The iQ-R clock set (H) writes only SD210-SD216 and SM210, in `clock`.
 //! This core does no I/O or configured-range lookup; the guest gates writes.
 //! 3E has no serial number, so the caller must match its responses by order.
 #![no_std]
@@ -21,6 +22,12 @@ mod label;
 pub use label::{
     decode_label_read, encode_label_read, encode_label_write, label_read_data_len,
     label_write_data_len, LabelData, LabelWrite, LABEL_SEND_DATA_LIMIT,
+};
+
+mod clock;
+pub use clock::{
+    encode_r_clock_data_write, encode_r_clock_set_request, encode_r_clock_status_read,
+    CLOCK_STATUS_SPAN,
 };
 
 mod q_extension;
