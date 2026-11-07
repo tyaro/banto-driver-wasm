@@ -36,6 +36,7 @@ const allowed = new Set([
   'drivers/slmp/Cargo.toml',
   'drivers/slmp/Cargo.lock',
   'drivers/slmp/src/clock.rs',
+  'drivers/slmp/src/clock_read.rs',
   'drivers/slmp/src/label.rs',
   'drivers/slmp/src/lib.rs',
   'drivers/slmp/src/q_zr.rs',
@@ -43,6 +44,7 @@ const allowed = new Set([
   'drivers/slmp/src/sd_basic.rs',
   'drivers/slmp/src/type_name.rs',
   'drivers/slmp/tests/clock.rs',
+  'drivers/slmp/tests/clock_read.rs',
   'drivers/slmp/tests/frame_3e.rs',
   'drivers/slmp/tests/label.rs',
   'drivers/slmp/tests/q_zr.rs',
@@ -56,6 +58,7 @@ const allowed = new Set([
   'slmp-component/Cargo.lock',
   'slmp-component/src/lib.rs',
   'slmp-component/src/clock.rs',
+  'slmp-component/src/clock_read.rs',
   'slmp-component/src/diagnostics.rs',
   'slmp-component/src/label.rs',
   'slmp-component/src/write_policy.rs',
@@ -63,6 +66,7 @@ const allowed = new Set([
   'slmp-runtime/Cargo.lock',
   'slmp-runtime/src/lib.rs',
   'slmp-runtime/tests/clock.rs',
+  'slmp-runtime/tests/clock_read.rs',
   'slmp-runtime/tests/diagnostics.rs',
   'slmp-runtime/tests/label.rs',
   'slmp-runtime/tests/range_matrix.rs',
@@ -80,6 +84,7 @@ const allowed = new Set([
   'wit/write-v1.wit',
   'wit/diagnostics-v1.wit',
   'wit/clock-v1.wit',
+  'wit/clock-read-v1.wit',
 ]);
 function checkTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

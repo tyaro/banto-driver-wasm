@@ -19,6 +19,14 @@ mod tests {
         wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-write-diagnostics-and-clock-v1" });
     }
 
+    mod clock_read_host {
+        wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-clock-read-v1" });
+    }
+
+    mod clock_read_full_host {
+        wasmtime::component::bindgen!({ path: "../wit", world: "driver-with-write-diagnostics-clock-and-clock-read-v1" });
+    }
+
     /// Route bytes as echoed in a response: network, station, module I/O (LE), multidrop.
     const OWN_ROUTE: [u8; 5] = [0, 0xff, 0xff, 3, 0];
 
@@ -118,6 +126,13 @@ mod tests {
             &new_component,
             &linker,
         )?;
+        // H3: the same holds for the clock read worlds.
+        clock_read_host::DriverWithClockReadV1::instantiate(&mut store, &new_component, &linker)?;
+        clock_read_full_host::DriverWithWriteDiagnosticsClockAndClockReadV1::instantiate(
+            &mut store,
+            &new_component,
+            &linker,
+        )?;
         if let Ok(old_path) = std::env::var("BANTO_SLMP_LEGACY_COMPONENT_WASM") {
             let old_component = Component::from_file(&engine, old_path)?;
             let old_read = Driver::instantiate(&mut store, &old_component, &linker)?;
@@ -135,6 +150,12 @@ mod tests {
             )
             .is_err());
             assert!(clock_host::DriverWithClockV1::instantiate(
+                &mut store,
+                &old_component,
+                &linker
+            )
+            .is_err());
+            assert!(clock_read_host::DriverWithClockReadV1::instantiate(
                 &mut store,
                 &old_component,
                 &linker

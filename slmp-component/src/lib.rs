@@ -31,6 +31,9 @@
 //! The optional clock-v1 (H, see `clock`) sets the clock of a 0101-confirmed
 //! iQ-R CPU at its own station through SD210-SD216 and SM210 only, behind
 //! the separate `clock_set` gate. Special devices stay unwritable as tags.
+//! The optional clock-read-v1 (H3, see `clock_read`) reads the clock of a
+//! 0101-confirmed iQ-R or standard Q CPU at its own station from SM210-SM213
+//! and SD210 onward, writes nothing and has no guest setting.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -48,6 +51,7 @@ use banto_slmp_read_core::{
 };
 use exports::banto::driver::{address, config, diagnostics_v1, read, session, write_v1};
 mod clock;
+mod clock_read;
 mod diagnostics;
 mod label;
 mod write_policy;
@@ -59,7 +63,7 @@ use clock::CLOCK_SET_KEY;
 use label::{is_label, parse_label, Label, LABEL_ALLOWLIST_KEY};
 use write_policy::{WritePolicy, ALLOWLIST_KEY, MODE_KEY};
 
-wit_bindgen::generate!({ path: "../wit", world: "driver-with-write-diagnostics-and-clock-v1" });
+wit_bindgen::generate!({ path: "../wit", world: "driver-with-write-diagnostics-clock-and-clock-read-v1" });
 
 struct Component;
 
@@ -130,6 +134,8 @@ struct SlmpConnection {
     clock_set_enabled: bool,
     pending_clock: RefCell<Option<clock::PendingClock>>,
     clock_poisoned: Cell<bool>,
+    pending_clock_read: RefCell<Option<clock_read::PendingClockRead>>,
+    clock_read_poisoned: Cell<bool>,
     bit_sd_attempted: Cell<bool>,
     bit_sd_refused: Cell<bool>,
     dw_sd_refused: Cell<bool>,
@@ -518,6 +524,8 @@ impl SlmpConnection {
             clock_set_enabled: setting(settings, CLOCK_SET_KEY) == Some("enabled"),
             pending_clock: RefCell::new(None),
             clock_poisoned: Cell::new(false),
+            pending_clock_read: RefCell::new(None),
+            clock_read_poisoned: Cell::new(false),
             bit_sd_attempted: Cell::new(false),
             bit_sd_refused: Cell::new(false),
             dw_sd_refused: Cell::new(false),
@@ -606,8 +614,8 @@ impl SlmpConnection {
     }
 }
 
-/// Every other operation waits while a clock response is pending or after a
-/// malformed one: a 3E answer could not be told apart, and the Host closes
+/// Every other operation waits while a clock set or clock read response is
+/// pending or after a malformed one: a 3E answer could not be told apart, and the Host closes
 /// the connection after a fatal error.
 fn clock_busy_error() -> FatalError {
     FatalError::Protocol("clock response is pending; reconnect".into())
@@ -3359,7 +3367,7 @@ impl address::Guest for Component {
     }
 
     fn help() -> String {
-        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and decimal ZR. Q ZR (decimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only. An FX5 (iQ-F) CPU needs frame 3e and its own station; it reads M/L/F/B/S/D/W/SB/SW/SM/SD/Z, T/ST/C contacts, coils and current values and LCS/LCC with ranges from its own SD table, and the decimal file register Rn as a read-only word tag (Rn is FX5 only). FX5 X/Y, V, LT/LST, LCN, ZR, RD and U\\G are not supported, and FX5 writes follow the standard R rules for D/W and M/L/B only. A GX Works3 global label is @ followed by its name as written (case kept, sent in UTF-16; structure members with ., arrays with up to three decimal subscripts such as @Arr[3] or @M[1,2]); it needs \"Access from External Device\" enabled in GX Works3 and is read with 041C and written with 141B on an iQ-R CPU only, as bit, u16, i16, u32, i32, f32, f64 or string (string_words) matching the label's data type exactly (no 64-bit integers, bit specification @X.3 or digit specification). A label write checks every label's data type first and writes nothing on a mismatch; it needs the SLMP write mode, a label_write_allowlist entry and a matching Host gate, and labels never share a write request with device tags. Special devices (SM/SD and others) stay read-only as tags; the optional clock set writes only SD210-SD216 and SM210 of an iQ-R CPU at its own station, behind the separate clock_set setting and Host gate"
+        "SLMP Q/R timer/counter contacts and coils are bits; TN/SN/CN are one-word current values. Standard iQ-R adds LCS/LCC bit contacts/coils, LTN/LSTN/LCN i32 current values, LTS/LTC/LSTS/LSTC flags through four-word current-value reads, and decimal ZR. Q ZR (decimal, except Q00JCPU/Q00UJCPU/Q25PRH) is a range-Unknown read-only one-tag read. U<h>\\G<n> (h 1-3 hex digits, n decimal) reads unit buffer memory on standard Q/R as numeric, string or U<h>\\G<n>.<b> word-bit tags: h is 0-FF, plus 3E0-3E3 (CPU buffer memory) on iQ-R only; it is read-only, range-Unknown, one request per tag, and HG, index modification and J\\ are not supported. Read-only S step relay bits (decimal), Z index words on Q/R and iQ-R RD refresh data words (decimal) have unknown ranges and use one request per tag; LZ needs 0403 random read and is not supported; block-switched R is not supported. A string tag is Dn or hexadecimal Wn with 1-128 string_words; it reads and writes the whole span (one 1401 write, the only item of its request) as bytes in character order, two characters per word with the first in the low byte, without decoding, NUL cut, truncation or padding, under the same range proof and write gates as a numeric tag of that width. Dn.h and Wn.h read one hexadecimal-indexed bit of Dn or hexadecimal Wn; Wn.h uses the same W range proof as a one-word W read. A Dn.h/Wn.h write is a non-atomic read-modify-write of the whole word on standard Q/R (read, write back with only the requested bits changed, read again to confirm) that needs explicit bit-interval allowlist entries; one request writes distinct bits of one word only. V edge relays cannot be registered for periodic collection because a one-scan edge may be missed. New area ranges remain unknown and use one request per tag. Local writes require explicit common-policy D/W numeric or string, M/Y/L/B bool or D/W word-bit spans, same-connection SD proof, and a matching Host gate. Q25PRH W and bit areas remain read-only. An FX5 (iQ-F) CPU needs frame 3e and its own station; it reads M/L/F/B/S/D/W/SB/SW/SM/SD/Z, T/ST/C contacts, coils and current values and LCS/LCC with ranges from its own SD table, and the decimal file register Rn as a read-only word tag (Rn is FX5 only). FX5 X/Y, V, LT/LST, LCN, ZR, RD and U\\G are not supported, and FX5 writes follow the standard R rules for D/W and M/L/B only. A GX Works3 global label is @ followed by its name as written (case kept, sent in UTF-16; structure members with ., arrays with up to three decimal subscripts such as @Arr[3] or @M[1,2]); it needs \"Access from External Device\" enabled in GX Works3 and is read with 041C and written with 141B on an iQ-R CPU only, as bit, u16, i16, u32, i32, f32, f64 or string (string_words) matching the label's data type exactly (no 64-bit integers, bit specification @X.3 or digit specification). A label write checks every label's data type first and writes nothing on a mismatch; it needs the SLMP write mode, a label_write_allowlist entry and a matching Host gate, and labels never share a write request with device tags. Special devices (SM/SD and others) stay read-only as tags; the optional clock set writes only SD210-SD216 and SM210 of an iQ-R CPU at its own station, behind the separate clock_set setting and Host gate. The optional clock read writes nothing; it reads SM210-SM213 and then SD210-SD216 (iQ-R) or SD210-SD213 (Q, BCD) at its own station and needs SM213 kept ON by the PLC program"
             .into()
     }
 

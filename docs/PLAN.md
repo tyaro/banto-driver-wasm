@@ -44,7 +44,7 @@ main `25b5a1b`（#48）では #32 Modbus 基本、#33 register-bit read、#34 SL
 | F | SLMP 書込み対象の拡張 | ワード内ビット書込み（`D100.5`・`W1A.0`）は native と同じ RMW（読む→対象ビットだけ差し替えて書き戻す→読み直して確認）で採用する（2026-10-28 作者決定）。設計は下の「F の設計」（許可はビット単位の allowlist）。TN/STN/CN の現在値書込みは見送り | ゲストと Hub ゲートの変更（WIT 不変） |
 | G | SLMP U/G バッファメモリ、ラベル、FX5 / L / MX / 特殊 CPU | 拡張指定サブコマンド、ラベル用コマンド、機種別の型式・基数・点数根拠をそれぞれ契約設計してから段階的に追加する。Q25PRH と同様に機種別の限定対応とする。U/G（G1）を先に行う。設計は下の「G1 の設計」（2026-10-29 作者決定）。他機種は下の「G2 の設計」（2026-11-05 作者決定）。ラベルは下の「G3 の設計」（2026-11-06 作者決定、読書き） | 段階ごとに判断（G1・G3 は WIT 不変） |
 | H | PLC の時計合わせ（SLMP の Q/R から） | 接続先ごとに違う手順（どのデバイスに何をどの順で書き、どう確かめるか）はゲストが任意の WIT 拡張 `clock-v1` で持ち、時刻の元・実行の契機（定期実行）・許可・監査は Hub が持つ（2026-11-05 作者決定）。設計は下の「H の設計」、Hub との IF は「H の Hub との IF」（2026-11-06 作者決定） | WIT 追加（新しい world）と Hub の変更 |
-| H3 | PLC の時計の読取り（SLMP の Q/R から） | H の時計合わせとは別の段階（2026-11-07 オーナー決定）。使い道は表示（PLC の時刻・PC の時刻・差）と、時計合わせの前後の値の監査。ずれが小さいと合わせない使い方は採らない。`clock-v1` は変えず、読取りの任意 interface `clock-read-v1` と新しい world を足す。設計は下の「H3 の設計」（2026-11-07 作者決定） | WIT 追加（新しい world）と Hub の変更 |
+| H3 | PLC の時計の読取り（SLMP の Q/R から） | H の時計合わせとは別の段階（2026-11-07 オーナー決定）。使い道は表示（PLC の時刻・PC の時刻・差）と、時計合わせの前後の値の監査。ずれが小さいと合わせない使い方は採らない。`clock-v1` は変えず、読取りの任意 interface `clock-read-v1` と新しい world を足す。設計は下の「H3 の設計」（2026-11-07 作者決定）、ゲストの実装は「H3 の結果」 | WIT 追加（新しい world）と Hub の変更 |
 
 C0 の確認結果（2026-10-28、Hub main `1120419` の静的照合）: Hub の WASM 経路は文字列を通せない。タグ登録（`string`、1–128 words、UTF-8 / Shift_JIS）、engine の復号（最初の NUL で切り、不正な符号は項目エラー）、REST の read-now と書込み・監査、native SLMP の文字列は対応済みで、周期収集・履歴・ライブ表示は全ドライバで文字列を扱わない（設計どおり）。不足は WASM アダプタ（`crates/banto-driver-wasm`）だけで、`string` を宣言したゲストの読込み拒否、文字列アドレスの照合拒否、`bytes` 結果のバッチ全体 Fatal、Modbus・SLMP 書込みゲートの数値限定（`string-words` 未設定・`bytes` への変換なし）、Modbus の 1 要求 123 ワードと登録上限 128 ワードの差がある。tyaro/banto-industrial#914 はこの一部を記録している。作者の判断で Hub 側の修正はいったん保留し、C1 はその修正の後に行う。先に WIT・Hub 不変の D1・D2 を進める。
 
@@ -319,6 +319,17 @@ H3 の判断事項（2026-11-07 作者決定。4 点とも推奨案どおり）:
 2. 対象の機種: iQ-R 系（G2b を含む）と標準 Q・L。Q25PRH/Q12PRH・FX5・型式未知は `unsupported`。
 3. world の名前: `driver-with-write-diagnostics-clock-and-clock-read-v1`（全部入り）と `driver-with-clock-read-v1`（Hub が bind する小さい world）。
 4. H の残件 5（SM213 が ON のときの時計合わせ）: H の手順は変えない。H3 の前後の読取りを監査に残して見えるようにする（H の (1) で SM213 が ON なら断る案は、SM213 を ON にしておく前提の案 1 と両立しないので採らない）。
+
+H3 の結果（2026-11-07、ゲストのみ。Hub 模擬受入れは別 PR）: 上の設計と判断事項どおりに実装した（次の 1 の WIT の型だけ設計から変えた）。WIT に `wit/clock-read-v1.wit`（interface `clock-read-v1` と world `driver-with-write-diagnostics-clock-and-clock-read-v1`・`driver-with-clock-read-v1`）を足し、既存の interface と world（`clock-v1` を含む）は変えていない。SLMP ゲストは新しい全部入りの world で生成し、既存の 6 つの world と新しい 2 つの world のすべてを満たす（CI の `wasm-tools component targets` に 2 行を足した）。Modbus ゲストは export しない。コアに SM210–SM213 の 0401 ビット読みと SD210–SD216（R）／SD210–SD213（Q）の 0401 ワード読みを組む関数と、BIN・BCD の解読（`drivers/slmp/src/clock_read.rs`）、ゲストに手順（`slmp-component/src/clock_read.rs`）を足した。設定は足していない。実装の PR で決めたこと（作者確認待ち）:
+
+1. WIT の日時の型: 設計の `use clock-v1.{civil-time}` では、小さい world `driver-with-clock-read-v1`（session・clock-read-v1）が WIT として成り立たない（`clock-v1` が暗に import になり、その `clock-v1` が export の `session` を使うため、wasm-tools が「transitively depends on an interface in incompatible ways」で拒む）。そこで `clock-read-v1` の中に同じ欄（year u16、month・day・hour・minute・second u8）の `record civil-time` を置いた。world の組は設計どおり。別案は、小さい world に `clock-v1` も export させること（読取りだけのゲストが作れなくなる）。
+2. 送る前の確かめの順: 機種 → 宛先（H と同じ判定）。0101 で `StandardR`（G2b を含む）と確定した接続は R の手順、`StandardQ`（G2a の QnPH・QnUDPV・L を含む）は Q の手順。Q25PRH/Q12PRH・FX5（4E で使えない FX5 を含む）・型式未知・0101 を断られた接続は `unsupported`、ハンドシェイクが終わっていなければ `rejected`（"discovery is incomplete"）。他局と `target_cpu` の `cpu1`〜`cpu4` は `unsupported`。`clock_set` は見ない（無効でも読める）。監視タイマはその機種群のもの（R・Q とも 0010H）。各段の `max-len` は 64。
+3. 段 1 の判定: SM213 を先に見て、OFF なら `rejected`（メッセージに「SM213 is OFF」と、その機種の SD の範囲を書く）。次に SM210 が ON なら `rejected`（時計合わせの処理待ち）。SM211・SM212 は見ない。
+4. 段 2 の解読: R は 7 ワードの BIN で、SD216（曜日）は読むが使わない。Q は SD210–SD213 の各ワードの上位バイト・下位バイトを 2 桁の BCD として、SD210 上位＝年の下 2 桁・下位＝月、SD211 上位＝日・下位＝時、SD212 上位＝分・下位＝秒、SD213 上位＝年の上 2 桁と読む（QCPU 取扱説明書の SD210–SD213 の図と例 H9307・H3110・H3548・H1905 に合わせた）。SD213 の下位バイト（曜日）は BCD かどうかも見ない。BCD でない桁は `verification-failed`（どの SD かを名指す）。その後、H と同じ検査（年 1980–2079、月 1–12、その月の日数、時 0–23、分・秒 0–59）で外れたら `verification-failed`（R で 255 を超える値も同じ）。
+5. 終了コード・応答の不正・排他: どちらの段でも終了コードは `device`（code は終了コード）で、以降は送らない。短い・形の違う応答、4E のシリアル番号や経路の不一致、語数の違う応答は致命的エラー（`framing`）。`send` の後に応答なしで呼んだら致命的エラー（`protocol`）。読取りの応答待ちの間と致命的エラーの後は、その接続の読取り・書込み・診断・時計合わせ・ハンドシェイクを `protocol` で断る（H の `clock_busy` に読取り側を足した）。逆に、読取り・書込み・診断・時計合わせの応答待ち、書込み・診断・時計合わせが不確定のままの接続では、時計の読取りを `protocol` で断る。`done` の後は応答なしの呼出しで新しい実行を始める。
+6. 設定の説明: アドレスの説明の末尾に、時計の読取りは何も書かず、自局の SM210–SM213 と SD210–SD216（iQ-R）／SD210–SD213（Q、BCD）を読み、PLC のプログラムで SM213 を ON にしておく必要があることを 1 文足した。
+
+試験: コア 5 件（R・Q の 2 つの要求の 4E/3E のバイト列、共通の解読、BIN の解読、BCD の解読とマニュアルの例・BCD でない桁）、ゲスト単体 9 件（R 4E・Q 4E/3E の各段のバイト列と結果、SM213 OFF・SM210 ON、範囲外・暦にない日付・BCD でない値、各段の終了コード、応答の不正、両方向の排他、送る前に断る機種・宛先・未ハンドシェイク）、Wasmtime フィクスチャ 8 件（`slmp-runtime/tests/clock_read.rs`。小さい world と全部入りの world の両方で bind し、R04CPU・R08PCPU・Q02UCPU・Q12PHCPU・Q04UDPVCPU・L02CPU の成功、SM213 OFF・SM210 ON、`verification-failed`、各段の終了コード、短い応答・シリアル番号の不一致・語数の違い、全部入りの world で応答待ちの間の読取り・診断・時計合わせ・ハンドシェイクの拒否、Q25PRH・FX5・未知機種・他局・マルチ CPU の宛先・未ハンドシェイクで送らないこと）を足し、既存の world の互換の試験に新しい 2 つの world を足した。Hub 模擬受入れと実機確認はしていない。残件は下の「H3 の残件」1–3 のまま開いている。
 
 H3 の残件（実機で確かめる）:
 
