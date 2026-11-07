@@ -463,6 +463,9 @@ impl diagnostics_v1::Guest for Component {
         prev_response: Option<Vec<u8>>,
     ) -> Result<diagnostics_v1::Progress, FatalError> {
         let conn = conn.get::<SlmpConnection>();
+        if conn.clock_busy() {
+            return Err(clock_busy_error());
+        }
         if conn.diagnostic_poisoned.get() {
             return Err(FatalError::Protocol(
                 "diagnostic outcome is uncertain; reconnect".into(),
